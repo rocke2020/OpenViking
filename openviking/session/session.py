@@ -16,16 +16,19 @@ from uuid import uuid4
 from openviking.core.namespace import canonical_session_uri
 from openviking.message import Message, Part
 from openviking.message.part import ContextPart, TextPart, ToolPart
+from openviking.server.config import ToolOutputExternalizationConfig
 from openviking.server.identity import RequestContext, Role
+from openviking.session.tool_result_store import ToolResultStore, make_preview, sha256_text
 from openviking.telemetry import get_current_telemetry, tracer
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.utils.time_utils import get_current_timestamp
+from openviking_cli.exceptions import FailedPreconditionError
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger, run_async
 from openviking_cli.utils.config import get_openviking_config
 
 if TYPE_CHECKING:
-    from openviking.session.compressor import SessionCompressor
+    from openviking.session.compressor_v2 import SessionCompressorV2 as SessionCompressor
     from openviking.storage import VikingDBManager
     from openviking.storage.viking_fs import VikingFS
 
@@ -122,9 +125,7 @@ WM_UPDATE_TOOL: Dict[str, Any] = {
                     "type": "object",
                     "required": list(WM_SEVEN_SECTIONS),
                     "additionalProperties": False,
-                    "properties": {
-                        name: _WM_SECTION_OP_SCHEMA for name in WM_SEVEN_SECTIONS
-                    },
+                    "properties": dict.fromkeys(WM_SEVEN_SECTIONS, _WM_SECTION_OP_SCHEMA),
                 }
             },
         },
@@ -291,6 +292,7 @@ class Session:
         ctx: Optional[RequestContext] = None,
         session_id: Optional[str] = None,
         auto_commit_threshold: int = 8000,
+        tool_output_externalization_config: Optional[ToolOutputExternalizationConfig] = None,
     ):
         self._viking_fs = viking_fs
         self._vikingdb_manager = vikingdb_manager
@@ -313,6 +315,11 @@ class Session:
             participant_user_ids=[self.ctx.user.user_id],
         )
         self._loaded = False
+        self._tool_output_externalization_config = (
+            tool_output_externalization_config.model_copy(deep=True)
+            if tool_output_externalization_config is not None
+            else ToolOutputExternalizationConfig()
+        )
 
         logger.info(f"Session created: {self.session_id} for user {self.user}")
 
@@ -384,9 +391,7 @@ class Session:
         keep = max(0, int(self._meta.keep_recent_count or 0))
         total = len(self._messages)
         if keep <= 0:
-            self._meta.pending_tokens = sum(
-                int(m.estimated_tokens or 0) for m in self._messages
-            )
+            self._meta.pending_tokens = sum(int(m.estimated_tokens or 0) for m in self._messages)
         elif total > keep:
             self._meta.pending_tokens = sum(
                 int(m.estimated_tokens or 0) for m in self._messages[: total - keep]
@@ -479,6 +484,353 @@ class Session:
             except Exception:
                 pass
 
+    def _tool_result_store(self) -> Optional[ToolResultStore]:
+        if not self._viking_fs:
+            return None
+        return ToolResultStore(self._viking_fs, self._session_uri, self.session_id, self.ctx)
+
+    async def _hydrate_tool_outputs_for_extraction(
+        self,
+        messages: List[Message],
+    ) -> List[Message]:
+        """Return a memory-only copy with externalized tool outputs restored."""
+        hydrated = [Message.from_dict(m.to_dict()) for m in messages]
+        store = self._tool_result_store()
+        if not store:
+            return hydrated
+
+        for msg in hydrated:
+            for part in msg.parts:
+                if not isinstance(part, ToolPart):
+                    continue
+                if not part.tool_output_ref:
+                    continue
+                if not (part.tool_output_truncated or part.tool_output_source_ref):
+                    continue
+
+                ref = part.tool_output_source_ref or part.tool_output_ref
+                tool_result_id = ref.rstrip("/").split("/")[-1]
+                offset = part.tool_output_source_offset if part.tool_output_source_ref else 0
+                limit = part.tool_output_source_limit if part.tool_output_source_ref else -1
+                if (
+                    part.tool_output_source_ref
+                    and limit is None
+                    and part.tool_output_original_chars is not None
+                ):
+                    limit = part.tool_output_original_chars
+                try:
+                    result = await store.read(
+                        tool_result_id,
+                        offset=max(0, int(offset or 0)),
+                        limit=int(limit) if limit is not None else -1,
+                        include_metadata=False,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to hydrate externalized tool output for extraction: "
+                        "session=%s message_id=%s tool_id=%s ref=%s error=%s",
+                        self.session_id,
+                        msg.id,
+                        part.tool_id,
+                        ref,
+                        exc,
+                    )
+                    continue
+                part.tool_output = result.get("content", "")
+
+        return hydrated
+
+    def _effective_tool_preview_chars(
+        self,
+        cfg: ToolOutputExternalizationConfig,
+        externalized_count: int,
+    ) -> int:
+        if externalized_count <= 0:
+            return cfg.preview_chars
+        group_share = cfg.assistant_turn_preview_budget_chars // externalized_count
+        return max(0, min(cfg.preview_chars, max(cfg.min_preview_chars, group_share)))
+
+    def _rewrite_source_read_tool_output(
+        self,
+        part: ToolPart,
+        cfg: ToolOutputExternalizationConfig,
+        *,
+        group_id: str,
+        group_original_chars: int,
+    ) -> bool:
+        """Rewrite read-back tool output as a source reference, not a new result."""
+        if part.tool_name != "openviking_tool_result_read":
+            return False
+        tool_input = part.tool_input if isinstance(part.tool_input, dict) else {}
+        source_ref = str(
+            tool_input.get("tool_output_ref")
+            or tool_input.get("ref")
+            or tool_input.get("uri")
+            or ""
+        )
+        if not source_ref.startswith(f"{self._session_uri}/tool-results/"):
+            return False
+
+        output = part.tool_output or ""
+        preview_chars = max(cfg.min_preview_chars, cfg.preview_chars)
+        preview = make_preview(
+            output,
+            preview_chars=preview_chars,
+            ref=source_ref,
+            tool_name=part.tool_name,
+            sha256=sha256_text(output) if output else "",
+            reason="source_read",
+            original_chars=len(output),
+        )
+        part.tool_output = preview
+        part.tool_output_ref = source_ref
+        part.tool_output_truncated = len(output) > len(preview)
+        part.tool_output_original_chars = len(output)
+        part.tool_output_preview_chars = len(preview)
+        part.tool_output_sha256 = sha256_text(output) if output else ""
+        part.tool_output_storage_uri = source_ref
+        part.tool_output_source_ref = source_ref
+        part.tool_output_source_offset = tool_input.get("offset")
+        part.tool_output_source_limit = tool_input.get("limit")
+        part.tool_output_group_id = group_id
+        part.tool_output_externalized_reason = "source_read"
+        part.tool_output_group_original_chars = group_original_chars
+        part.tool_output_group_budget_chars = cfg.assistant_turn_inline_budget_chars
+        return True
+
+    def _externalize_tool_part(
+        self,
+        msg: Message,
+        part: ToolPart,
+        cfg: ToolOutputExternalizationConfig,
+        *,
+        preview_chars: int,
+        reason: str,
+        group_id: str,
+        group_original_chars: int,
+    ) -> None:
+        store = self._tool_result_store()
+        original_output = part.tool_output or ""
+        if not store or not original_output:
+            return
+
+        digest = sha256_text(original_output)
+        try:
+            stored = run_async(
+                store.write(
+                    content=original_output,
+                    tool_id=part.tool_id,
+                    tool_name=part.tool_name,
+                    message_id=msg.id,
+                    agent_id=msg.role_id,
+                    created_at=msg.created_at,
+                    preview_chars=preview_chars,
+                    mime_type=part.tool_output_mime_type or "text/plain",
+                )
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            part.tool_output_externalization_error = error
+            if cfg.failure_mode == "reject":
+                raise FailedPreconditionError(
+                    "Failed to externalize tool output",
+                    details={"tool_id": part.tool_id, "error": error},
+                ) from exc
+            if cfg.failure_mode == "preview_only":
+                part.tool_output = make_preview(
+                    original_output,
+                    preview_chars=preview_chars,
+                    tool_name=part.tool_name,
+                    sha256=digest,
+                    reason=f"{reason}:externalization_failed",
+                    original_chars=len(original_output),
+                )
+                part.tool_output_ref = ""
+                part.tool_output_truncated = True
+                part.tool_output_original_chars = len(original_output)
+                part.tool_output_preview_chars = len(part.tool_output)
+                part.tool_output_sha256 = digest
+                part.tool_output_externalized_reason = reason
+            return
+
+        ref = stored.storage_uri
+        part.tool_output = make_preview(
+            original_output,
+            preview_chars=preview_chars,
+            ref=ref,
+            tool_name=part.tool_name,
+            sha256=digest,
+            reason=reason,
+            original_chars=len(original_output),
+        )
+        part.tool_output_ref = ref
+        part.tool_output_truncated = True
+        part.tool_output_original_chars = len(original_output)
+        part.tool_output_preview_chars = len(part.tool_output)
+        part.tool_output_sha256 = digest
+        part.tool_output_storage_uri = ref
+        part.tool_output_mime_type = stored.metadata.get("mime_type", "text/plain")
+        part.tool_output_group_id = group_id
+        part.tool_output_externalized_reason = reason
+        part.tool_output_group_original_chars = group_original_chars
+        part.tool_output_group_budget_chars = cfg.assistant_turn_inline_budget_chars
+
+    def _externalize_large_tool_output_group(self, messages: List[Message]) -> None:
+        cfg = self._tool_output_externalization_config
+        if not cfg.enabled:
+            return
+
+        tool_parts = [
+            (msg, p)
+            for msg in messages
+            for p in msg.parts
+            if isinstance(p, ToolPart) and (p.tool_output or "")
+        ]
+        if not tool_parts:
+            return
+
+        group_id = messages[0].id
+        group_original_chars = sum(len(p.tool_output or "") for _, p in tool_parts)
+        normal_indices: List[int] = []
+        selected: set[int] = set()
+
+        for idx, (_msg, part) in enumerate(tool_parts):
+            part.tool_output_group_id = group_id
+            part.tool_output_group_original_chars = group_original_chars
+            part.tool_output_group_budget_chars = cfg.assistant_turn_inline_budget_chars
+            if self._rewrite_source_read_tool_output(
+                part,
+                cfg,
+                group_id=group_id,
+                group_original_chars=group_original_chars,
+            ):
+                continue
+            if part.tool_output_ref and part.tool_output_truncated:
+                continue
+            normal_indices.append(idx)
+            if len(part.tool_output or "") > cfg.threshold_chars:
+                selected.add(idx)
+
+        def projected_inline_chars(selected_indices: set[int]) -> int:
+            preview_chars = self._effective_tool_preview_chars(cfg, len(selected_indices))
+            total = 0
+            for idx, (_, part) in enumerate(tool_parts):
+                output_len = len(part.tool_output or "")
+                if idx in selected_indices:
+                    total += min(output_len, preview_chars)
+                else:
+                    total += output_len
+            return total
+
+        remaining = sorted(
+            [idx for idx in normal_indices if idx not in selected],
+            key=lambda idx: len(tool_parts[idx][1].tool_output or ""),
+            reverse=True,
+        )
+        while (
+            projected_inline_chars(selected) > cfg.assistant_turn_inline_budget_chars and remaining
+        ):
+            selected.add(remaining.pop(0))
+
+        preview_chars = self._effective_tool_preview_chars(cfg, len(selected))
+        for idx in sorted(selected):
+            msg, part = tool_parts[idx]
+            reason = (
+                "single_threshold"
+                if len(part.tool_output or "") > cfg.threshold_chars
+                else "turn_budget"
+            )
+            self._externalize_tool_part(
+                msg,
+                part,
+                cfg,
+                preview_chars=preview_chars,
+                reason=reason,
+                group_id=group_id,
+                group_original_chars=group_original_chars,
+            )
+
+    def _externalize_large_tool_outputs(self, msg: Message) -> None:
+        self._externalize_large_tool_output_group([msg])
+
+    def _is_tool_result_aggregate(self, role: str, parts: List[Part]) -> bool:
+        return (
+            role == "user" and len(parts) > 1 and all(isinstance(part, ToolPart) for part in parts)
+        )
+
+    def _append_messages(self, messages: List[Message]) -> None:
+        """Append multiple messages: update lists, stats, JSONL, meta."""
+        for msg in messages:
+            self._messages.append(msg)
+            self._record_participant(msg)
+
+            if msg.role == "user":
+                self._stats.total_turns += 1
+            msg_tokens = int(msg.estimated_tokens or 0)
+            self._stats.total_tokens += msg_tokens
+
+            keep = int(self._meta.keep_recent_count or 0)
+            if keep <= 0:
+                self._meta.pending_tokens += msg_tokens
+            elif len(self._messages) > keep:
+                pushed_out = self._messages[-(keep + 1)]
+                self._meta.pending_tokens += int(pushed_out.estimated_tokens or 0)
+
+        self._append_messages_to_jsonl_batch(messages)
+
+        self._meta.message_count = len(self._messages)
+        if self._meta.total_message_count is not None:
+            self._meta.total_message_count += len(messages)
+        self._save_meta_sync()
+
+    def add_messages(
+        self,
+        messages_spec: List[dict],
+    ) -> List[Message]:
+        """Add multiple messages in a single batch.
+
+        Args:
+            messages_spec: List of dicts, each with keys:
+                role, parts, role_id (optional), created_at (optional)
+        """
+        all_messages = []
+        for i, spec in enumerate(messages_spec):
+            if "role" not in spec:
+                raise ValueError(f"messages_spec[{i}]: missing required key 'role'")
+            if "parts" not in spec:
+                raise ValueError(f"messages_spec[{i}]: missing required key 'parts'")
+            role = spec["role"]
+            parts = spec["parts"]
+            role_id = spec.get("role_id")
+            created_at = spec.get("created_at") or datetime.now(timezone.utc).isoformat()
+
+            if self._is_tool_result_aggregate(role, parts):
+                msgs = [
+                    Message(
+                        id=f"msg_{uuid4().hex}",
+                        role=role,
+                        parts=[part],
+                        role_id=role_id,
+                        created_at=created_at,
+                    )
+                    for part in parts
+                ]
+                self._externalize_large_tool_output_group(msgs)
+                all_messages.extend(msgs)
+            else:
+                msg = Message(
+                    id=f"msg_{uuid4().hex}",
+                    role=role,
+                    parts=parts,
+                    role_id=role_id,
+                    created_at=created_at,
+                )
+                self._externalize_large_tool_outputs(msg)
+                all_messages.append(msg)
+
+        self._append_messages(all_messages)
+        return all_messages
+
     def add_message(
         self,
         role: str,
@@ -486,42 +838,18 @@ class Session:
         role_id: Optional[str] = None,
         created_at: str = None,
     ) -> Message:
-        """Add a message."""
-        msg = Message(
-            id=f"msg_{uuid4().hex}",
-            role=role,
-            parts=parts,
-            role_id=role_id,
-            created_at=created_at or datetime.now(timezone.utc).isoformat(),
-        )
-        self._messages.append(msg)
-        self._record_participant(msg)
+        """Add a message.
 
-        # Update statistics
-        if role == "user":
-            self._stats.total_turns += 1
-        msg_tokens = int(msg.estimated_tokens or 0)
-        self._stats.total_tokens += msg_tokens
-
-        # WM v2: maintain pending_tokens via sliding window.
-        # keep_recent_count == 0 (never-committed or compact path that chose 0):
-        #   every new message contributes to pending.
-        # keep_recent_count > 0:
-        #   only the message pushed OUT of the tail-keep window contributes.
-        keep = int(self._meta.keep_recent_count or 0)
-        if keep <= 0:
-            self._meta.pending_tokens += msg_tokens
-        elif len(self._messages) > keep:
-            pushed_out = self._messages[-(keep + 1)]
-            self._meta.pending_tokens += int(pushed_out.estimated_tokens or 0)
-
-        self._append_to_jsonl(msg)
-
-        self._meta.message_count = len(self._messages)
-        if self._meta.total_message_count is not None:
-            self._meta.total_message_count += 1
-        self._save_meta_sync()
-        return msg
+        A user message containing only multiple tool results is treated as a
+        transport aggregate and stored as one message per tool result.
+        """
+        msgs = self.add_messages([{
+            "role": role,
+            "parts": parts,
+            "role_id": role_id,
+            "created_at": created_at,
+        }])
+        return msgs[0]
 
     def _record_participant(self, msg: Message) -> None:
         if msg.role == "user" and msg.role_id:
@@ -549,22 +877,85 @@ class Session:
 
         tool_part.tool_output = output
         tool_part.tool_status = status
+        tool_part.tool_output_ref = ""
+        tool_part.tool_output_truncated = False
+        tool_part.tool_output_original_chars = None
+        tool_part.tool_output_preview_chars = None
+        tool_part.tool_output_sha256 = ""
+        tool_part.tool_output_storage_uri = ""
+        tool_part.tool_output_source_ref = ""
+        tool_part.tool_output_source_offset = None
+        tool_part.tool_output_source_limit = None
+        tool_part.tool_output_externalization_error = ""
+        tool_part.tool_output_externalized_reason = ""
+        self._externalize_large_tool_outputs(msg)
 
-        self._save_tool_result(tool_id, msg, output, status)
+        self._save_tool_result(tool_id, msg, tool_part.tool_output, status)
         self._update_message_in_jsonl()
         self._rebuild_pending_tokens()
+
+    async def read_tool_result(
+        self,
+        tool_result_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 20_000,
+        include_metadata: bool = True,
+    ) -> Dict[str, Any]:
+        store = self._tool_result_store()
+        if not store:
+            from openviking_cli.exceptions import NotFoundError
+
+            raise NotFoundError(tool_result_id, "tool result")
+        return await store.read(
+            tool_result_id,
+            offset=offset,
+            limit=limit,
+            include_metadata=include_metadata,
+        )
+
+    async def search_tool_result(
+        self,
+        tool_result_id: str,
+        *,
+        query: str,
+        limit: int = 20,
+        context_chars: int = 300,
+    ) -> Dict[str, Any]:
+        store = self._tool_result_store()
+        if not store:
+            from openviking_cli.exceptions import NotFoundError
+
+            raise NotFoundError(tool_result_id, "tool result")
+        return await store.search(
+            tool_result_id,
+            query=query,
+            limit=limit,
+            context_chars=context_chars,
+        )
+
+    async def list_tool_results(
+        self,
+        *,
+        tool_name: Optional[str] = None,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        store = self._tool_result_store()
+        if not store:
+            return {"tool_results": []}
+        return await store.list(tool_name=tool_name, limit=limit)
 
     def commit(self, keep_recent_count: int = 0) -> Dict[str, Any]:
         """Sync wrapper for commit_async()."""
         return run_async(self.commit_async(keep_recent_count=keep_recent_count))
 
-    @tracer("session.commit")
+    @tracer("session.commit.phase1")
     async def commit_async(self, keep_recent_count: int = 0) -> Dict[str, Any]:
         """Async commit session: archive immediately, extract memories in background.
 
-        Phase 1 (Archive prep, PathLock-protected): Split messages into
+        Phase 1 (Archive prep, path-lock protected): Split messages into
         archive/retain parts, write the retained tail back to messages.jsonl,
-        then persist the archive. Uses a distributed filesystem lock (PathLock)
+        then persist the archive. Uses a distributed filesystem lock
         so this works across workers and processes.
         Phase 2 (Memory extraction): Always runs in background via
         asyncio.create_task().
@@ -589,7 +980,7 @@ class Session:
             f"keep_recent_count={keep_recent_count}"
         )
 
-        # ===== Phase 1: Snapshot + clear (PathLock-protected) =====
+        # ===== Phase 1: Snapshot + clear (path-lock protected) =====
         # Fast pre-check: skip lock entirely if no messages (common case avoids
         # unnecessary filesystem lock acquisition).
         if not self._messages:
@@ -616,7 +1007,7 @@ class Session:
 
         # Use filesystem-based distributed lock so this works across workers/processes.
         session_path = self._viking_fs._uri_to_path(self._session_uri, ctx=self.ctx)
-        async with LockContext(get_lock_manager(), [session_path], lock_mode="point"):
+        async with LockContext(get_lock_manager(), [session_path], lock_mode="exact"):
             # Authoritative check under lock: handles the race where two concurrent
             # callers both passed the pre-check but only the first should archive.
             if not self._messages:
@@ -706,11 +1097,11 @@ class Session:
 
         # Create TaskRecord for tracking Phase 2
         tracker = get_task_tracker()
-        task = tracker.create(
+        task = await tracker.create(
             "session_commit",
             resource_id=self.session_id,
-            owner_account_id=self.ctx.account_id,
-            owner_user_id=self.ctx.user.user_id,
+            account_id=self.ctx.account_id,
+            user_id=self.ctx.user.user_id,
         )
 
         asyncio.create_task(
@@ -733,6 +1124,7 @@ class Session:
             "trace_id": trace_id,
         }
 
+    @tracer("session.commit.phase2", ignore_result=True, ignore_args=True)
     async def _run_memory_extraction(
         self,
         task_id: str,
@@ -754,10 +1146,14 @@ class Session:
         request_wait_tracker = get_request_wait_tracker()
 
         memories_extracted: Dict[str, int] = {}
+        extracted_skill_results: list[dict] = []
         active_count_updated = 0
         telemetry = OperationTelemetry(operation="session_commit_phase2", enabled=True)
         archive_index = self._archive_index_from_uri(archive_uri)
         redo_task_id: Optional[str] = None
+        lock_manager = get_lock_manager()
+        redo_enabled = lock_manager.redo_recovery_enabled
+        redo_log = lock_manager.redo_log
 
         try:
             if not await self._wait_for_previous_archive_done(archive_index):
@@ -770,101 +1166,198 @@ class Session:
                     ),
                     blocked_by=f"archive_{archive_index - 1:03d}",
                 )
-                tracker.fail(
+                await tracker.fail(
                     task_id,
                     f"Previous archive archive_{archive_index - 1:03d} failed; "
                     "cannot continue session commit",
+                    account_id=self.ctx.account_id,
+                    user_id=self.ctx.user.user_id,
                 )
                 return
 
-            tracker.start(task_id)
+            await tracker.start(
+                task_id,
+                account_id=self.ctx.account_id,
+                user_id=self.ctx.user.user_id,
+            )
             request_wait_tracker.register_request(telemetry.telemetry_id)
             register_telemetry(telemetry)
             try:
                 with bind_telemetry(telemetry):
                     # redo-log protection
-                    redo_task_id = str(uuid.uuid4())
-                    redo_log = get_lock_manager().redo_log
-                    redo_log.write_pending(
-                        redo_task_id,
-                        {
-                            "archive_uri": archive_uri,
-                            "session_uri": self._session_uri,
-                            "account_id": self.ctx.account_id,
-                            "user_id": self.ctx.user.user_id,
-                            "agent_id": self.ctx.user.agent_id,
-                            "role": self.ctx.role.value,
-                        },
-                    )
+                    if redo_enabled:
+                        redo_task_id = str(uuid.uuid4())
+                        await redo_log.write_pending_async(
+                            redo_task_id,
+                            {
+                                "archive_uri": archive_uri,
+                                "session_uri": self._session_uri,
+                                "account_id": self.ctx.account_id,
+                                "user_id": self.ctx.user.user_id,
+                                "agent_id": self.ctx.user.agent_id,
+                                "role": self.ctx.role.value,
+                            },
+                        )
 
                     latest_archive_overview = await self._get_latest_completed_archive_overview(
                         exclude_archive_uri=archive_uri
                     )
+                    extraction_messages = await self._hydrate_tool_outputs_for_extraction(messages)
 
-                    # Generate summary and write L0/L1 to archive
-                    summary = await self._generate_archive_summary_async(
-                        messages,
-                        latest_archive_overview=latest_archive_overview,
-                    )
-                    if self._viking_fs and summary:
-                        abstract = self._extract_abstract_from_summary(summary)
-                        await self._viking_fs.write_file(
-                            uri=f"{archive_uri}/.abstract.md",
-                            content=abstract,
-                            ctx=self.ctx,
-                        )
-                        await self._viking_fs.write_file(
-                            uri=f"{archive_uri}/.overview.md",
-                            content=summary,
-                            ctx=self.ctx,
-                        )
-                        await self._viking_fs.write_file(
-                            uri=f"{archive_uri}/.meta.json",
-                            content=json.dumps(
-                                {
-                                    "overview_tokens": -(-len(summary) // 4),
-                                    "abstract_tokens": -(-len(abstract) // 4),
-                                }
-                            ),
-                            ctx=self.ctx,
-                        )
-
-                    # Memory extraction
-                    if self._session_compressor:
-                        logger.info(
-                            f"Starting memory extraction from {len(messages)} archived messages"
-                        )
-                        extracted = await self._session_compressor.extract_long_term_memories(
-                            messages=messages,
-                            user=self.user,
-                            session_id=self.session_id,
-                            ctx=self.ctx,
+                    async def _run_archive_summary() -> None:
+                        summary = await self._generate_archive_summary_async(
+                            extraction_messages,
                             latest_archive_overview=latest_archive_overview,
-                            archive_uri=archive_uri,
                         )
-                        logger.info(f"Extracted {len(extracted)} memories")
-                        for ctx_item in extracted:
-                            cat = getattr(ctx_item, "category", "") or "unknown"
-                            memories_extracted[cat] = memories_extracted.get(cat, 0) + 1
-                        self._stats.memories_extracted += len(extracted)
-                        get_current_telemetry().set("memory.extracted", len(extracted))
+                        if self._viking_fs and summary:
+                            abstract = self._extract_abstract_from_summary(summary)
+                            await self._viking_fs.write_file(
+                                uri=f"{archive_uri}/.abstract.md",
+                                content=abstract,
+                                ctx=self.ctx,
+                            )
+                            await self._viking_fs.write_file(
+                                uri=f"{archive_uri}/.overview.md",
+                                content=summary,
+                                ctx=self.ctx,
+                            )
+                            await self._viking_fs.write_file(
+                                uri=f"{archive_uri}/.meta.json",
+                                content=json.dumps(
+                                    {
+                                        "overview_tokens": -(-len(summary) // 4),
+                                        "abstract_tokens": -(-len(abstract) // 4),
+                                    }
+                                ),
+                                ctx=self.ctx,
+                            )
+
+                    # Summary generation, user memory and agent memory all run concurrently.
+                    ov_config = get_openviking_config()
+                    memory_extraction_enabled = ov_config.memory.extraction_enabled
+                    session_skill_extraction_enabled = (
+                        ov_config.memory.session_skill_extraction_enabled
+                    )
+                    if self._session_compressor and (
+                        memory_extraction_enabled or session_skill_extraction_enabled
+                    ):
+                        logger.info(
+                            "Starting post-commit extraction from %s archived messages",
+                            len(messages),
+                        )
+
+                        has_agent_memory = hasattr(
+                            self._session_compressor, "extract_agent_memories"
+                        )
+
+                        async def _noop_list():
+                            return []
+
+                        async def _noop_agent_result():
+                            return {"contexts": [], "session_skills": []}
+
+                        async def _run_long_term_memories():
+                            if not memory_extraction_enabled:
+                                return []
+                            return await self._session_compressor.extract_long_term_memories(
+                                messages=extraction_messages,
+                                user=self.user,
+                                session_id=self.session_id,
+                                ctx=self.ctx,
+                                latest_archive_overview=latest_archive_overview,
+                                archive_uri=archive_uri,
+                            )
+
+                        async def _run_agent_memories():
+                            if not has_agent_memory:
+                                return {"contexts": [], "session_skills": []}
+                            if not (memory_extraction_enabled or session_skill_extraction_enabled):
+                                return {"contexts": [], "session_skills": []}
+                            return await self._session_compressor.extract_agent_memories(
+                                messages=extraction_messages,
+                                ctx=self.ctx,
+                                latest_archive_overview=latest_archive_overview,
+                                archive_uri=archive_uri,
+                            )
+
+                        _results = await asyncio.gather(
+                            _run_archive_summary(),
+                            _run_long_term_memories(),
+                            _run_agent_memories() if has_agent_memory else _noop_agent_result(),
+                            return_exceptions=True,
+                        )
+                        summary_result, extracted_result, agent_result = _results
+
+                        if isinstance(summary_result, Exception):
+                            logger.error(
+                                f"Archive summary generation failed: {summary_result}",
+                                exc_info=summary_result,
+                            )
+                        if isinstance(extracted_result, Exception):
+                            logger.error(
+                                f"User memory extraction failed: {extracted_result}",
+                                exc_info=extracted_result,
+                            )
+                            raise extracted_result
+                        else:
+                            extracted = extracted_result
+
+                        if isinstance(agent_result, Exception):
+                            logger.error(
+                                f"Agent memory extraction failed: {agent_result}",
+                                exc_info=agent_result,
+                            )
+                            agent_extracted = []
+                            session_skills = []
+                        else:
+                            agent_extracted = list(agent_result.get("contexts", []))
+                            session_skills = list(agent_result.get("session_skills", []))
+
+                        if memory_extraction_enabled:
+                            logger.info(f"Extracted {len(extracted)} memories")
+                            for ctx_item in extracted:
+                                cat = getattr(ctx_item, "category", "") or "unknown"
+                                memories_extracted[cat] = memories_extracted.get(cat, 0) + 1
+                            self._stats.memories_extracted += len(extracted)
+                            get_current_telemetry().set("memory.extracted", len(extracted))
+
+                        if agent_extracted:
+                            logger.info(f"Extracted {len(agent_extracted)} agent memories")
+                            for ctx_item in agent_extracted:
+                                cat = getattr(ctx_item, "category", "") or "unknown"
+                                memories_extracted[cat] = memories_extracted.get(cat, 0) + 1
+                            self._stats.memories_extracted += len(agent_extracted)
+                        if session_skills:
+                            logger.info(f"Extracted {len(session_skills)} session skills")
+                            extracted_skill_results = session_skills
+                    else:
+                        if self._session_compressor:
+                            logger.info(
+                                "Memory and session skill extraction are disabled by config "
+                                "(memory.extraction_enabled=false, "
+                                "memory.session_skill_extraction_enabled=false)"
+                            )
+                        await _run_archive_summary()
 
                     # Write relations (using snapshot, not self._usage_records)
                     if self._viking_fs:
                         for usage in usage_records:
                             try:
-                                await self._viking_fs.link(self._session_uri, usage.uri, ctx=self.ctx)
+                                await self._viking_fs.link(
+                                    self._session_uri, usage.uri, ctx=self.ctx
+                                )
                             except Exception as e:
                                 logger.warning(f"Failed to create relation to {usage.uri}: {e}")
 
-                    redo_log.mark_done(redo_task_id)
+                    if redo_enabled and redo_task_id:
+                        await redo_log.mark_done_async(redo_task_id)
 
                     # Update active_count (using snapshot, not self._usage_records)
                     if self._vikingdb_manager:
                         uris = [u.uri for u in usage_records if u.uri]
                         try:
-                            active_count_updated = await self._vikingdb_manager.increment_active_count(
-                                self.ctx, uris
+                            active_count_updated = (
+                                await self._vikingdb_manager.increment_active_count(self.ctx, uris)
                             )
                         except Exception as e:
                             logger.debug(f"Could not update active_count for usage URIs: {e}")
@@ -905,12 +1398,18 @@ class Session:
             # Write .done file last — signals that all state is finalized
             await self._write_done_file(archive_uri, first_message_id, last_message_id)
 
-            tracker.complete(
+            await tracker.complete(
                 task_id,
                 {
                     "session_id": self.session_id,
                     "archive_uri": archive_uri,
                     "memories_extracted": memories_extracted,
+                    "session_skills_extracted": len(extracted_skill_results),
+                    "session_skill_uris": [
+                        item.get("uri") or item.get("root_uri")
+                        for item in extracted_skill_results
+                        if isinstance(item, dict) and (item.get("uri") or item.get("root_uri"))
+                    ],
                     "active_count_updated": active_count_updated,
                     "token_usage": {
                         "llm": dict(self._meta.llm_token_usage),
@@ -921,17 +1420,40 @@ class Session:
                         },
                     },
                 },
+                account_id=self.ctx.account_id,
+                user_id=self.ctx.user.user_id,
             )
             logger.info(f"Session {self.session_id} memory extraction completed")
+        except asyncio.CancelledError as e:
+            if redo_enabled and redo_task_id:
+                await redo_log.mark_done_async(redo_task_id)
+            try:
+                await self._write_failed_marker(
+                    archive_uri,
+                    stage="memory_extraction",
+                    error=f"cancelled: {e}",
+                )
+            except Exception:
+                logger.debug("Failed to write cancelled marker for session %s", self.session_id)
+            await tracker.fail(
+                task_id,
+                f"cancelled: {e}",
+                account_id=self.ctx.account_id,
+                user_id=self.ctx.user.user_id,
+            )
+            logger.warning("Memory extraction cancelled for session %s", self.session_id)
+            raise
         except Exception as e:
-            if redo_task_id:
-                get_lock_manager().redo_log.mark_done(redo_task_id)
+            if redo_enabled and redo_task_id:
+                await redo_log.mark_done_async(redo_task_id)
             await self._write_failed_marker(
                 archive_uri,
                 stage="memory_extraction",
                 error=str(e),
             )
-            tracker.fail(task_id, str(e))
+            await tracker.fail(
+                task_id, str(e), account_id=self.ctx.account_id, user_id=self.ctx.user.user_id
+            )
             logger.exception(f"Memory extraction failed for session {self.session_id}")
 
     async def _write_done_file(
@@ -1482,8 +2004,10 @@ class Session:
           tool_call / JSON / schema anomaly, fall back to the creation
           prompt so we never persist malformed output as WM.
         """
-        _wm_debug(f"_generate_archive_summary_async called "
-                  f"messages={len(messages)} prior_wm={len(latest_archive_overview)}B")
+        _wm_debug(
+            f"_generate_archive_summary_async called "
+            f"messages={len(messages)} prior_wm={len(latest_archive_overview)}B"
+        )
         if not messages:
             return ""
 
@@ -1493,8 +2017,7 @@ class Session:
         if not (vlm and vlm.is_available()):
             turn_count = len([m for m in messages if m.role == "user"])
             return (
-                f"# Session Summary\n\n"
-                f"**Overview**: {turn_count} turns, {len(messages)} messages"
+                f"# Session Summary\n\n**Overview**: {turn_count} turns, {len(messages)} messages"
             )
 
         try:
@@ -1503,8 +2026,7 @@ class Session:
             logger.warning(f"Prompt module unavailable: {e}")
             turn_count = len([m for m in messages if m.role == "user"])
             return (
-                f"# Session Summary\n\n"
-                f"**Overview**: {turn_count} turns, {len(messages)} messages"
+                f"# Session Summary\n\n**Overview**: {turn_count} turns, {len(messages)} messages"
             )
 
         # -------- Detect WM v2 format --------
@@ -1521,7 +2043,10 @@ class Session:
             try:
                 prompt = render_prompt(
                     "compression.ov_wm_v2",
-                    {"messages": formatted, "latest_archive_overview": latest_archive_overview or ""},
+                    {
+                        "messages": formatted,
+                        "latest_archive_overview": latest_archive_overview or "",
+                    },
                 )
                 return await vlm.get_completion_async(prompt)
             except Exception as e:
@@ -1557,14 +2082,12 @@ class Session:
             )
         except Exception as e:
             import traceback as _tb
-            _wm_debug(
-                f"tool_call raised: {type(e).__name__}: {e} "
-                f"tb={_tb.format_exc()[-400:]}"
+
+            _wm_debug(f"tool_call raised: {type(e).__name__}: {e} tb={_tb.format_exc()[-400:]}")
+            logger.warning("WM update tool_call failed (%s); falling back to creation prompt", e)
+            return await self._fallback_generate_wm_creation(
+                formatted, messages, latest_archive_overview
             )
-            logger.warning(
-                "WM update tool_call failed (%s); falling back to creation prompt", e
-            )
-            return await self._fallback_generate_wm_creation(formatted, messages, latest_archive_overview)
 
         has_tc = bool(getattr(resp, "has_tool_calls", False) and getattr(resp, "tool_calls", None))
         _preview = (str(resp)[:200]).replace(chr(10), " ")
@@ -1576,17 +2099,14 @@ class Session:
         )
 
         if not has_tc:
-            logger.warning(
-                "WM update: LLM returned no tool_call; falling back to creation prompt"
+            logger.warning("WM update: LLM returned no tool_call; falling back to creation prompt")
+            return await self._fallback_generate_wm_creation(
+                formatted, messages, latest_archive_overview
             )
-            return await self._fallback_generate_wm_creation(formatted, messages, latest_archive_overview)
 
         try:
             raw_args = resp.tool_calls[0].arguments
-            _wm_debug(
-                f"raw_args type={type(raw_args).__name__} "
-                f"preview={str(raw_args)[:400]!r}"
-            )
+            _wm_debug(f"raw_args type={type(raw_args).__name__} preview={str(raw_args)[:400]!r}")
             args = raw_args
             if isinstance(args, str):
                 args = json.loads(args)
@@ -1612,8 +2132,7 @@ class Session:
                             patched = raw_str.rstrip().rstrip(",") + ("}" * opens)
                             recovered = json.loads(patched)
                             _wm_debug(
-                                f"recovered by closing {opens} brace(s); "
-                                f"patched_len={len(patched)}"
+                                f"recovered by closing {opens} brace(s); patched_len={len(patched)}"
                             )
                     except Exception as e2:
                         _wm_debug(f"brace-close recovery failed: {e2}")
@@ -1630,15 +2149,12 @@ class Session:
                 _wm_debug("args has section keys directly; accepting as ops")
                 ops = args
             else:
-                raise ValueError(
-                    f"tool_call arguments.sections missing; keys={list(args.keys())}"
-                )
+                raise ValueError(f"tool_call arguments.sections missing; keys={list(args.keys())}")
             if not isinstance(ops, dict):
                 raise ValueError("ops is not a dict")
         except Exception as e:
             _wm_debug(
-                f"args parse failed: {type(e).__name__}: {e}; "
-                f"attempting regex recovery from raw"
+                f"args parse failed: {type(e).__name__}: {e}; attempting regex recovery from raw"
             )
             # Regex salvage: when the LLM emits slightly-broken JSON (curly
             # quote, unescaped newline, truncated string), OV's VLM backend
@@ -1671,15 +2187,15 @@ class Session:
                     len(WM_SEVEN_SECTIONS),
                 )
                 return self._merge_wm_sections(latest_archive_overview, salvaged)
-            _wm_debug(
-                "regex recovery salvaged 0 sections; falling back to creation prompt"
-            )
+            _wm_debug("regex recovery salvaged 0 sections; falling back to creation prompt")
             logger.warning(
                 "WM update: tool_call arguments parse failed (%s); "
                 "regex recovery found nothing; falling back to creation prompt",
                 e,
             )
-            return await self._fallback_generate_wm_creation(formatted, messages, latest_archive_overview)
+            return await self._fallback_generate_wm_creation(
+                formatted, messages, latest_archive_overview
+            )
 
         _wm_debug(
             f"ops keys={list(ops.keys())[:7]} "
@@ -1714,8 +2230,7 @@ class Session:
             logger.warning(f"WM creation fallback failed: {e}")
             turn_count = len([m for m in messages if m.role == "user"])
             return (
-                f"# Session Summary\n\n"
-                f"**Overview**: {turn_count} turns, {len(messages)} messages"
+                f"# Session Summary\n\n**Overview**: {turn_count} turns, {len(messages)} messages"
             )
 
     @staticmethod
@@ -1787,9 +2302,11 @@ class Session:
         return "<section_size_warnings>\n" + "\n\n".join(warnings) + "\n</section_size_warnings>"
 
     # Sections where server enforces APPEND-only regardless of what the LLM emits.
-    _WM_APPEND_ONLY_SECTIONS = frozenset({
-        "Errors & Corrections",
-    })
+    _WM_APPEND_ONLY_SECTIONS = frozenset(
+        {
+            "Errors & Corrections",
+        }
+    )
 
     # Very loose path-like token regex used to detect file paths that existed
     # in prior Files & Context and MUST NOT silently disappear after UPDATE.
@@ -1799,11 +2316,32 @@ class Session:
         re.IGNORECASE,
     )
 
-    _WM_TITLE_STOPWORDS = frozenset({
-        "the", "a", "an", "and", "or", "of", "to", "in", "on", "for",
-        "with", "by", "at", "from", "session", "title", "working", "memory",
-        "plan", "plans", "notes", "note",
-    })
+    _WM_TITLE_STOPWORDS = frozenset(
+        {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "of",
+            "to",
+            "in",
+            "on",
+            "for",
+            "with",
+            "by",
+            "at",
+            "from",
+            "session",
+            "title",
+            "working",
+            "memory",
+            "plan",
+            "plans",
+            "notes",
+            "note",
+        }
+    )
 
     @staticmethod
     def _wm_recover_ops_from_raw(raw_str: str) -> Dict[str, Any]:
@@ -1828,9 +2366,7 @@ class Session:
         names_alt = "|".join(re.escape(n) for n in WM_SEVEN_SECTIONS)
 
         # --- KEEP: "Name": {"op": "KEEP"} ---
-        keep_re = re.compile(
-            rf'"({names_alt})"\s*:\s*\{{\s*"op"\s*:\s*"KEEP"\s*\}}'
-        )
+        keep_re = re.compile(rf'"({names_alt})"\s*:\s*\{{\s*"op"\s*:\s*"KEEP"\s*\}}')
         for m in keep_re.finditer(raw_str):
             ops.setdefault(m.group(1), {"op": "KEEP"})
 
@@ -1860,7 +2396,7 @@ class Session:
         # Tolerate truncated array (no closing ']').
         append_re = re.compile(
             rf'"({names_alt})"\s*:\s*\{{\s*"op"\s*:\s*"APPEND"\s*,\s*"items"\s*:\s*\['
-            rf'([\s\S]*?)(?:\]|$)',
+            rf"([\s\S]*?)(?:\]|$)",
         )
         item_re = re.compile(r'"((?:[^"\\]|\\.)*)"', re.DOTALL)
         for m in append_re.finditer(raw_str):
@@ -1901,9 +2437,7 @@ class Session:
         return items
 
     @staticmethod
-    def _wm_enforce_append_only(
-        header: str, op: Any, old_content: str
-    ) -> Dict[str, Any]:
+    def _wm_enforce_append_only(header: str, op: Any, old_content: str) -> Dict[str, Any]:
         """Guard: force KEEP/APPEND semantics on APPEND-only sections.
 
         - KEEP and APPEND pass through.
@@ -1959,22 +2493,117 @@ class Session:
         r"\b(?:because|decided|chose|committed|agreed|resolved)\b",
         re.IGNORECASE,
     )
-    _WM_ANCHOR_STOPWORDS = frozenset({
-        "the", "a", "an", "and", "or", "of", "to", "in", "on", "for",
-        "with", "by", "at", "from", "is", "are", "was", "were", "has",
-        "have", "had", "been", "be", "will", "would", "could", "should",
-        "may", "might", "shall", "this", "that", "these", "those",
-        "not", "no", "but", "if", "then", "so", "as", "it", "its",
-        "they", "their", "them", "she", "her", "he", "him", "his",
-        "we", "our", "us", "you", "your", "who", "which", "what",
-        "when", "where", "how", "why", "all", "each", "every",
-        "both", "few", "more", "most", "other", "some", "such",
-        "than", "too", "very", "also", "just", "about", "after",
-        "before", "between", "into", "through", "during", "again",
-        "further", "once", "here", "there", "over", "under", "out",
-        "up", "down", "off", "own", "same", "only", "new", "old",
-        "key", "facts", "decisions", "session", "working", "memory",
-    })
+    _WM_ANCHOR_STOPWORDS = frozenset(
+        {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "of",
+            "to",
+            "in",
+            "on",
+            "for",
+            "with",
+            "by",
+            "at",
+            "from",
+            "is",
+            "are",
+            "was",
+            "were",
+            "has",
+            "have",
+            "had",
+            "been",
+            "be",
+            "will",
+            "would",
+            "could",
+            "should",
+            "may",
+            "might",
+            "shall",
+            "this",
+            "that",
+            "these",
+            "those",
+            "not",
+            "no",
+            "but",
+            "if",
+            "then",
+            "so",
+            "as",
+            "it",
+            "its",
+            "they",
+            "their",
+            "them",
+            "she",
+            "her",
+            "he",
+            "him",
+            "his",
+            "we",
+            "our",
+            "us",
+            "you",
+            "your",
+            "who",
+            "which",
+            "what",
+            "when",
+            "where",
+            "how",
+            "why",
+            "all",
+            "each",
+            "every",
+            "both",
+            "few",
+            "more",
+            "most",
+            "other",
+            "some",
+            "such",
+            "than",
+            "too",
+            "very",
+            "also",
+            "just",
+            "about",
+            "after",
+            "before",
+            "between",
+            "into",
+            "through",
+            "during",
+            "again",
+            "further",
+            "once",
+            "here",
+            "there",
+            "over",
+            "under",
+            "out",
+            "up",
+            "down",
+            "off",
+            "own",
+            "same",
+            "only",
+            "new",
+            "old",
+            "key",
+            "facts",
+            "decisions",
+            "session",
+            "working",
+            "memory",
+        }
+    )
 
     @staticmethod
     def _extract_lexical_anchors(text: str) -> set:
@@ -2007,16 +2636,12 @@ class Session:
             if key and key not in old_lower:
                 fresh_items.append(it)
         if fresh_items:
-            _wm_debug(
-                f"guard: salvaged {len(fresh_items)} new items from rejected UPDATE"
-            )
+            _wm_debug(f"guard: salvaged {len(fresh_items)} new items from rejected UPDATE")
             return {"op": "APPEND", "items": fresh_items}
         return {"op": "KEEP"}
 
     @staticmethod
-    def _wm_enforce_key_facts_consolidation(
-        op: Any, old_content: str
-    ) -> Dict[str, Any]:
+    def _wm_enforce_key_facts_consolidation(op: Any, old_content: str) -> Dict[str, Any]:
         """Guard: allow controlled consolidation for Key Facts & Decisions.
 
         Layer 1 — reject trivially small UPDATEs (< 15% bullet count).
@@ -2050,10 +2675,7 @@ class Session:
                 append_items = Session._wm_extract_bullet_items(raw)
             append_items = [str(it) for it in append_items if it]
             old_lower = (old_content or "").lower()
-            fresh = [
-                it for it in append_items
-                if it.strip("_* `").lower() not in old_lower
-            ]
+            fresh = [it for it in append_items if it.strip("_* `").lower() not in old_lower]
             emergency = (
                 len(old_items) > Session._WM_SECTION_BULLET_THRESHOLD * 2
                 or est_tokens > Session._WM_SECTION_TOKEN_THRESHOLD * 2
@@ -2110,13 +2732,9 @@ class Session:
                 f"new={len(new_items)} / old={len(old_items)} = "
                 f"{ratio:.2%} < {Session._WM_KEY_FACTS_MIN_BULLET_RATIO:.0%}"
             )
-            salvaged = Session._salvage_new_items_from_rejected_update(
-                new_content, old_content
-            )
+            salvaged = Session._salvage_new_items_from_rejected_update(new_content, old_content)
             if is_emergency and salvaged.get("op") == "APPEND":
-                _wm_debug(
-                    "guard: suppressing salvage APPEND (emergency level)"
-                )
+                _wm_debug("guard: suppressing salvage APPEND (emergency level)")
                 return {"op": "KEEP"}
             return salvaged
 
@@ -2133,13 +2751,9 @@ class Session:
                     f"({covered}/{len(old_anchors)}) < "
                     f"{Session._WM_KEY_FACTS_MIN_ANCHOR_COVERAGE:.0%}"
                 )
-                salvaged = Session._salvage_new_items_from_rejected_update(
-                    new_content, old_content
-                )
+                salvaged = Session._salvage_new_items_from_rejected_update(new_content, old_content)
                 if is_emergency and salvaged.get("op") == "APPEND":
-                    _wm_debug(
-                        "guard: suppressing salvage APPEND (emergency level)"
-                    )
+                    _wm_debug("guard: suppressing salvage APPEND (emergency level)")
                     return {"op": "KEEP"}
                 return salvaged
             _wm_debug(
@@ -2180,7 +2794,7 @@ class Session:
         added_paths = new_paths - old_paths
         _wm_debug(
             f"guard: 'Files & Context' UPDATE drops {len(missing)} paths "
-            f"{sorted(list(missing))[:5]}; forcing KEEP (+ APPEND new paths="
+            f"{sorted(missing)[:5]}; forcing KEEP (+ APPEND new paths="
             f"{len(added_paths)})"
         )
         if added_paths:
@@ -2217,10 +2831,7 @@ class Session:
 
         def meaningful_words(text: str) -> set:
             tokens = re.findall(r"[A-Za-z][A-Za-z0-9\.]{2,}|[\d\.]+", text or "")
-            return {
-                t.lower() for t in tokens
-                if t.lower() not in Session._WM_TITLE_STOPWORDS
-            }
+            return {t.lower() for t in tokens if t.lower() not in Session._WM_TITLE_STOPWORDS}
 
         old_w = meaningful_words(old_content)
         new_w = meaningful_words(new_content)
@@ -2270,9 +2881,7 @@ class Session:
             f"guard: Open Issues UPDATE silently dropped {len(dropped)} "
             f"items; restoring once (will not restore again if re-dropped)"
         )
-        restored = "\n".join(
-            f"- [silently dropped, restored] {it}" for it in dropped
-        )
+        restored = "\n".join(f"- [silently dropped, restored] {it}" for it in dropped)
         merged = (new_content + ("\n" if new_content else "") + restored).strip()
         return {"op": "UPDATE", "content": merged}
 
@@ -2346,7 +2955,9 @@ class Session:
                     if bad_items:
                         logger.warning(
                             "wm_v2: dropped %d non-string APPEND item(s) in section %r: %s",
-                            len(bad_items), header, [type(s).__name__ for s in bad_items],
+                            len(bad_items),
+                            header,
+                            [type(s).__name__ for s in bad_items],
                         )
                     appended = "\n".join(
                         f"- {s.strip()}" for s in items if isinstance(s, str) and s.strip()
@@ -2471,14 +3082,15 @@ class Session:
             ctx=self.ctx,
         )
 
-    def _append_to_jsonl(self, msg: Message) -> None:
-        """Append to messages.jsonl."""
+    def _append_messages_to_jsonl_batch(self, messages: List[Message]) -> None:
+        """Append multiple messages to messages.jsonl in a single write."""
         if not self._viking_fs:
             return
+        batch_content = "".join(msg.to_jsonl() + "\n" for msg in messages)
         run_async(
             self._viking_fs.append_file(
                 f"{self._session_uri}/messages.jsonl",
-                msg.to_jsonl() + "\n",
+                batch_content,
                 ctx=self.ctx,
             )
         )

@@ -19,6 +19,7 @@ CLEAN_DIRS := \
 	*.egg-info/ \
 	openviking/bin/ \
 	openviking/lib/ \
+	openviking/web_studio/dist/ \
 	$(OV_CLI_DIR)/target/ \
 	src/cmake_build/ \
 	.pytest_cache/ \
@@ -27,15 +28,18 @@ CLEAN_DIRS := \
 	**/__pycache__/
 
 .PHONY: all build clean help check-pip check-deps
+.PHONY: build-cli build-studio
 
 all: build
 
 help:
 	@echo "Available targets:"
-	@echo "  build       - Build ragfs-python and C++ extensions using setup.py"
-	@echo "  clean       - Remove build artifacts and temporary files"
-	@echo "  check-deps  - Check if required dependencies (Rust, CMake, etc.) are installed"
-	@echo "  help        - Show this help message"
+	@echo "  build           - Build ragfs-python and C++ extensions using setup.py"
+	@echo "  build-cli       - Build Rust CLI (ov) in development mode (fast) and copy to openviking/bin/"
+	@echo "  build-studio    - Build web-studio SPA and copy into openviking/web_studio/dist/"
+	@echo "  clean           - Remove build artifacts and temporary files"
+	@echo "  check-deps      - Check if required dependencies (Rust, CMake, etc.) are installed"
+	@echo "  help            - Show this help message"
 
 check-pip:
 	@if command -v uv > /dev/null 2>&1 && uv pip --help > /dev/null 2>&1; then \
@@ -81,7 +85,7 @@ check-deps:
 		echo "Error: C++ compiler (GCC or Clang) is required."; exit 1; \
 	fi
 
-build: check-deps check-pip
+build: check-deps check-pip build-studio
 	@echo "Starting build process via setup.py..."
 	$(PYTHON) $(SETUP_PY) build_ext --inplace
 	@if command -v uv > /dev/null 2>&1 && uv pip --help > /dev/null 2>&1; then \
@@ -138,3 +142,32 @@ clean:
 	@find . -name "*.pyc" -delete
 	@find . -name "__pycache__" -type d -exec rm -rf {} +
 	@echo "Cleanup completed."
+
+# Web Studio target
+build-studio:
+	@if [ "$$OV_SKIP_STUDIO_BUILD" = "1" ]; then \
+		echo "  [SKIP] web-studio build disabled by OV_SKIP_STUDIO_BUILD=1"; \
+	elif [ -f openviking/web_studio/dist/index.html ]; then \
+		echo "  [OK] web-studio bundle already present"; \
+	elif ! command -v npm > /dev/null 2>&1; then \
+		echo "  [SKIP] npm not found; install Node.js to enable /studio"; \
+	elif [ ! -f web-studio/package.json ]; then \
+		echo "  [SKIP] web-studio source not found"; \
+	else \
+		echo "Building web-studio (Vite SPA)..."; \
+		cd web-studio && npm ci && npm run build -- --base="/studio/" && cd ..; \
+		mkdir -p openviking/web_studio; \
+		rm -rf openviking/web_studio/dist; \
+		cp -r web-studio/dist openviking/web_studio/dist; \
+		echo "  [OK] web-studio bundle copied to openviking/web_studio/dist/"; \
+	fi
+
+# Rust CLI targets
+build-cli:
+	@echo "Building Rust CLI (ov) in development mode..."
+	@cd $(OV_CLI_DIR) && cargo build
+	@mkdir -p openviking/bin
+	@cp target/debug/ov openviking/bin/ov
+	@chmod +x openviking/bin/ov
+	@echo "  [OK] CLI built at target/debug/ov"
+	@echo "  [OK] CLI copied to openviking/bin/ov"

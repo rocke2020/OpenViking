@@ -27,10 +27,10 @@ async def get_task(
 ):
     """Get the status of a single background task."""
     tracker = get_task_tracker()
-    task = tracker.get(
+    task = await tracker.get(
         task_id,
-        owner_account_id=_ctx.account_id,
-        owner_user_id=_ctx.user.user_id,
+        account_id=_ctx.account_id,
+        user_id=_ctx.user.user_id,
     )
     if not task:
         raise OpenVikingError(
@@ -53,12 +53,12 @@ async def list_tasks(
 ):
     """List background tasks with optional filters."""
     tracker = get_task_tracker()
-    tasks = tracker.list_tasks(
+    tasks = await tracker.list_tasks(
         task_type=task_type,
         status=status,
         resource_id=resource_id,
         limit=limit,
-        owner_account_id=_ctx.account_id,
-        owner_user_id=_ctx.user.user_id,
+        account_id=_ctx.account_id,
+        user_id=_ctx.user.user_id,
     )
     return Response(status="ok", result=[t.to_dict() for t in tasks])

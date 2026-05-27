@@ -4,12 +4,17 @@
 # ragfs-python's default S3-enabled dependency set currently requires rustc >= 1.91.1.
 FROM rust:1.91.1-trixie AS rust-toolchain
 
-# Stage 2: build Python environment with uv (builds Rust CLI + C++ extension from source)
+# Stage 2: build Python environment with uv (builds Rust CLI + C++ extension + web-studio from source)
 FROM ghcr.io/astral-sh/uv:python3.13-trixie-slim AS py-builder
 
 # Reuse Rust toolchain from stage 1 so setup.py can compile ov CLI in-place.
 COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
 COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
+# Provide Node.js so setup.py build_py can build web-studio SPA in-tree.
+COPY --from=node:24-trixie-slim /usr/local/bin/node /usr/local/bin/
+COPY --from=node:24-trixie-slim /usr/local/lib/node_modules/ /usr/local/lib/node_modules/
+RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+ && ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 ENV CARGO_HOME=/usr/local/cargo
 ENV RUSTUP_HOME=/usr/local/rustup
 ENV PATH="/app/.venv/bin:/usr/local/cargo/bin:${PATH}"
@@ -19,9 +24,19 @@ ARG UV_LOCK_STRATEGY=auto
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    ccache \
     cmake \
     git \
  && rm -rf /var/lib/apt/lists/*
+
+# Route gcc/g++/cc through ccache so cmake (which asks shutil.which("gcc")) picks
+# up /usr/lib/ccache/gcc and benefits from the BuildKit cache mount on /root/.ccache.
+ENV PATH="/usr/lib/ccache:${PATH}"
+ENV CCACHE_DIR=/root/.ccache
+# Pin Cargo's target dir to a stable path so a BuildKit cache mount can persist
+# build artifacts across layer reruns even when uv builds the wheel in an
+# ephemeral isolated tempdir.
+ENV CARGO_TARGET_DIR=/cargo-target
 
 ENV UV_COMPILE_BYTECODE=1
 ENV UV_LINK_MODE=copy
@@ -38,12 +53,19 @@ COPY openviking/ openviking/
 COPY openviking_cli/ openviking_cli/
 COPY src/ src/
 COPY third_party/ third_party/
+COPY web-studio/ web-studio/
 
-# Install project and dependencies (triggers setup.py artifact builds + build_extension).
+# Install project and dependencies (triggers setup.py build_py → web-studio
+# SPA build + build_ext → native extensions).
 # Default to auto-refreshing uv.lock inside the ephemeral build context when it is
 # stale, so Docker builds stay unblocked after dependency changes. Set
 # UV_LOCK_STRATEGY=locked to keep fail-fast reproducibility checks.
 RUN --mount=type=cache,target=/root/.cache/uv,id=uv-${TARGETPLATFORM} \
+    --mount=type=cache,target=/root/.npm,id=npm-${TARGETPLATFORM} \
+    --mount=type=cache,target=/cargo-target,id=cargo-target-${TARGETPLATFORM} \
+    --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETPLATFORM} \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git-${TARGETPLATFORM} \
+    --mount=type=cache,target=/root/.ccache,id=ccache-${TARGETPLATFORM} \
     if [ -n "${OPENVIKING_VERSION:-}" ]; then \
         export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENVIKING="${OPENVIKING_VERSION}"; \
     elif [ -f openviking/_version.py ]; then \
@@ -68,43 +90,6 @@ RUN --mount=type=cache,target=/root/.cache/uv,id=uv-${TARGETPLATFORM} \
             ;; \
     esac
 
-# Build ragfs-python (Rust RAGFS binding) and extract the native extension
-# into the installed openviking package.
-RUN --mount=type=cache,target=/root/.cache/uv,id=uv-${TARGETPLATFORM} \
-    uv pip install maturin && \
-    export _TMPDIR=$(mktemp -d) && \
-    trap 'rm -rf "$_TMPDIR"' EXIT && \
-    cd crates/ragfs-python && \
-    python -m maturin build --release --out "$_TMPDIR" && \
-    cd ../.. && \
-    export _OV_LIB=$(python -c "import openviking; from pathlib import Path; print(Path(openviking.__file__).resolve().parent / 'lib')") && \
-    mkdir -p "$_OV_LIB" && \
-    python - <<'PY'
-import glob
-import os
-import sys
-import zipfile
-
-tmpdir = os.environ["_TMPDIR"]
-ov_lib = os.environ["_OV_LIB"]
-whls = glob.glob(os.path.join(tmpdir, "ragfs_python-*.whl"))
-assert whls, "maturin produced no wheel"
-
-with zipfile.ZipFile(whls[0]) as zf:
-    for name in zf.namelist():
-        bn = os.path.basename(name)
-        if bn.startswith("ragfs_python") and (bn.endswith(".so") or bn.endswith(".pyd")):
-            dst = os.path.join(ov_lib, bn)
-            with zf.open(name) as src, open(dst, "wb") as f:
-                f.write(src.read())
-            os.chmod(dst, 0o755)
-            print(f"ragfs-python: extracted {bn} -> {dst}")
-            sys.exit(0)
-
-print("WARNING: No ragfs_python .so/.pyd in wheel")
-sys.exit(1)
-PY
-
 # Stage 3: runtime
 FROM python:3.13-slim-trixie
 
@@ -117,16 +102,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY --from=py-builder /app/.venv /app/.venv
-COPY docker/openviking-console-entrypoint.sh /usr/local/bin/openviking-console-entrypoint
+COPY docker/openviking-entrypoint.sh /usr/local/bin/openviking-entrypoint
 COPY docker/pending_health_server.py /usr/local/bin/openviking-pending-health
 RUN mkdir -p /app/.openviking \
- && chmod +x /usr/local/bin/openviking-console-entrypoint /usr/local/bin/openviking-pending-health
+ && chmod +x /usr/local/bin/openviking-entrypoint /usr/local/bin/openviking-pending-health
 ENV HOME="/app" \
     PATH="/app/.venv/bin:$PATH" \
     OPENVIKING_CONFIG_FILE="/app/.openviking/ov.conf" \
     OPENVIKING_CLI_CONFIG_FILE="/app/.openviking/ovcli.conf"
 
-EXPOSE 1933 8020
+EXPOSE 1933
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -fsS http://127.0.0.1:1933/health || exit 1
@@ -139,4 +124,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
 # JSON, or `docker exec` in and run `openviking-server init`.
 # Override command to run CLI, e.g.:
 # docker run --rm -v ~/.openviking:/app/.openviking <image> openviking --help
-ENTRYPOINT ["openviking-console-entrypoint"]
+ENTRYPOINT ["openviking-entrypoint"]

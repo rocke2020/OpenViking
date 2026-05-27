@@ -4,7 +4,7 @@ import asyncio
 import json
 from abc import ABC
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 import httpx
 from loguru import logger
@@ -22,6 +22,7 @@ class OVFileTool(Tool, ABC):
         if self._client is None:
             self._client = await VikingClient.create(tool_context.workspace_id)
         return self._client
+
 
 class VikingListTool(OVFileTool):
     """Tool to list Viking resources."""
@@ -86,9 +87,12 @@ class VikingSearchTool(OVFileTool):
 
     @property
     def description(self) -> str:
-        return ("Using query to search for resources (knowledge, code, files, workflow, etc.) in OpenViking. "
-                "This operation performs semantic retrieval, not full character matching. Please avoid repeated calls with similar queries as much as possible."
-                "bad-case: after searching with ‘Nate Joanna dog playdate 3:00 pm', another search was performed using 'Nate Joanna dog playdate'.")
+        return (
+            "Using query to search for resources (knowledge, code, files, workflow, etc.) in OpenViking. "
+            "Result: Only URIs and summaries are included here. To view the full content, use openviking_multi_read tool."
+            "This operation performs semantic retrieval, not full character matching. Please avoid repeated calls with similar queries as much as possible."
+            "bad-case: after searching with ‘Nate Joanna dog playdate 3:00 pm', another search was performed using 'Nate Joanna dog playdate'."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -128,7 +132,11 @@ class VikingSearchTool(OVFileTool):
                         items.append({**item, "type": item.get("type", item_type)})
             return items
 
-        if hasattr(results, "memories") or hasattr(results, "resources") or hasattr(results, "skills"):
+        if (
+            hasattr(results, "memories")
+            or hasattr(results, "resources")
+            or hasattr(results, "skills")
+        ):
             for key, item_type in group_map.items():
                 for item in getattr(results, key, []) or []:
                     items.append(
@@ -178,7 +186,9 @@ class VikingSearchTool(OVFileTool):
         except (TypeError, ValueError):
             return 0.0
 
-    def _filter_search_items(self, results: Any, min_score: float) -> dict[str, list[dict[str, Any]]]:
+    def _filter_search_items(
+        self, results: Any, min_score: float
+    ) -> dict[str, list[dict[str, Any]]]:
         grouped: dict[str, list[dict[str, Any]]] = {
             "memory": [],
             "resource": [],
@@ -216,7 +226,9 @@ class VikingSearchTool(OVFileTool):
             )
         return group_items
 
-    def _format_search_items_json(self, grouped_items: dict[str, list[dict[str, Any]]], min_score: float) -> str:
+    def _format_search_items_json(
+        self, grouped_items: dict[str, list[dict[str, Any]]], min_score: float
+    ) -> str:
         memories = self._build_group_json(grouped_items.get("memory", []))
         resources = self._build_group_json(grouped_items.get("resource", []))
         skills = self._build_group_json(grouped_items.get("skill", []))
@@ -238,8 +250,38 @@ class VikingSearchTool(OVFileTool):
     ) -> str:
         try:
             client = await self._get_client(tool_context)
-            search_client = getattr(client, "admin_user_client", client)
-            results = await search_client.search(query, target_uri=target_uri, limit=20)
+            admin_user_id = client.admin_user_id
+
+            if not target_uri and tool_context.memory_user_ids:
+                user_ids = tool_context.memory_user_ids if client.should_sender_fanout() else [None]
+                grouped_items = {
+                    "memory": [],
+                    "resource": [],
+                    "skill": [],
+                }
+
+                for memory_user_id in user_ids:
+                    results = await client.search(
+                        query,
+                        target_uri=client._memory_target_uri(memory_user_id),
+                        limit=20,
+                        user_id=admin_user_id,
+                    )
+                    filtered_items = self._filter_search_items(results, min_score=min_score)
+                    for item_type, items in filtered_items.items():
+                        grouped_items[item_type].extend(items)
+
+                total = sum(len(items) for items in grouped_items.values())
+                if total == 0:
+                    return f"No results found for query: {query}"
+                return self._format_search_items_json(grouped_items, min_score=min_score)
+
+            results = await client.search(
+                query,
+                target_uri=target_uri,
+                limit=20,
+                user_id=admin_user_id,
+            )
 
             if not results:
                 return f"No results found for query: {query}"
@@ -302,7 +344,7 @@ class VikingAddResourceTool(OVFileTool):
             else:
                 return "Failed to add resource"
         except httpx.ReadTimeout:
-            return f"Request timed out. The resource addition task may still be processing on the server side."
+            return "Request timed out. The resource addition task may still be processing on the server side."
         except Exception as e:
             logger.warning(f"Error adding resource: {e}")
             return f"Error adding resource to Viking: {str(e)}"
@@ -312,7 +354,7 @@ class VikingAddResourceTool(OVFileTool):
 
 
 class VikingGrepTool(OVFileTool):
-    """Tool to search Viking resources using regex patterns."""
+    """Tool to search Viking resources using a regex pattern."""
 
     @property
     def name(self) -> str:
@@ -320,8 +362,11 @@ class VikingGrepTool(OVFileTool):
 
     @property
     def description(self) -> str:
-        return ("Search Viking resources using regex patterns (like grep). Supports multiple patterns to search concurrently."
-                "Please avoid repeated calls with similar queries as much as possible.")
+        return (
+            "Search Viking resources using a regex pattern (like grep)."
+            "Result: Only URIs and summaries are included here. To view the full content, use openviking_multi_read tool."
+            "Please avoid repeated calls with similar queries as much as possible."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -333,9 +378,8 @@ class VikingGrepTool(OVFileTool):
                     "description": "The whole Viking URI to search within (e.g., viking://resources/)",
                 },
                 "pattern": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Regex pattern or array of regex patterns to search for",
+                    "type": "string",
+                    "description": "Regex pattern to search for",
                 },
                 "case_insensitive": {
                     "type": "boolean",
@@ -350,69 +394,51 @@ class VikingGrepTool(OVFileTool):
         self,
         tool_context: "ToolContext",
         uri: str,
-        pattern: Union[str, list[str]],
+        pattern: str,
         case_insensitive: bool = False,
         **kwargs: Any,
     ) -> str:
         try:
             client = await self._get_client(tool_context)
-            patterns = [pattern] if isinstance(pattern, str) else pattern
+            result = await client.grep(
+                uri,
+                pattern,
+                case_insensitive=case_insensitive,
+                user_id=client.admin_user_id,
+            )
+            if isinstance(result, dict):
+                matches = result.get("matches", [])
+            else:
+                matches = getattr(result, "matches", [])
 
-            # Limit concurrent requests to avoid overwhelming the server and memory
-            max_concurrent = 10
-            semaphore = asyncio.Semaphore(max_concurrent)
+            if not matches:
+                return f"No matches found for pattern: '{pattern}'"
 
-            async def run_grep(p: str) -> tuple[str, list[Any]]:
-                async with semaphore:
-                    try:
-                        result = await client.grep(uri, p, case_insensitive=case_insensitive)
-                        if isinstance(result, dict):
-                            matches = result.get("matches", [])
-                        else:
-                            matches = getattr(result, "matches", [])
-                        return (p, matches)
-                    except Exception as e:
-                        logger.warning(f"Error searching for pattern '{p}': {e}")
-                        return (p, [])
+            merged_results: dict[str, list[tuple[int, str]]] = {}
 
-            tasks = [run_grep(p) for p in patterns]
-            results = await asyncio.gather(*tasks)
+            for match in matches:
+                if isinstance(match, dict):
+                    match_uri = match.get("uri", "unknown")
+                    line = match.get("line", "?")
+                    content = match.get("content", "")
+                else:
+                    match_uri = getattr(match, "uri", "unknown")
+                    line = getattr(match, "line", "?")
+                    content = getattr(match, "content", "")
 
-            # Merge results by URI
-            merged_results: dict[str, list[tuple[int, str, str]]] = {}
-            total_matches = 0
+                if match_uri not in merged_results:
+                    merged_results[match_uri] = []
+                merged_results[match_uri].append((line, content))
 
-            for p, matches in results:
-                if not matches:
-                    continue
-                total_matches += len(matches)
-                for match in matches:
-                    if isinstance(match, dict):
-                        match_uri = match.get("uri", "unknown")
-                        line = match.get("line", "?")
-                        content = match.get("content", "")
-                    else:
-                        match_uri = getattr(match, "uri", "unknown")
-                        line = getattr(match, "line", "?")
-                        content = getattr(match, "content", "")
+            result_lines = [
+                f"Found {len(matches)} match{'es' if len(matches) != 1 else ''} for pattern '{pattern}':"
+            ]
 
-                    if match_uri not in merged_results:
-                        merged_results[match_uri] = []
-                    merged_results[match_uri].append((line, content, p))
-
-            if not merged_results:
-                pattern_str = ", ".join(f"'{p}'" for p in patterns)
-                return f"No matches found for patterns: {pattern_str}"
-
-            # Format output
-            result_lines = [f"Found {total_matches} match{'es' if total_matches != 1 else ''} across {len(patterns)} pattern{'s' if len(patterns) != 1 else ''}:"]
-
-            for match_uri, matches in merged_results.items():
-                # Sort matches by line number
-                matches.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else 0)
+            for match_uri, uri_matches in merged_results.items():
+                uri_matches.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else 0)
                 result_lines.append(f"\n📄 {match_uri}")
-                for line, content, pattern_name in matches:
-                    result_lines.append(f"   Line {line} (pattern: '{pattern_name}'):")
+                for line, content in uri_matches:
+                    result_lines.append(f"   Line {line}:")
                     result_lines.append(f"   {content}")
 
             return "\n".join(result_lines)
@@ -429,7 +455,10 @@ class VikingGlobTool(OVFileTool):
 
     @property
     def description(self) -> str:
-        return "Find Viking resources using glob patterns (like **/*.md, *.py)."
+        return (
+            "Find Viking resources using glob patterns (like **/*.md, *.py)."
+            "Result: Only URIs and summaries are included here. To view the full content, use openviking_multi_read tool."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -454,7 +483,7 @@ class VikingGlobTool(OVFileTool):
     ) -> str:
         try:
             client = await self._get_client(tool_context)
-            result = await client.glob(pattern, uri=uri or None)
+            result = await client.glob(pattern, uri=uri or None, user_id=client.admin_user_id)
 
             if isinstance(result, dict):
                 matches = result.get("matches", [])
@@ -475,6 +504,7 @@ class VikingGlobTool(OVFileTool):
             return "\n".join(result_lines)
         except Exception as e:
             return f"Error searching Viking with glob: {str(e)}"
+
 
 class VikingMemoryCommitTool(OVFileTool):
     """Tool to commit messages to OpenViking session."""
@@ -525,6 +555,7 @@ class VikingMemoryCommitTool(OVFileTool):
             logger.exception(f"Error processing message: {e}")
             return f"Error committing to Viking: {str(e)}"
 
+
 class VikingMultiReadTool(OVFileTool):
     """Tool to read content from multiple Viking resources concurrently."""
 
@@ -544,7 +575,7 @@ class VikingMultiReadTool(OVFileTool):
                 "uris": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "List of Viking file URIs to read from (e.g., [\"viking://resources/path/123.md\", \"viking://resources/path/456.md\"])",
+                    "description": 'List of Viking file URIs to read from (e.g., ["viking://resources/path/123.md", "viking://resources/path/456.md"])',
                 },
             },
             "required": ["uris"],
@@ -589,7 +620,7 @@ class VikingMultiReadTool(OVFileTool):
             # 构建结果
             result_lines = [f"Multi-read results for {len(uris)} resources (level: {level}):"]
 
-            for i, result in enumerate(results, 1):
+            for result in results:
                 uri = result["uri"]
                 content = result["content"]
                 success = result["success"]
