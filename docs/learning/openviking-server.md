@@ -19,9 +19,10 @@ broken (git tag switch + `uv sync`).
 There are three intentional OV command surfaces on this machine:
 `~/bin/ov` points at the test server checkout, `~/codes/ov1/.venv/bin/ov` is
 the active development CLI, and `/opt/homebrew/bin/ov` is the npm-installed
-official CLI. Treat the Homebrew-path CLI as **prod-sim CLI only**: useful for
-testing what a user gets from `npm install -g @openviking/cli`, but call it by
-absolute path so it never silently replaces the editable dev/test CLIs.
+optional CLI, not a full server installation. Treat the Homebrew-path CLI as
+**prod-sim CLI only**: useful for testing what a user gets from
+`npm install -g @openviking/cli`, but call it by absolute path so it never
+silently replaces the editable dev/test CLIs.
 
 ## Current Setup
 
@@ -51,13 +52,13 @@ Homebrew install from accidentally controlling the local test service.
 |---|---|---|
 | Test default | `ov` → `~/bin/ov` → `/Users/rocke_dong/codes/OpenViking/.venv/bin/ov` | Daily CLI calls against the running `127.0.0.1:1933` test server |
 | Dev | `/Users/rocke_dong/codes/ov1/.venv/bin/ov` | Active repo development and source-level CLI checks |
-| Prod-sim CLI | `/opt/homebrew/bin/ov` | Official npm CLI install behavior; invoke explicitly |
+| Prod-sim CLI | `/opt/homebrew/bin/ov` | Optional npm CLI install behavior; invoke explicitly |
 
 `/opt/homebrew/bin/ov` is a good prod-sim CLI boundary because it is installed
-outside editable checkouts and behaves like a user-facing npm package install.
-It should not be the default `ov` while most work targets the local test
-server: that would make routine debugging depend on an older installed CLI and
-hide which checkout you are exercising.
+outside editable checkouts and behaves like a user-facing optional CLI package
+install. It should not be the default `ov` while most work targets the local
+test server: that would make routine debugging depend on an older installed CLI
+and hide which checkout you are exercising.
 
 Official install distinction:
 
