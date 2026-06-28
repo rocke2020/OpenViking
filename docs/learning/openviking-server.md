@@ -2,8 +2,7 @@
 
 > Quick-reference for running the local OpenViking server from this repo's
 > editable `.venv`, for the self-learning loop (read source → tweak → restart
-> → observe). Written 2026-06-26 after switching the launchd job off the
-> `langg` conda env onto the repo's uv-managed `.venv`.
+> → observe).
 
 ## TL;DR
 
