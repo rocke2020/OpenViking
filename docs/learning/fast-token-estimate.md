@@ -28,7 +28,22 @@ def estimate_text_tokens(text):
     return math.ceil(sum(_code_point_weight(ord(c)) for c in text))
 ```
 
-权重依据：1.5 token/char 是 `cl100k_base` 在中文上的经验均值，Claude tokenizer 同量级；补充平面（emoji 等）按 2.0；ASCII/拉丁按 0.25（标准 chars/4 启发式）。
+权重依据：1.5 token/char 不是 `cl100k_base` 在常见中文文本上的真实均值，而是中文预算场景的保守经验权重。`cl100k_base` 对常见现代中文通常接近 1 token/char，但标准 chars/4 会低估约 4 倍；1.5/char 故意站在安全侧，避免 `pending_tokens` 和本地截断预算过低。补充平面（emoji 等）按 2.0；ASCII/拉丁按 0.25（标准 chars/4 启发式）。
+
+### `cl100k_base` 校准实验
+
+实验确认：常见中文文本的真实计数低于 1.5 token/char，但 chars/4 明显不可用；1.5/char 是预算安全权重，不应表述为真实均值。下面结果由 `uv run python` 在 repo `.venv` 中使用 `tiktoken 0.12.0` 和 `cl100k_base` 生成。
+
+| 样本 | 字符数 | 真实 tokens | tokens/char | chars/4 误差 | OV 估算误差 |
+|---|---:|---:|---:|---:|---:|
+| 新闻中文短句 | 47 | 53 | 1.128 | -77.4% | +34.0% |
+| 技术中文短句 | 42 | 43 | 1.024 | -74.4% | +46.5% |
+| 中英混合命令 | 84 | 37 | 0.440 | -43.2% | +21.6% |
+| 中文标点混合 | 42 | 44 | 1.048 | -75.0% | +4.5% |
+| 常见中文短句重复 | 230 | 200 | 0.870 | -71.0% | +29.0% |
+| 英文对照 | 98 | 17 | 0.173 | +47.1% | +47.1% |
+
+逐字符看，260 个常见中文字符单独编码的均值是 1.104 token/char（233 个字符为 1 token，27 个字符为 2 tokens）。但整个 CJK Unified Ideographs 基本区（`0x4E00-0x9FFF`）逐字符均值是 2.357 token/char，因为大量罕见字走更碎的 byte/BPE fallback；这说明“CJK 码点区间均值”和“常见中文文本均值”不是同一个口径。OV 的 1.5 权重针对主要中文使用场景折中：相比 chars/4 不低估预算，相比按全 CJK 区间又不会过早触发 commit。
 
 `_is_cjk_code_point` 覆盖区段：CJK 统一（`0x4E00-0x9FFF`）、扩展 A（`0x3400-0x4DBF`）、兼容（`0xF900-0xFAFF`）、扩展 B（`0x20000-0x2EBEF`）、平假名 / 片假名、谚文、全角 ASCII、CJK 符号。
 
