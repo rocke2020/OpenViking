@@ -10,7 +10,6 @@ import os
 from typing import TYPE_CHECKING, Any, Optional
 
 from openviking.core.directories import DirectoryInitializer
-from openviking.crypto.config import bootstrap_encryption
 from openviking.privacy import UserPrivacyConfigService
 from openviking.resource.watch_scheduler import WatchScheduler
 from openviking.server.identity import RequestContext, Role
@@ -18,6 +17,7 @@ from openviking.service.debug_service import DebugService
 from openviking.service.fs_service import FSService
 from openviking.service.pack_service import PackService
 from openviking.service.relation_service import RelationService
+from openviking.service.resource_memory_link_service import ResourceMemoryLinkService
 from openviking.service.resource_service import ResourceService
 from openviking.service.search_service import SearchService
 from openviking.service.session_service import SessionService
@@ -29,13 +29,17 @@ from openviking.storage.index_consistency import check_index_consistency
 from openviking.storage.queuefs.queue_manager import QueueManager, init_queue_manager
 from openviking.storage.transaction import LockManager, init_lock_manager
 from openviking.storage.viking_fs import VikingFS, init_viking_fs
-from openviking.utils.agfs_utils import resolve_queuefs_mount_point
+from openviking.utils.agfs_utils import (
+    build_runtime_ragfs_binding_config,
+    resolve_queuefs_mount_point,
+)
 from openviking.utils.resource_processor import ResourceProcessor
 from openviking.utils.skill_processor import SkillProcessor
 from openviking_cli.exceptions import NotInitializedError
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config import OPENVIKING_ENABLE_RECORDER_ENV, get_openviking_config
+from openviking_cli.utils.config.git_config import GitConfig
 from openviking_cli.utils.config.open_viking_config import initialize_openviking_config
 from openviking_cli.utils.config.storage_config import StorageConfig
 
@@ -69,9 +73,7 @@ class OpenVikingService:
             path=path,
         )
         self._config = config
-        self._user = user or UserIdentifier(
-            config.default_account, config.default_user, config.default_agent
-        )
+        self._user = user or UserIdentifier(config.default_account, config.default_user)
 
         # Infrastructure
         self._agfs_client: Optional[Any] = None
@@ -87,12 +89,14 @@ class OpenVikingService:
         self._watch_scheduler: Optional[WatchScheduler] = None
         self._encryptor: Optional[Any] = None
         self._privacy_config_service: Optional[UserPrivacyConfigService] = None
+        self._data_dir_lock_acquired = False
 
         # Sub-services
         self._fs_service = FSService()
         self._relation_service = RelationService()
         self._pack_service = PackService()
         self._search_service = SearchService()
+        self._resource_memory_link_service = ResourceMemoryLinkService()
         self._resource_service = ResourceService()
         self._session_service = SessionService()
         self._debug_service = DebugService()
@@ -100,9 +104,22 @@ class OpenVikingService:
         # State
         self._initialized = False
 
+        # Acquire the data-dir lock before encryption bootstrap so first-run root-key creation is
+        # serialized with storage initialization across processes.
+        self._ensure_data_dir_lock_acquired()
+
+        # Resolve encryption config (root_key) BEFORE building the agfs client, so the binding
+        # stack is constructed with the encryption layer when encryption is enabled. The encryptor
+        # is built here once and reused by initialize().
+        binding_config = self._build_ragfs_binding_config()
+
         # Initialize storage
         self._init_storage(
-            config.storage, config.embedding.max_concurrent, config.vlm.max_concurrent
+            config.storage,
+            config.embedding.max_concurrent,
+            config.vlm.max_concurrent,
+            binding_config=binding_config,
+            git_config=config.git,
         )
 
         # Initialize embedder
@@ -115,13 +132,17 @@ class OpenVikingService:
         self,
         config: StorageConfig,
         max_concurrent_embedding: int = 10,
-        max_concurrent_semantic: int = 100,
+        max_concurrent_semantic: int = 64,
+        binding_config: Any = None,
+        *,
+        git_config: Optional[GitConfig] = None,
     ) -> None:
         """Initialize storage resources."""
-        from openviking.utils.agfs_utils import create_agfs_client
+        from openviking.utils.agfs_utils import RagfsBindingConfig, create_agfs_client
 
         # Create RAGFS client using utility
-        self._agfs_client = create_agfs_client(config.agfs)
+        runtime_binding_config = binding_config or RagfsBindingConfig(agfs=config.agfs)
+        self._agfs_client = create_agfs_client(runtime_binding_config, git_config=git_config)
 
         # Initialize QueueManager with agfs_client
         if self._agfs_client:
@@ -158,6 +179,28 @@ class OpenVikingService:
             redo_recovery_enabled=tx_cfg.redo_recovery_enabled,
         )
         set_task_tracker(config.build_task_tracker(self._agfs_client))
+
+    def _build_ragfs_binding_config(self) -> Any:
+        """Build the single runtime binding config from OpenViking storage + encryption settings."""
+        binding_config, self._encryptor = build_runtime_ragfs_binding_config(self._config)
+        return binding_config
+
+    def _ensure_data_dir_lock_acquired(self) -> None:
+        """Acquire the process-level data directory lock once for this service instance."""
+        if self._data_dir_lock_acquired:
+            return
+
+        # contention (see https://github.com/volcengine/OpenViking/issues/473).
+        if not self._config.storage.skip_process_lock:
+            from openviking.utils.process_lock import acquire_data_dir_lock
+
+            acquire_data_dir_lock(self._config.storage.workspace)
+        else:
+            logger.warning(
+                "Skipping workspace process lock for '%s'; multi-process access may corrupt data",
+                self._config.storage.workspace,
+            )
+        self._data_dir_lock_acquired = True
 
     @property
     def _agfs(self) -> Any:
@@ -240,17 +283,15 @@ class OpenVikingService:
             logger.debug("Already initialized")
             return
 
-        # Acquire advisory lock on data directory to prevent multi-process
-        # contention (see https://github.com/volcengine/OpenViking/issues/473).
-        from openviking.utils.process_lock import acquire_data_dir_lock
-
-        acquire_data_dir_lock(self._config.storage.workspace)
+        self._ensure_data_dir_lock_acquired()
 
         if self._vikingdb_manager is None:
             self._init_storage(
                 self._config.storage,
                 self._config.embedding.max_concurrent,
                 self._config.vlm.max_concurrent,
+                binding_config=self._build_ragfs_binding_config(),
+                git_config=self._config.git,
             )
 
         if self._embedder is None:
@@ -258,9 +299,6 @@ class OpenVikingService:
 
         config = get_openviking_config()
 
-        # Initialize encryption module
-        full_config = config.to_dict()
-        self._encryptor = await bootstrap_encryption(full_config)
         if self._encryptor:
             logger.info("Encryption module initialized")
         else:
@@ -285,6 +323,7 @@ class OpenVikingService:
             rerank_config=config.rerank,
             vector_store=self._vikingdb_manager,
             retrieval_config=config.retrieval,
+            grep_config=config.grep,
             enable_recorder=enable_recorder,
             encryptor=self._encryptor,
         )
@@ -344,7 +383,14 @@ class OpenVikingService:
         # Wire up sub-services
         self._fs_service.set_dependencies(
             viking_fs=self._viking_fs,
+            vikingdb=self._vikingdb_manager,
             privacy_config_service=self._privacy_config_service,
+            resource_memory_link_service=self._resource_memory_link_service,
+        )
+        self._resource_memory_link_service.set_dependencies(
+            vikingdb=self._vikingdb_manager,
+            viking_fs=self._viking_fs,
+            session_service=self._session_service,
         )
         self._relation_service.set_viking_fs(self._viking_fs)
         self._pack_service.set_dependencies(
@@ -358,6 +404,7 @@ class OpenVikingService:
             resource_processor=self._resource_processor,
             skill_processor=self._skill_processor,
             watch_scheduler=self._watch_scheduler,
+            resource_memory_link_service=self._resource_memory_link_service,
         )
         self._session_service.set_dependencies(
             vikingdb=self._vikingdb_manager,
@@ -370,11 +417,21 @@ class OpenVikingService:
             agfs_client=self._agfs_client,
         )
 
+        # Register as the process-wide service so flows that resolve the
+        # service via the dependency global (e.g. background reindex tasks
+        # triggered by git restore) work in embedded mode, not just under the
+        # HTTP server which calls set_service() during bootstrap.
+        from openviking.server.dependencies import set_service
+
+        set_service(self)
+
         self._initialized = True
         logger.info("OpenVikingService initialized")
 
     async def close(self) -> None:
         """Close OpenViking and release resources."""
+        await self._resource_service.close_background_tasks()
+
         if self._watch_scheduler:
             await self._watch_scheduler.stop()
             self._watch_scheduler = None
@@ -403,6 +460,13 @@ class OpenVikingService:
         self._directory_initializer = None
         self._privacy_config_service = None
         self._initialized = False
+
+        # Clear the process-wide registration if it still points at us, so a
+        # closed service is never resolved via the dependency global.
+        from openviking.server.dependencies import get_service_or_none, set_service
+
+        if get_service_or_none() is self:
+            set_service(None)
 
         logger.info("OpenVikingService closed")
 

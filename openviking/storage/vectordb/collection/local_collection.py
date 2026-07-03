@@ -313,7 +313,27 @@ class LocalCollection(ICollection):
                 pk_list = [pk_list[i] for i in valid_indices]
                 scores_list = [scores_list[i] for i in valid_indices]
 
-            cands_fields = [json.loads(cand.fields) for cand in cands_list]
+            # Parse each candidate's fields defensively: a single corrupted JSON
+            # string (e.g. truncated by the storage layer's uint16 length prefix)
+            # must not fail the whole query. Skip the bad ones and keep cands_list,
+            # pk_list and scores_list aligned, mirroring the None-skip above.
+            cands_fields = []
+            json_valid_indices = []
+            for i, cand in enumerate(cands_list):
+                try:
+                    cands_fields.append(json.loads(cand.fields))
+                    json_valid_indices.append(i)
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.warning(
+                        f"Failed to parse candidate fields as JSON (label={cand.label}, "
+                        f"fields_len={len(cand.fields) if cand.fields else 0}), skipping. "
+                        f"Error: {e}"
+                    )
+
+            if len(json_valid_indices) < len(cands_list):
+                cands_list = [cands_list[i] for i in json_valid_indices]
+                pk_list = [pk_list[i] for i in json_valid_indices]
+                scores_list = [scores_list[i] for i in json_valid_indices]
 
             if self.meta.primary_key:
                 pk_list = [
@@ -521,20 +541,52 @@ class LocalCollection(ICollection):
 
     # data interface
     def upsert_data(self, raw_data_list: List[Dict[str, Any]], ttl=0):
-        result = UpsertDataResult()
-        data_list = []
+        data_list = self._validate_raw_data_list(raw_data_list)
+        return self._write_data_list(data_list, ttl=ttl)
 
+    def update_data(self, raw_data_list: List[Dict[str, Any]]):
+        if not raw_data_list:
+            return UpsertDataResult()
+
+        pk = self.meta.primary_key
+        primary_keys = []
+        for raw_data in raw_data_list:
+            if pk not in raw_data:
+                raise ValueError(f"primary key '{pk}' is required for update")
+            primary_keys.append(raw_data[pk])
+
+        existing = self.fetch_data(primary_keys)
+        existing_map = {item.id: item.fields for item in existing.items}
+        missing_ids = [key for key in primary_keys if key not in existing_map]
+        if missing_ids:
+            raise ValueError(f"record not found for primary key(s): {missing_ids}")
+
+        merged_list = []
+        for raw_data in raw_data_list:
+            existing_fields = existing_map[raw_data[pk]] or {}
+            merged = dict(existing_fields)
+            merged.update(raw_data)
+            merged_list.append(merged)
+
+        processed_list = self._validate_raw_data_list(merged_list)
+        return self._write_data_list(processed_list, ttl=0)
+
+    def _validate_raw_data_list(self, raw_data_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        data_list = []
         for raw_data in raw_data_list:
             if self.data_processor:
                 try:
                     data = self.data_processor.validate_and_process(raw_data)
                 except ValueError as e:
                     logger.error(f"Data validation failed: {e}, raw_data: {raw_data}")
-                    return result
+                    raise
             else:
-                # Should not happen given init logic, but for safety
                 data = raw_data
             data_list.append(data)
+        return data_list
+
+    def _write_data_list(self, data_list: List[Dict[str, Any]], ttl=0):
+        result = UpsertDataResult()
 
         dense_emb, sparse_emb = (
             self.vectorizer_adapter.vectorize_raw_data(data_list)

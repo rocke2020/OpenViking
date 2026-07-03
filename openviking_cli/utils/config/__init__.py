@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
+from . import embedding_config
 from .agfs_config import AGFSConfig
 from .config_loader import (
     load_json_config,
@@ -11,7 +12,6 @@ from .consts import (
     DEFAULT_OV_CONF,
     DEFAULT_OVCLI_CONF,
     OPENVIKING_ACCOUNT_ENV,
-    OPENVIKING_AGENT_ID_ENV,
     OPENVIKING_ALLOW_BREAK_SYSTEM_PACKAGES_ENV,
     OPENVIKING_API_KEY_ENV,
     OPENVIKING_ARK_API_KEY_ENV,
@@ -51,6 +51,8 @@ from .consts import (
     SYSTEM_CONFIG_DIR,
 )
 from .embedding_config import EmbeddingConfig
+from .grep_config import GrepConfig, GrepEngine
+from .git_config import GitConfig, GitLocalConfig, GitS3Config
 from .log_config import LogConfig
 from .open_viking_config import (
     OpenVikingConfig,
@@ -98,7 +100,6 @@ __all__ = [
     "OPENVIKING_API_KEY_ENV",
     "OPENVIKING_ACCOUNT_ENV",
     "OPENVIKING_USER_ENV",
-    "OPENVIKING_AGENT_ID_ENV",
     "OPENVIKING_EMBEDDING_API_KEY_ENV",
     "OPENVIKING_VLM_API_KEY_ENV",
     "OPENVIKING_ARK_API_KEY_ENV",
@@ -131,6 +132,8 @@ __all__ = [
     "OpenVikingConfig",
     "OpenVikingConfigSingleton",
     "OVCLIConfig",
+    "GrepConfig",
+    "GrepEngine",
     "RerankConfig",
     "RetrievalConfig",
     "StorageConfig",
@@ -159,4 +162,7 @@ __all__ = [
     "is_valid_openviking_config",
     "TelemetryConfig",
     "TracerConfig",
+    "GitConfig",
+    "GitLocalConfig",
+    "GitS3Config",
 ]

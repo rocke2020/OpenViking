@@ -41,6 +41,10 @@ from openviking_cli.utils.config.open_viking_config import OpenVikingConfig
 logger = get_logger(__name__)
 EMBEDDING_META_MARKER = "\n\n[openviking.embedding]\n"
 
+# Minimum OV version that supports content field + FullText config for grep bm25
+_FULLTEXT_MIN_VERSION = "0.3.18"
+_EMBEDDING_COMPATIBILITY_KEYS = ("provider", "model", "dimension", "model_identity")
+
 
 @dataclass
 class RequestQueueStats:
@@ -77,7 +81,7 @@ class CollectionSchemas:
             # context_type 字段：区分上下文的大类
             # 枚举值："resource"（资源，默认）, "memory"（记忆）, "skill"（技能）
             # 推导规则：
-            #   - URI 以 viking://agent/skills 开头 → "skill"
+            #   - URI 位于 user skills 目录下 → "skill"
             #   - URI 包含 "memories" → "memory"
             #   - 其他情况 → "resource"
             {"FieldName": "context_type", "FieldType": "string"},
@@ -102,10 +106,11 @@ class CollectionSchemas:
                 {"FieldName": "name", "FieldType": "string"},
                 {"FieldName": "description", "FieldType": "string"},
                 {"FieldName": "tags", "FieldType": "string"},
+                {"FieldName": "search_tags", "FieldType": "list<string>"},
                 {"FieldName": "abstract", "FieldType": "string"},
+                {"FieldName": "content", "FieldType": "text"},
                 {"FieldName": "account_id", "FieldType": "string"},
                 {"FieldName": "owner_user_id", "FieldType": "string"},
-                {"FieldName": "owner_agent_id", "FieldType": "string"},
             ]
         )
         scalar_index = [
@@ -121,9 +126,9 @@ class CollectionSchemas:
                 "level",
                 "name",
                 "tags",
+                "search_tags",
                 "account_id",
                 "owner_user_id",
-                "owner_agent_id",
             ]
         )
         return {
@@ -131,6 +136,12 @@ class CollectionSchemas:
             "Description": description or "Unified context collection",
             "Fields": fields,
             "ScalarIndex": scalar_index,
+            "FullText": [
+                {
+                    "Field": "content",
+                    "Analyzer": {"Tokenizer": "standard", "StopWordsFilters": ["symbol"]},
+                },
+            ],
         }
 
 
@@ -147,10 +158,25 @@ def _get_active_embedding_model_config(config: "OpenVikingConfig") -> Any:
 
 def _build_embedding_metadata(config: "OpenVikingConfig") -> Dict[str, Any]:
     model_cfg = _get_active_embedding_model_config(config)
+    # When credentials are configured, the first credential drives the actual
+    # provider/model used at request time (see EmbeddingConfig._effective_*),
+    # so the metadata signature must reflect the credential rather than the
+    # parent's possibly-default provider/model. Otherwise a credential-only
+    # OpenAI config would still be signed as ``provider=volcengine`` (the parent
+    # default), masking real vector-space changes.
+    first_cred = None
+    creds = getattr(model_cfg, "credentials", None) or []
+    if creds:
+        first_cred = creds[0]
+    cred_provider = getattr(first_cred, "provider", None) if first_cred else None
+    cred_model = getattr(first_cred, "model", None) if first_cred else None
     provider = (
-        getattr(model_cfg, "provider", None) or getattr(model_cfg, "backend", None) or ""
+        cred_provider
+        or getattr(model_cfg, "provider", None)
+        or getattr(model_cfg, "backend", None)
+        or ""
     ).lower()
-    model = getattr(model_cfg, "model", None) or ""
+    model = cred_model or getattr(model_cfg, "model", None) or ""
     dimension = config.embedding.dimension
     model_path = getattr(model_cfg, "model_path", None)
     model_identity = model
@@ -164,12 +190,44 @@ def _build_embedding_metadata(config: "OpenVikingConfig") -> Dict[str, Any]:
         except Exception:
             model_identity = model
 
+    from openviking import __version__
+
     return {
         "provider": provider,
         "model": model,
         "dimension": dimension,
         "model_identity": model_identity,
+        "schema_version": __version__,
     }
+
+
+def _embedding_metadata_compatible(
+    existing_meta: Optional[Dict[str, Any]],
+    current_meta: Dict[str, Any],
+) -> bool:
+    if existing_meta is None:
+        return False
+    return all(
+        existing_meta.get(key) == current_meta.get(key)
+        for key in _EMBEDDING_COMPATIBILITY_KEYS
+    )
+
+
+def _collection_has_content_fulltext(meta: Dict[str, Any]) -> bool:
+    fields = meta.get("Fields", [])
+    has_content = any(
+        f.get("FieldName") == "content" and f.get("FieldType") == "text" for f in fields
+    )
+    fulltext = meta.get("FullText") or []
+    if isinstance(fulltext, str):
+        try:
+            fulltext = json.loads(fulltext)
+        except json.JSONDecodeError:
+            fulltext = []
+    has_content_fulltext = any(
+        isinstance(ft, dict) and ft.get("Field") == "content" for ft in fulltext
+    )
+    return has_content and has_content_fulltext
 
 
 def _encode_collection_description(
@@ -248,7 +306,27 @@ async def init_context_collection(storage) -> bool:
     base_description, existing_embedding_meta = _decode_collection_description(
         existing_meta.get("Description")
     )
-    if existing_embedding_meta == embedding_meta:
+
+    # Schema compatibility check: actual collection schema controls whether
+    # VikingDB full-text grep can be used. Missing content/FullText should only
+    # disable the vikingdb grep path, not block server startup.
+    if (
+        "Fields" in existing_meta or "FullText" in existing_meta
+    ) and not _collection_has_content_fulltext(existing_meta):
+        existing_schema_version = "unknown"
+        if existing_embedding_meta:
+            existing_schema_version = existing_embedding_meta.get("schema_version", "0.0.0")
+        logger.warning(
+            "Collection schema does not support VikingDB full-text grep "
+            "(created by OV %s, feature requires >= %s). "
+            "Missing 'content' field or FullText config. "
+            "grep engine=auto will fall back to fs. "
+            "Recreate the collection to enable vikingdb-based grep.",
+            existing_schema_version,
+            _FULLTEXT_MIN_VERSION,
+        )
+
+    if _embedding_metadata_compatible(existing_embedding_meta, embedding_meta):
         return False
 
     existing_count = await storage.count() if hasattr(storage, "count") else 0
@@ -286,9 +364,53 @@ async def init_context_collection(storage) -> bool:
         )
         return False
 
+    # Embedding metadata differs from current config and the collection is
+    # non-empty. Decide whether the user has explicitly opted in to keep the
+    # existing vectors despite the metadata drift.
+    existing_dimension = (
+        existing_embedding_meta.get("dimension") if existing_embedding_meta else None
+    )
+    current_dimension = embedding_meta.get("dimension")
+    dimension_changed = (
+        existing_dimension is not None
+        and current_dimension is not None
+        and existing_dimension != current_dimension
+    )
+
+    allow_override = bool(getattr(config.embedding, "allow_metadata_override", False))
+    if (
+        allow_override
+        and not dimension_changed
+        and hasattr(storage, "update_collection_description")
+    ):
+        logger.warning(
+            "Embedding metadata changed (provider/model) but dimension is "
+            "unchanged; embedding.allow_metadata_override=true, so the existing "
+            "collection metadata will be rewritten and existing vectors kept. "
+            "old=%s new=%s",
+            existing_embedding_meta,
+            embedding_meta,
+        )
+        await storage.update_collection_description(
+            _encode_collection_description(
+                base_description or "Unified context collection",
+                embedding_meta,
+            )
+        )
+        return False
+
+    if dimension_changed:
+        raise EmbeddingRebuildRequiredError(
+            "Existing collection embedding dimension "
+            f"({existing_dimension}) does not match current configuration "
+            f"({current_dimension}). Vectors are incompatible; rebuild is required."
+        )
+
     raise EmbeddingRebuildRequiredError(
         "Existing collection embedding metadata does not match current configuration. "
-        "Rebuild is required before using the current embedding model."
+        "Rebuild is required before using the current embedding model, or set "
+        "embedding.allow_metadata_override=true to keep existing vectors when "
+        "only provider/model changed (dimension must remain the same)."
     )
 
 
@@ -446,9 +568,11 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     report_success = True
                     return None
 
-                # Only process string messages
-                if not isinstance(embedding_msg.message, str):
-                    logger.debug(f"Skipping non-string message type: {type(embedding_msg.message)}")
+                # Process string (text) or list (multimodal) messages
+                if not isinstance(embedding_msg.message, (str, list)):
+                    logger.debug(
+                        f"Skipping unsupported message type: {type(embedding_msg.message)}"
+                    )
                     self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
                     self._record_request_success(embedding_msg)
                     report_success = True
@@ -627,10 +751,14 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     user = UserIdentifier(
                         account_id=account_id,
                         user_id="default",
-                        agent_id="default",
                     )
                     ctx = RequestContext(user=user, role=Role.ROOT)
-                    record_id = await self._vikingdb.upsert(inserted_data, ctx=ctx)
+                    result = await self._vikingdb.upsert(
+                        inserted_data,
+                        ctx=ctx,
+                        partial_update=True,
+                    )
+                    record_id = result
                     if record_id:
                         logger.debug(
                             f"Successfully wrote embedding to database: {record_id} abstract {inserted_data['abstract']} vector {inserted_data['vector'][:5]}"

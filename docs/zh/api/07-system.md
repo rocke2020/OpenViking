@@ -66,6 +66,16 @@ healthy = client.health()
 print(f"Healthy: {healthy}")
 ```
 
+**Go SDK**
+
+```go
+healthy, err := client.Health(ctx)
+if err != nil {
+    return err
+}
+fmt.Println(healthy)
+```
+
 **CLI**
 
 ```bash
@@ -256,6 +266,16 @@ print(report["ok"])
 print(report["missing_records"])
 ```
 
+**Go SDK**
+
+```go
+report, err := client.CheckConsistency(ctx, "viking://resources/my-project")
+if err != nil {
+    return err
+}
+fmt.Println(report["ok"])
+```
+
 **CLI**
 
 ```bash
@@ -333,6 +353,18 @@ status = client.wait_processed(timeout=60.0)
 print(f"Processing complete: {status}")
 ```
 
+**Go SDK**
+
+```go
+status, err := client.WaitProcessed(ctx, &openviking.WaitProcessedOptions{
+    Timeout: openviking.Float64(60),
+})
+if err != nil {
+    return err
+}
+fmt.Println(status)
+```
+
 **CLI**
 
 ```bash
@@ -372,7 +404,7 @@ ov system wait --timeout 60
 
 **认证**
 
-- HTTP 端点：在开启认证时要求 root/admin 权限；root key 请求必须带 `X-OpenViking-Account`
+- HTTP 端点：在开启认证时要求 admin/root 角色。`api_key` 模式下，租户内容重建请使用 admin key；裸 root key 不能访问租户级数据。
 - Python embedded 模式：使用当前 service context
 - Python HTTP client / CLI：使用当前认证身份发起请求
 
@@ -391,16 +423,15 @@ HTTP 请求体不接受未知字段。`uri` 可以使用其他 content API 支�
 - `viking://`
 - `viking://user`
 - `viking://user/<user_id>`
-- `viking://agent`
-- `viking://agent/<agent_id>`
 - `viking://resources`
 - `viking://resources/...`
 - `viking://user/<user_id>/memories/...`
-- `viking://agent/<agent_id>/memories/...`
-- `viking://agent/<agent_id>/skills`
-- `viking://agent/<agent_id>/skills/<skill_name>`
+- `viking://user/<user_id>/skills`
+- `viking://user/<user_id>/skills/<skill_name>`
 
-`reindex()` 不支持 `viking://session/...`。
+`reindex()` 不支持会话命名空间。请求 `viking://session/...` 或
+`viking://user/<user_id>/sessions/...` 会被拒绝；重建更大的 user 命名空间时，
+session 子树会被跳过。
 
 **模式说明**
 
@@ -424,11 +455,24 @@ print(result)
 
 ```python
 result = client.reindex(
-    uri="viking://agent/default/skills",
+    uri="viking://user/default/skills",
     mode="semantic_and_vectors",
     wait=False,
 )
 print(result["status"])
+```
+
+**Go SDK**
+
+```go
+result, err := client.Reindex(ctx, "viking://resources", &openviking.ReindexOptions{
+    Mode: "vectors_only",
+    Wait: true,
+})
+if err != nil {
+    return err
+}
+fmt.Println(result["status"])
 ```
 
 **HTTP API**
@@ -458,7 +502,7 @@ openviking reindex viking://resources --mode vectors_only
 ```
 
 ```bash
-openviking reindex viking://agent/default/skills --mode semantic_and_vectors --wait false
+openviking reindex viking://user/default/skills --mode semantic_and_vectors --wait false
 ```
 
 **同步响应（`wait=true`）**
@@ -512,7 +556,7 @@ Reindex 后台任务的 `task_type` 为 `admin_reindex`，`resource_id` 等于�
 GET /api/v1/tasks?task_type=admin_reindex&resource_id=viking://resources
 ```
 
-任务记录保存在内存中，可能过期，也会在服务重启后丢失。
+任务记录持久化在 `/local/{account_id}/_system/tasks/{user_id}/{task_id}.json`，服务重启后仍可查询。
 
 **结果字段**
 
@@ -520,7 +564,7 @@ GET /api/v1/tasks?task_type=admin_reindex&resource_id=viking://resources
 |------|------|
 | status | 同步完成时为 `completed`，后台执行时为 `accepted` |
 | uri | 解析路径变量后的请求 URI |
-| object_type | 推断出的目标类型，例如 `resource`、`skill`、`memory`、`user_namespace`、`agent_namespace`、`skill_namespace` 或 `global_namespace` |
+| object_type | 推断出的目标类型，例如 `resource`、`skill`、`memory`、`user_namespace`、`skill_namespace` 或 `global_namespace` |
 | mode | 实际执行的 reindex 模式 |
 | scanned_records | 被检查的记录或语义源数量 |
 | rebuilt_records | 成功重建的向量记录数量 |
@@ -534,7 +578,7 @@ GET /api/v1/tasks?task_type=admin_reindex&resource_id=viking://resources
 
 - Reindex 是非破坏式的，采用重建/覆盖写入，不需要先 drop 向量集合。
 - 对 `viking://` 发起 reindex 时，会向下分发到支持的顶层命名空间，并显式排除 `session`。
-- 命名空间级 reindex，例如 `viking://user` 或 `viking://agent/default`，会继续传播到其支持的子内容类型。
+- 命名空间级 reindex，例如 `viking://user`，会继续传播到其支持的子内容类型。
 - 如果只是 embedding 模型或向量索引需要刷新，应使用 `vectors_only`。
 - 如果语义产物本身也需要重建，再做重向量化，应使用 `semantic_and_vectors`。
 - 同一个 URI 和 owner 同时只能运行一个 reindex 任务。对同一目标的并发请求会返回 conflict。
@@ -590,6 +634,16 @@ print(client.observer.queue)
 # Embedding             0        0            10         0       10
 # Semantic              0        0            10         0       10
 # TOTAL                 0        0            20         0       20
+```
+
+**Go SDK**
+
+```go
+status, err := client.QueueStatus(ctx)
+if err != nil {
+    return err
+}
+fmt.Println(status["is_healthy"])
 ```
 
 **CLI**
@@ -659,6 +713,16 @@ print(client.observer.vikingdb().is_healthy)  # True
 print(client.observer.vikingdb().status)      # 状态表字符串
 ```
 
+**Go SDK**
+
+```go
+status, err := client.VikingDBStatus(ctx)
+if err != nil {
+    return err
+}
+fmt.Println(status["is_healthy"])
+```
+
 **CLI**
 
 ```bash
@@ -721,6 +785,16 @@ print(client.observer.models)
 # dense_embedding        yes      ...
 # rerank                 yes      ...
 # vlm                    yes      ...
+```
+
+**Go SDK**
+
+```go
+status, err := client.ModelsStatus(ctx)
+if err != nil {
+    return err
+}
+fmt.Println(status["is_healthy"])
 ```
 
 **CLI**
@@ -963,6 +1037,16 @@ print(client.observer.system())
 # ...
 #
 # [system] (healthy)
+```
+
+**Go SDK**
+
+```go
+status, err := client.GetStatus(ctx)
+if err != nil {
+    return err
+}
+fmt.Println(status["is_healthy"])
 ```
 
 **CLI**

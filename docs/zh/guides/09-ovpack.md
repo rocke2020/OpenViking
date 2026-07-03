@@ -13,18 +13,32 @@ checksum，保证包内容没有偏离 manifest；如果攻击者能同时篡改
 
 - `viking://resources/...`
 - `viking://user/...`
-- `viking://agent/...`
-- `viking://session/...`
 
 全量迁移使用单独的 `backup/restore`，它会把公开 scope root 一起打进备份包：
 
 - `viking://resources`
 - `viking://user`
-- `viking://agent`
-- `viking://session`
+
+Session 通过 user 命名空间一起迁移，路径为
+`viking://user/{user_id}/sessions/{session_id}`。`viking://session/...`
+别名不属于 OVPack v3 的导入/导出 scope。
 
 `temp`、`queue`、`upload`、锁文件、watch control 文件、`.relations.json` 等内部或运行态数据
 不属于 OVPack 迁移范围。
+
+## 与多写存储配合
+
+多写存储只复制启用之后的新写入，不会自动同步启用之前已经存在的历史文件。将已有环境迁移到多写模式时，建议先用 OVPack 完成存量数据迁移，再开启 `storage.agfs.backups`。
+
+推荐流程：
+
+1. 使用 `ov backup` 或 `ov export` 导出现有内容。
+2. 在目标存储环境恢复或导入数据。
+3. 校验目标环境内容和索引状态。
+4. 配置并启用多写存储。
+5. 恢复正常写入，让后续增量由多写机制复制。
+
+更多说明见 [多写存储指南](./13-multi-write-storage.md)。
 
 ## 快速开始
 
@@ -94,6 +108,16 @@ report = await client.check_consistency("viking://resources/my-project")
 print(report["ok"], report["missing_records"])
 ```
 
+Go SDK：
+
+```go
+report, err := client.CheckConsistency(ctx, "viking://resources/my-project")
+if err != nil {
+    return err
+}
+fmt.Println(report["ok"], report["missing_records"])
+```
+
 HTTP API：
 
 ```bash
@@ -151,6 +175,60 @@ await client.restore_ovpack(
     on_conflict="overwrite",
     vector_mode="auto",
 )
+```
+
+## Go SDK
+
+```go
+outPath, err := client.ExportOVPack(
+    ctx,
+    "viking://resources/my-project",
+    "./exports/my-project.ovpack",
+    &openviking.PackOptions{IncludeVectors: false},
+)
+if err != nil {
+    return err
+}
+
+importedURI, err := client.ImportOVPack(
+    ctx,
+    outPath,
+    "viking://resources/imported/",
+    &openviking.ImportPackOptions{
+        OnConflict: "overwrite",
+        VectorMode: "auto",
+    },
+)
+if err != nil {
+    return err
+}
+fmt.Println(importedURI)
+```
+
+全量备份：
+
+```go
+backupPath, err := client.BackupOVPack(
+    ctx,
+    "./backups/openviking.ovpack",
+    &openviking.PackOptions{IncludeVectors: true},
+)
+if err != nil {
+    return err
+}
+
+restoredURI, err := client.RestoreOVPack(
+    ctx,
+    backupPath,
+    &openviking.ImportPackOptions{
+        OnConflict: "overwrite",
+        VectorMode: "auto",
+    },
+)
+if err != nil {
+    return err
+}
+fmt.Println(restoredURI)
 ```
 
 ## HTTP API
@@ -213,7 +291,7 @@ curl -X POST http://localhost:1933/api/v1/pack/backup \
 
 ## 包结构
 
-OVPack v2 是标准 ZIP。ZIP 内部有一个包根目录：
+OVPack v3 是标准 ZIP。ZIP 内部有一个包根目录：
 
 ```text
 my-project/
@@ -235,7 +313,7 @@ manifest 只保存包结构、文件 checksum 和内部索引文件的 checksum�
 ```json
 {
   "kind": "openviking.ovpack",
-  "format_version": 2,
+  "format_version": 3,
   "root": {
     "name": "my-project",
     "uri": "viking://resources/my-project",
@@ -307,7 +385,7 @@ type, context_type, level, name, description, tags, abstract
 这些字段不会从包里直接恢复，而是在目标环境重新生成：
 
 ```text
-id, uri, account_id, owner_user_id, owner_agent_id, owner_space,
+id, uri, account_id, owner_user_id, owner_space,
 created_at, updated_at, active_count
 ```
 
@@ -327,7 +405,7 @@ dense 快照，也会按目标 URI、目标账号和当前时间重建运行态�
 6. 每个文件的 `size` 和 `sha256` 必须匹配实际内容。
 7. `content_sha256` 必须匹配按路径排序后的文件清单。
 8. `_ovpack/index_records.jsonl` 和可选 `_ovpack/dense.f32` 必须匹配 manifest 中的 hash、数量和维度。
-9. source scope 和 target scope 必须一致；`user`、`agent`、`session` 这类结构化 scope 还要求 root 层级一致。
+9. source scope 和 target scope 必须一致；`user` 这类结构化 scope 还要求 root 层级一致。
 10. 校验通过前不会写入包内容；冲突策略也在写入前处理。
 
 典型拒绝示例：
@@ -365,14 +443,14 @@ ov import ./exports/resources.ovpack viking:// --on-conflict overwrite
 以下导入会被拒绝：
 
 ```bash
-# resources 包不能导入 session
-ov import ./exports/a.ovpack viking://session/
+# resources 包不能导入 user
+ov import ./exports/a.ovpack viking://user/alice/
 
-# session 子树不能导入 resources
+# user session 子树不能导入 resources
 ov import ./exports/sess_123.ovpack viking://resources/
 
-# session 子树不能把自身路径当父目录，否则会变成 session/sess_123/sess_123
-ov import ./exports/sess_123.ovpack viking://session/sess_123/
+# session 子树不能把自身路径当父目录，否则会变成 sessions/sess_123/sess_123
+ov import ./exports/sess_123.ovpack viking://user/alice/sessions/sess_123/
 ```
 
 ## 记忆和 Session
@@ -386,31 +464,28 @@ ov export viking://user/default/memories ./exports/user-memories.ovpack
 ov import ./exports/user-memories.ovpack viking://user/default/ --on-conflict overwrite
 ```
 
-Agent 记忆：
+Session 数据：
 
 ```bash
-ov export viking://agent/default/memories ./exports/agent-memories.ovpack
-ov import ./exports/agent-memories.ovpack viking://agent/default/ --on-conflict overwrite
+ov export viking://user/alice/sessions/sess_123 ./exports/sess_123.ovpack
+ov import ./exports/sess_123.ovpack viking://user/alice/sessions/ --on-conflict overwrite
 ```
 
-Session 只恢复文件状态，不触发向量化：
-
-```bash
-ov export viking://session/sess_123 ./exports/sess_123.ovpack
-ov import ./exports/sess_123.ovpack viking://session/ --on-conflict overwrite
-```
+Session 只恢复文件状态，不触发向量化。
 
 结果：
 
 ```text
-viking://session/sess_123
+viking://user/alice/sessions/sess_123
 ```
 
 ## 旧包和未来版本
 
-当前实现只接受 OVPack v2。旧版无 manifest 包没有文件集合、目录集合和 checksum 信息，无法判断
+当前实现只接受 OVPack v3。旧版无 manifest 包没有文件集合、目录集合和 checksum 信息，无法判断
 是否被删改或混入内容，因此默认拒绝。需要迁移旧包时，应先在可信旧环境中导入，再用当前版本
-重新导出。
+重新导出为 OVPack v3。
+
+OVPack v2 包也会被当前 OpenViking 拒绝。导入旧包前，需要先用当前版本服务重新导出。
 
 未来版本包也不会静默兼容。处理方式是升级 OpenViking，或在支持该版本的环境中重新导出为当前
 支持格式。
@@ -419,11 +494,11 @@ viking://session/sess_123
 
 | 错误 | 常见原因 | 处理方式 |
 | --- | --- | --- |
-| `Missing ovpack manifest` | 旧版无 manifest 包 | 在可信环境重新导出为 v2。 |
+| `Missing ovpack manifest` | 旧版无 manifest 包 | 在可信环境重新导出为 v3。 |
 | `Unsupported ovpack format_version` | 包格式版本不是当前支持版本 | 升级 OpenViking 或重新导出。 |
 | `sha256 does not match manifest` | 文件或内部索引内容被改动 | 丢弃该包，或从可信源重新导出。 |
 | `ovpack entries do not match manifest` | ZIP 中缺文件/目录，或混入额外文件/目录 | 丢弃该包，或重新导出。 |
-| `source scope does not match target scope` | 跨 scope 导入，例如 session 导入 resources | 导入到同 scope 的父目录。 |
+| `source scope does not match target scope` | 跨 scope 导入，例如 user 导入 resources | 导入到同 scope 的父目录。 |
 | `source path is incompatible with target path` | 结构化 scope 的 root 层级会改变 | 导入到正确系统父目录。 |
 | `Top-level scope ovpack packages must be imported to viking://` | 将顶级 scope 包导入了非根父目录 | 改为导入 `viking://`。 |
 | `Backup ovpack packages must be restored` | 用普通 import 导入 backup 包 | 使用 `ov restore`。 |

@@ -16,7 +16,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from openviking.server.api_keys import APIKeyManager
 from openviking.server.config import (
     ServerConfig,
     load_bot_gateway_token,
@@ -25,12 +24,13 @@ from openviking.server.config import (
 )
 from openviking.server.dependencies import set_server_config, set_service
 from openviking.server.error_mapping import map_exception
-from openviking.server.identity import AuthMode, Role
+from openviking.server.identity import Role
 from openviking.server.models import ERROR_CODE_TO_HTTP_STATUS, ErrorInfo, Response
 from openviking.server.profile_middleware import create_profile_http_middleware
 from openviking.server.routers import (
     admin_router,
     bot_router,
+    code_router,
     console_router,
     content_router,
     debug_router,
@@ -43,6 +43,8 @@ from openviking.server.routers import (
     resources_router,
     search_router,
     sessions_router,
+    skills_router,
+    snapshot_router,
     stats_router,
     system_router,
     tasks_router,
@@ -73,6 +75,57 @@ def _on_deferred_init_done(task):
         exc_info=(type(exc), exc, exc.__traceback__),
     )
     os._exit(1)
+
+
+async def _initialize_auth_plugin(
+    app: FastAPI,
+    service: OpenVikingService,
+    config: ServerConfig,
+) -> None:
+    """Initialize the auth plugin before the app serves authenticated requests."""
+    from openviking.server.auth.registry import get_registry
+
+    effective_auth_mode = config.get_effective_auth_mode()
+    registry = get_registry()
+
+    # Ensure built-in plugins are registered
+    from openviking.server.auth.plugins import (
+        ApiKeyAuthPlugin,
+        DevAuthPlugin,
+        TrustedAuthPlugin,
+    )
+
+    if registry.get("dev") is None:
+        registry.register(DevAuthPlugin)
+    if registry.get("api_key") is None:
+        registry.register(ApiKeyAuthPlugin)
+    if registry.get("trusted") is None:
+        registry.register(TrustedAuthPlugin)
+
+    plugin_cls = registry.get(effective_auth_mode)
+    if plugin_cls is None:
+        logger.error(
+            "Unknown auth_mode: %r. No auth plugin registered. Registered modes: %s.",
+            effective_auth_mode,
+            ", ".join(registry.list_modes()),
+        )
+        raise RuntimeError(f"Unknown auth_mode: {effective_auth_mode}")
+
+    plugin = plugin_cls()
+    app.state.auth_plugin = plugin
+    await plugin.initialize(app, service, config)
+    logger.info("Auth plugin initialized: %s", effective_auth_mode)
+
+
+async def _initialize_runtime_state(
+    app: FastAPI,
+    service: OpenVikingService,
+    config: ServerConfig,
+) -> None:
+    """Initialize service and auth dependencies before traffic is accepted."""
+    await service.initialize()
+    await _initialize_auth_plugin(app, service, config)
+    logger.info("OpenVikingService initialization complete")
 
 
 def _format_error_location(loc: object) -> str:
@@ -173,44 +226,8 @@ def create_app(
         _configure_session_tool_outputs(service)
 
     async def _deferred_init(service, app, config):
-        """Run heavy initialization in background after server starts accepting requests."""
-        await service.initialize()
-
-        # Initialize APIKeyManager after service (needs VikingFS)
-        effective_auth_mode = config.get_effective_auth_mode()
-        if config.root_api_key and config.root_api_key != "":
-            api_key_manager = APIKeyManager(
-                root_key=config.root_api_key,
-                viking_fs=service.viking_fs,
-                api_key_hashing_enabled=config.api_key_hashing_enabled,
-            )
-            await api_key_manager.load()
-            app.state.api_key_manager = api_key_manager
-            logger.info(
-                "APIKeyManager initialized with api_key_hashing_enabled=%s",
-                config.api_key_hashing_enabled,
-            )
-        elif effective_auth_mode == AuthMode.TRUSTED:
-            app.state.api_key_manager = None
-            if config.root_api_key and config.root_api_key != "":
-                logger.info(
-                    "Trusted mode enabled: authentication trusts X-OpenViking-Account/User/Agent "
-                    "headers and requires the configured server API key on each request. "
-                    "Only expose this server behind a trusted network boundary or "
-                    "identity-injecting gateway."
-                )
-            else:
-                logger.warning(
-                    "Trusted mode enabled: authentication uses X-OpenViking-Account/User/Agent "
-                    "headers without API keys. This is only allowed on localhost. "
-                    "Only expose this server behind a trusted network boundary or "
-                    "identity-injecting gateway after configuring server.root_api_key."
-                )
-        else:
-            # AuthMode.DEV - logging already handled in validate_server_config
-            app.state.api_key_manager = None
-
-        logger.info("OpenVikingService initialization complete")
+        """Retained for tests that validate deferred-init callback behavior."""
+        await _initialize_runtime_state(app, service, config)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -270,21 +287,10 @@ def create_app(
         # Start MCP session manager (must be active before /mcp requests)
         from openviking.server.mcp_endpoint import mcp_lifespan
 
-        deferred_task = None
-
         async with mcp_lifespan():
-            # Start heavy initialization as background task after yield
             if service is not None:
-                deferred_task = asyncio.create_task(_deferred_init(service, app, config))
-                deferred_task.add_done_callback(_on_deferred_init_done)
+                await _initialize_runtime_state(app, service, config)
             yield
-
-        # Wait for deferred initialization to complete before shutdown
-        if deferred_task and not deferred_task.done():
-            try:
-                await deferred_task
-            except Exception:
-                logger.exception("Deferred initialization failed")
 
         # Cleanup
         from openviking.metrics.global_api import shutdown_metrics_async
@@ -322,6 +328,7 @@ def create_app(
     )
 
     app.state.config = config
+    app.state.api_key_manager = None
     set_server_config(config)
 
     # Add CORS middleware
@@ -520,9 +527,12 @@ def create_app(
     app.include_router(content_router)
     app.include_router(console_router)
     app.include_router(search_router)
+    app.include_router(code_router)
     app.include_router(relations_router)
     app.include_router(privacy_configs_router)
+    app.include_router(skills_router)
     app.include_router(sessions_router)
+    app.include_router(snapshot_router)
     app.include_router(stats_router)
     app.include_router(pack_router)
     app.include_router(debug_router)
@@ -534,8 +544,8 @@ def create_app(
     app.include_router(bot_router, prefix="/bot/v1")
 
     # OAuth 2.1: when enabled, mount the official MCP SDK auth routes
-    # (DCR / authorize / token / metadata) plus our authorize page + OTP
-    # issuance endpoint. The Provider that backs the SDK routes is built
+    # (DCR / authorize / token / metadata) plus our authorize page + consent /
+    # verify endpoints. The Provider that backs the SDK routes is built
     # in the lifespan; here we only register the route handlers, since the
     # SDK routes inspect request.app.state at call time.
     try:
@@ -547,14 +557,14 @@ def create_app(
 
             from openviking.server.oauth.router import router as oauth_router
 
-            # Custom routes (authorize page + /api/v1/auth/otp).
+            # Custom routes (authorize page + consent / verify endpoints).
             app.include_router(oauth_router)
 
             # SDK-owned routes (DCR / authorize / token / metadata / revoke).
             # We need a live Provider here; create_auth_routes captures it by
             # reference. Re-build the same construction the lifespan does so
             # the routes work as soon as they're hit (lifespan re-binds the
-            # same instance to app.state for the OTP / authorize-page path).
+            # same instance to app.state for the consent / authorize-page path).
             from pathlib import Path as _Path
 
             from openviking.server.oauth.provider import OpenVikingOAuthProvider
@@ -606,7 +616,7 @@ def create_app(
             app.routes.extend(sdk_routes)
             app.state.oauth_config = ov_cfg.oauth
             logger.info(
-                "OAuth 2.1 routes mounted (SDK + authorize-page + otp): %s",
+                "OAuth 2.1 routes mounted (SDK + authorize-page + consent): %s",
                 [r.path for r in sdk_routes],
             )
     except Exception as e:  # noqa: BLE001

@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 from openviking.async_client import AsyncOpenViking
 from openviking.telemetry import TelemetryRequest
+from openviking.utils.search_filters import SearchContextTypeInput
 from openviking_cli.utils import run_async
 
 
@@ -22,9 +23,19 @@ class SyncOpenViking:
     Wraps AsyncOpenViking with synchronous methods.
     """
 
-    def __init__(self, **kwargs):
-        self._async_client = AsyncOpenViking(**kwargs)
+    def __init__(
+        self,
+        path: Optional[str] = None,
+        actor_peer_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+    ):
+        self._async_client = AsyncOpenViking(
+            path=path,
+            actor_peer_id=actor_peer_id,
+            agent_id=agent_id,
+        )
         self._initialized = False
+        self._snapshot: Optional["SyncSnapshotNamespace"] = None
 
     def initialize(self) -> None:
         """Initialize OpenViking storage and indexes."""
@@ -40,7 +51,10 @@ class SyncOpenViking:
         return run_async(self._async_client.session_exists(session_id))
 
     def create_session(
-        self, session_id: Optional[str] = None, telemetry: TelemetryRequest = False
+        self,
+        session_id: Optional[str] = None,
+        telemetry: TelemetryRequest = False,
+        memory_policy: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Create a new session.
 
@@ -48,7 +62,13 @@ class SyncOpenViking:
             session_id: Optional session ID. If provided, creates a session with the given ID.
                        If None, creates a new session with auto-generated ID.
         """
-        return run_async(self._async_client.create_session(session_id, telemetry=telemetry))
+        return run_async(
+            self._async_client.create_session(
+                session_id,
+                telemetry=telemetry,
+                memory_policy=memory_policy,
+            )
+        )
 
     def list_sessions(self) -> List[Any]:
         """List all sessions."""
@@ -79,7 +99,7 @@ class SyncOpenViking:
         content: str | None = None,
         parts: list[dict] | None = None,
         created_at: str | None = None,
-        role_id: str | None = None,
+        peer_id: str | None = None,
         telemetry: TelemetryRequest = False,
     ) -> Dict[str, Any]:
         """Add a message to a session.
@@ -88,33 +108,75 @@ class SyncOpenViking:
             session_id: Session ID
             role: Message role ("user" or "assistant")
             content: Text content (simple mode)
-            parts: Parts array (full Part support: TextPart, ContextPart, ToolPart)
+            parts: Parts array (full Part support: TextPart, ContextPart, ImagePart, ToolPart)
             created_at: Message creation time (ISO format string). If not provided, current time is used.
-            role_id: Optional explicit actor identity. Omit to let the client/server derive it.
+            peer_id: Optional stable interaction peer identity.
 
         If both content and parts are provided, parts takes precedence.
         """
         return run_async(
             self._async_client.add_message(
+                session_id=session_id,
+                role=role,
+                content=content,
+                parts=parts,
+                created_at=created_at,
+                peer_id=peer_id,
+                telemetry=telemetry,
+            )
+        )
+
+    def batch_add_messages(
+        self,
+        session_id: str,
+        messages: list[dict],
+        telemetry: TelemetryRequest = False,
+    ) -> Dict[str, Any]:
+        """Add multiple messages to a session in a single request."""
+        return run_async(
+            self._async_client.batch_add_messages(
                 session_id,
-                role,
-                content,
-                parts,
-                created_at,
-                role_id,
+                messages,
                 telemetry,
             )
         )
 
     def commit_session(
-        self, session_id: str, telemetry: TelemetryRequest = False
+        self,
+        session_id: str,
+        telemetry: TelemetryRequest = False,
+        *,
+        keep_recent_count: int = 0,
     ) -> Dict[str, Any]:
         """Commit a session (archive and extract memories)."""
-        return run_async(self._async_client.commit_session(session_id, telemetry=telemetry))
+        return run_async(
+            self._async_client.commit_session(
+                session_id,
+                telemetry=telemetry,
+                keep_recent_count=keep_recent_count,
+            )
+        )
 
     def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
         """Query background task status."""
         return run_async(self._async_client.get_task(task_id))
+
+    def list_tasks(
+        self,
+        task_type: Optional[str] = None,
+        status: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """List background tasks visible to the current caller."""
+        return run_async(
+            self._async_client.list_tasks(
+                task_type=task_type,
+                status=status,
+                resource_id=resource_id,
+                limit=limit,
+            )
+        )
 
     def reindex(
         self,
@@ -142,6 +204,7 @@ class SyncOpenViking:
         timeout: float = None,
         build_index: bool = True,
         summarize: bool = False,
+        args: Optional[Dict[str, Any]] = None,
         telemetry: TelemetryRequest = False,
         **kwargs,
     ) -> Dict[str, Any]:
@@ -168,6 +231,7 @@ class SyncOpenViking:
                 timeout=timeout,
                 build_index=build_index,
                 summarize=summarize,
+                args=args,
                 telemetry=telemetry,
                 **kwargs,
             )
@@ -179,10 +243,127 @@ class SyncOpenViking:
         wait: bool = False,
         timeout: float = None,
         telemetry: TelemetryRequest = False,
+        target_uri: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Add skill to OpenViking."""
         return run_async(
-            self._async_client.add_skill(data, wait=wait, timeout=timeout, telemetry=telemetry)
+            self._async_client.add_skill(
+                data,
+                wait=wait,
+                timeout=timeout,
+                telemetry=telemetry,
+                target_uri=target_uri,
+            )
+        )
+
+    def list_skills(
+        self,
+        node_limit: int = 1000,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """List installed skills."""
+        return run_async(
+            self._async_client.list_skills(
+                node_limit=node_limit,
+                target_uri=target_uri,
+            )
+        )
+
+    def find_skills(
+        self,
+        query: str,
+        limit: int = 10,
+        score_threshold: Optional[float] = None,
+        level: Optional[List[int]] = None,
+        telemetry: TelemetryRequest = False,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Find skills by semantic search."""
+        return run_async(
+            self._async_client.find_skills(
+                query=query,
+                limit=limit,
+                score_threshold=score_threshold,
+                level=level,
+                telemetry=telemetry,
+                target_uri=target_uri,
+            )
+        )
+
+    def get_skill(
+        self,
+        skill_name: str,
+        include_content: Optional[bool] = None,
+        include_files: bool = True,
+        include_source: bool = False,
+        level: Optional[int] = None,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get a skill by name."""
+        return run_async(
+            self._async_client.get_skill(
+                skill_name=skill_name,
+                include_content=include_content,
+                include_files=include_files,
+                include_source=include_source,
+                level=level,
+                target_uri=target_uri,
+            )
+        )
+
+    def update_skill(
+        self,
+        skill_name: str,
+        data: Any,
+        wait: bool = False,
+        timeout: Optional[float] = None,
+        source_metadata: Optional[Dict[str, Any]] = None,
+        telemetry: TelemetryRequest = False,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Update an existing skill."""
+        return run_async(
+            self._async_client.update_skill(
+                skill_name=skill_name,
+                data=data,
+                wait=wait,
+                timeout=timeout,
+                source_metadata=source_metadata,
+                telemetry=telemetry,
+                target_uri=target_uri,
+            )
+        )
+
+    def delete_skill(
+        self,
+        skill_name: str,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Delete a skill."""
+        return run_async(
+            self._async_client.delete_skill(
+                skill_name=skill_name,
+                target_uri=target_uri,
+            )
+        )
+
+    def validate_skill(
+        self,
+        data: Any,
+        strict: bool = False,
+        source_path: Optional[str] = None,
+        skill_dir_name: Optional[str] = None,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Validate skill data."""
+        return run_async(
+            self._async_client.validate_skill(
+                data=data,
+                strict=strict,
+                source_path=source_path,
+                skill_dir_name=skill_dir_name,
+                target_uri=target_uri,
+            )
         )
 
     def search(
@@ -194,6 +375,8 @@ class SyncOpenViking:
         limit: int = 10,
         score_threshold: Optional[float] = None,
         filter: Optional[Dict] = None,
+        context_type: Optional[SearchContextTypeInput] = None,
+        tags: Optional[List[str]] = None,
         telemetry: TelemetryRequest = False,
         since: Optional[str] = None,
         until: Optional[str] = None,
@@ -210,6 +393,8 @@ class SyncOpenViking:
                 limit=limit,
                 score_threshold=score_threshold,
                 filter=filter,
+                context_type=context_type,
+                tags=tags,
                 telemetry=telemetry,
                 since=since,
                 until=until,
@@ -225,6 +410,8 @@ class SyncOpenViking:
         limit: int = 10,
         score_threshold: Optional[float] = None,
         filter: Optional[Dict] = None,
+        context_type: Optional[SearchContextTypeInput] = None,
+        tags: Optional[List[str]] = None,
         telemetry: TelemetryRequest = False,
         since: Optional[str] = None,
         until: Optional[str] = None,
@@ -239,6 +426,8 @@ class SyncOpenViking:
                 limit,
                 score_threshold,
                 filter,
+                context_type,
+                tags,
                 telemetry,
                 since,
                 until,
@@ -276,6 +465,25 @@ class SyncOpenViking:
                 mode=mode,
                 wait=wait,
                 timeout=timeout,
+                telemetry=telemetry,
+            )
+        )
+
+    def set_tags(
+        self,
+        uri: str,
+        tags: List[str],
+        mode: str = "replace",
+        recursive: bool = False,
+        telemetry: TelemetryRequest = False,
+    ) -> Dict[str, Any]:
+        """Replace explicit retrieval tags for a file or directory."""
+        return run_async(
+            self._async_client.set_tags(
+                uri=uri,
+                tags=tags,
+                mode=mode,
+                recursive=recursive,
                 telemetry=telemetry,
             )
         )
@@ -351,9 +559,15 @@ class SyncOpenViking:
         """Get relations"""
         return run_async(self._async_client.relations(uri))
 
-    def rm(self, uri: str, recursive: bool = False) -> None:
+    def rm(
+        self,
+        uri: str,
+        recursive: bool = False,
+        wait: bool = False,
+        timeout: float = None,
+    ) -> None:
         """Delete resource"""
-        return run_async(self._async_client.rm(uri, recursive))
+        return run_async(self._async_client.rm(uri, recursive, wait=wait, timeout=timeout))
 
     def wait_processed(self, timeout: float = None) -> Dict[str, Any]:
         """Wait for all async operations to complete"""
@@ -366,10 +580,18 @@ class SyncOpenViking:
         case_insensitive: bool = False,
         node_limit: Optional[int] = None,
         exclude_uri: Optional[str] = None,
+        level_limit: int = 5,
     ) -> Dict:
         """Content search"""
         return run_async(
-            self._async_client.grep(uri, pattern, case_insensitive, node_limit, exclude_uri)
+            self._async_client.grep(
+                uri,
+                pattern,
+                case_insensitive,
+                node_limit,
+                exclude_uri,
+                level_limit,
+            )
         )
 
     def glob(self, pattern: str, uri: str = "viking://") -> Dict:
@@ -418,6 +640,14 @@ class SyncOpenViking:
         if not self._initialized:
             self.initialize()
         return self._async_client.observer
+
+    @property
+    def snapshot(self) -> "SyncSnapshotNamespace":
+        """Snapshot version control namespace (synchronous)."""
+        if getattr(self, "_snapshot", None) is None:
+            from openviking.snapshot_namespace import SyncSnapshotNamespace
+            self._snapshot = SyncSnapshotNamespace(self)
+        return self._snapshot
 
     @classmethod
     def reset(cls) -> None:

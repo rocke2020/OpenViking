@@ -69,11 +69,42 @@ import openviking as ov
 client = ov.SyncHTTPClient(
     url="http://localhost:1933",
     api_key="your-key",
-    agent_id="my-agent",
     timeout=120.0,
 )
 client.initialize()
 ```
+
+#### Go SDK 客户端
+
+Go SDK 是 Client-Server 模式下的 HTTP-only 客户端，作为主仓库的 `sdk/go` 独立 Go module 发布。
+
+```bash
+go get github.com/volcengine/OpenViking/sdk/go
+```
+
+```go
+client, err := openviking.NewClient(openviking.Config{
+    BaseURL: "http://localhost:1933",
+    APIKey:  "your-key",
+})
+if err != nil {
+    return err
+}
+defer client.CloseIdleConnections()
+```
+
+Go SDK 发送的身份请求头与 Python HTTP client 一致：
+
+| Config 字段 | HTTP Header |
+|-------------|-------------|
+| `APIKey` | `X-API-Key` |
+| `Account` | `X-OpenViking-Account` |
+| `User` | `X-OpenViking-User` |
+| `ActorPeerID` | `X-OpenViking-Actor-Peer` |
+
+普通 `api_key` 部署下只需要设置 `APIKey`，服务端会从 API key 推导租户身份。只有在 trusted 部署或网关显式透传租户身份时，才需要设置 `Account` 和 `User`。
+
+Go SDK 不支持 Python embedded 模式，也不保留旧 `agent_id` 兼容路径。更多示例见 [`sdk/go/README_CN.md`](../../../sdk/go/README_CN.md)。
 
 未显式传入 `url` 时，HTTP 客户端会自动从 `ovcli.conf` 读取连接信息。`ovcli.conf` 是 HTTP 客户端和 CLI 共享的配置文件，默认路径 `~/.openviking/ovcli.conf`，也可通过环境变量指定：
 
@@ -88,8 +119,7 @@ export OPENVIKING_CLI_CONFIG_FILE=/path/to/ovcli.conf
   "url": "http://localhost:1933",
   "api_key": "your-key",
   "account": "acme",
-  "user": "alice",
-  "agent_id": "my-agent"
+  "user": "alice"
 }
 ```
 
@@ -101,7 +131,6 @@ export OPENVIKING_CLI_CONFIG_FILE=/path/to/ovcli.conf
 | `api_key` | API Key | `null`（无认证） |
 | `account` | 租户级请求的默认账户请求头 | `null` |
 | `user` | 租户级请求的默认用户请求头 | `null` |
-| `agent_id` | Agent 标识符请求头 | `null` |
 | `timeout` | HTTP 请求超时时间（秒） | `60.0` |
 | `output` | 默认输出格式：`"table"` 或 `"json"` | `"table"` |
 
@@ -356,7 +385,31 @@ JSON 输出 - 错误：
 |------|------|------|
 | POST | `/api/v1/resources/temp_upload` | 临时文件上传（用于后续资源导入） |
 | POST | `/api/v1/resources` | 添加资源（支持 URL 或 temp_file_id） |
+
+### 技能端点
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/skills` | 列出已安装技能 |
 | POST | `/api/v1/skills` | 添加技能 |
+| POST | `/api/v1/skills/find` | 搜索已安装技能 |
+| POST | `/api/v1/skills/validate` | 校验技能 payload |
+| GET | `/api/v1/skills/{skill_name}` | 获取技能 |
+| PUT | `/api/v1/skills/{skill_name}` | 更新技能 |
+| DELETE | `/api/v1/skills/{skill_name}` | 删除技能 |
+
+### Watch 端点
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/watches` | 列出 watch，或按 `to_uri` 查询单个 watch |
+| GET | `/api/v1/watches/{task_id}` | 获取 watch |
+| PATCH | `/api/v1/watches` | 按 `to_uri` 更新 watch |
+| PATCH | `/api/v1/watches/{task_id}` | 按 task ID 更新 watch |
+| DELETE | `/api/v1/watches` | 按 `to_uri` 删除 watch |
+| DELETE | `/api/v1/watches/{task_id}` | 按 task ID 删除 watch |
+| POST | `/api/v1/watches/trigger` | 按 `to_uri` 触发 watch |
+| POST | `/api/v1/watches/{task_id}/trigger` | 按 task ID 触发 watch |
 
 ### Pack 端点
 
@@ -377,6 +430,15 @@ JSON 输出 - 错误：
 | POST | `/api/v1/fs/mkdir` | 创建目录 |
 | DELETE | `/api/v1/fs` | 删除资源 |
 | POST | `/api/v1/fs/mv` | 移动/重命名资源 |
+
+### 快照端点（多版本管理）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/v1/snapshot/commit` | 把当前工作区状态保存成新快照 |
+| GET | `/api/v1/snapshot/log` | 从最新提交开始回溯历史 |
+| GET | `/api/v1/snapshot/show` | 查看提交元数据，或读取提交中某个文件 |
+| POST | `/api/v1/snapshot/restore` | 恢复目录或整棵账号树到某个历史快照（正向提交） |
 
 ### 内容端点
 
@@ -475,7 +537,6 @@ JSON 输出 - 错误：
 | DELETE | `/api/v1/admin/accounts/{account_id}` | 删除工作区（级联清理数据） | ROOT |
 | POST | `/api/v1/admin/accounts/{account_id}/users` | 注册用户 | ROOT/ADMIN |
 | GET | `/api/v1/admin/accounts/{account_id}/users` | 列出用户 | ROOT/ADMIN |
-| GET | `/api/v1/admin/accounts/{account_id}/agents` | 列出 agent namespace | ROOT/ADMIN |
 | DELETE | `/api/v1/admin/accounts/{account_id}/users/{user_id}` | 移除用户 | ROOT/ADMIN |
 | PUT | `/api/v1/admin/accounts/{account_id}/users/{user_id}/role` | 修改用户角色 | ROOT |
 | POST | `/api/v1/admin/accounts/{account_id}/users/{user_id}/key` | 重新生成 User Key | ROOT/ADMIN |
@@ -512,6 +573,7 @@ VikingBot API 需要服务器启动时指定 `--with-bot` 选项：
 |------|------|
 | [资源管理](02-resources.md) | 资源和技能的添加、导入、导出 |
 | [文件系统](03-filesystem.md) | 目录操作、内容读写 |
+| [多版本管理](11-snapshot.md) | 快照提交、历史回溯、版本恢复 |
 | [技能](04-skills.md) | 技能管理 API |
 | [会话管理](05-sessions.md) | 会话创建、消息管理、记忆提取 |
 | [检索](06-retrieval.md) | 搜索、关联、上下文获取 |

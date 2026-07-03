@@ -10,7 +10,7 @@ Mounted on the FastAPI app at /mcp. The MCP session manager lifecycle is
 tied to the FastAPI app lifespan (not a sub-app lifespan) so the task group
 is always initialized before requests arrive.
 
-Identity headers (X-OpenViking-Account, X-OpenViking-User, X-OpenViking-Agent)
+Identity headers (X-OpenViking-Account, X-OpenViking-User)
 are extracted from HTTP request scope and propagated via contextvars.
 """
 
@@ -21,7 +21,7 @@ import contextvars
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
@@ -32,12 +32,13 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from openviking.parse.parsers.code.ast.code_tools import (
+    CODE_SEARCH_CONCURRENCY,
     expand_symbol,
+    filter_code_uris,
     outline_file,
     search_symbols,
 )
-from openviking.parse.parsers.code.ast.extractor import get_extractor
-from openviking.server.auth import resolve_identity
+from openviking.server.auth import normalize_actor_peer_header, resolve_identity
 from openviking.server.dependencies import get_server_config, get_service
 from openviking.server.identity import RequestContext
 from openviking.server.local_input_guard import (
@@ -53,6 +54,9 @@ from openviking_cli.exceptions import (
 )
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger
+
+# Backwards-compatible alias for existing tests that import this private name.
+_filter_code_uris = filter_code_uris
 
 logger = get_logger(__name__)
 
@@ -145,7 +149,9 @@ class _IdentityASGIMiddleware:
                 authorization=request.headers.get("authorization"),
                 x_openviking_account=request.headers.get("x-openviking-account"),
                 x_openviking_user=request.headers.get("x-openviking-user"),
-                x_openviking_agent=request.headers.get("x-openviking-agent"),
+            )
+            actor_peer_id = normalize_actor_peer_header(
+                request.headers.get("x-openviking-actor-peer")
             )
         except (UnauthenticatedError, PermissionDeniedError, InvalidArgumentError) as exc:
             status = (
@@ -175,10 +181,10 @@ class _IdentityASGIMiddleware:
             user=UserIdentifier(
                 identity.account_id or "default",
                 identity.user_id or "default",
-                identity.agent_id or "default",
             ),
             role=identity.role,
-            namespace_policy=identity.namespace_policy,
+            actor_peer_id=actor_peer_id,
+            from_oauth=identity.from_oauth,
         )
         url_info = {
             "x_forwarded_proto": request.headers.get("x-forwarded-proto"),
@@ -366,7 +372,6 @@ async def remember(messages: list[StoreMessage]) -> str:
             session.add_message(
                 msg.role,
                 [TextPart(text=msg.content)],
-                role_id=ctx.resolve_role_id(msg.role),
             )
     await service.sessions.commit_async(session_id, ctx)
     return f"Stored {len(messages)} message(s) and committed for memory extraction."
@@ -432,16 +437,6 @@ def _resolve_public_base_url() -> tuple[str, str]:
     return "http://127.0.0.1:1933", "listen"
 
 
-_WATCH_REQUIRES_TO_HINT = (
-    "watch_interval > 0 requires `to` to be specified (the stable target URI to refresh into). "
-    "Pick a deterministic URI under viking://resources/. For example:\n"
-    "  - https://github.com/<org>/<repo>  -> to='viking://resources/<org>/<repo>'\n"
-    "  - https://example.com/docs/api     -> to='viking://resources/example.com/docs/api'\n"
-    "Tip: call add_resource without watch_interval first, observe the returned URI, "
-    "then call again with watch_interval=<minutes> and to=<that URI>."
-)
-
-
 @mcp.tool()
 async def add_resource(
     path: str = "",
@@ -449,14 +444,16 @@ async def add_resource(
     description: str = "",
     watch_interval: float = 0,
     to: str = "",
+    args: Optional[dict[str, Any]] = None,
 ) -> str:
     """Add a resource to OpenViking. Asynchronous — processing happens in the background.
 
     Three ways to invoke:
 
     1. Remote URL: pass ``path`` set to an http(s)://, git@, ssh://, or git:// URL.
-       Returns a success message immediately. Supports ``watch_interval`` + ``to`` for
-       auto-refresh subscriptions.
+       Returns a success message immediately. Supports ``watch_interval`` for
+       auto-refresh subscriptions; pass ``to`` to choose the exact target URI, or
+       omit it to bind the watch to the URI created by this add.
 
     2. Local file: pass ``path`` set to a local filesystem path (e.g. ``/tmp/foo.pdf``).
        The response is NOT a success message — it's a multi-step upload instruction.
@@ -475,12 +472,15 @@ async def add_resource(
         watch_interval: Auto-refresh cadence in minutes. 0 (default) = no watch.
             >0 = periodically re-fetch the resource at that cadence (full re-ingest
             each time). Prefer >=1440 (24h) unless the source genuinely changes
-            faster — every refresh re-embeds the entire resource. Requires ``to``.
+            faster — every refresh re-embeds the entire resource. When ``to`` is
+            omitted, the watch binds to the URI created by this add.
             Only applies to remote-URL invocations.
         to: Target URI under viking://resources/ (e.g.
-            "viking://resources/volcengine/OpenViking"). Required when
-            watch_interval > 0. Leave empty for one-shot adds — the system will
-            auto-derive a URI from the source.
+            "viking://resources/volcengine/OpenViking"). Leave empty to let the
+            system derive a URI from the source.
+        args: Parser-specific import options. For Feishu one-time user-token imports,
+            pass {"feishu_access_token": "..."}. For Feishu user-token watches,
+            pass {"feishu_access_token": "...", "feishu_refresh_token": "..."}.
     """
     from openviking.server.local_input_guard import require_remote_resource_source
 
@@ -508,11 +508,13 @@ async def add_resource(
                 result = await service.resources.add_resource(
                     path=resolved.local_path,
                     ctx=ctx,
+                    to=to or None,
                     reason=description,
                     source_name=resolved.original_filename,
                     wait=False,
                     allow_local_path_resolution=True,
                     enforce_public_remote_targets=True,
+                    args=args,
                 )
             except Exception as exc:
                 await store.mark_failed(resolved, ctx)
@@ -539,8 +541,6 @@ async def add_resource(
 
     # Branch 3: remote URL — same flow as before
     if is_remote_resource_source(path):
-        if watch_interval > 0 and not to:
-            return f"Error: {_WATCH_REQUIRES_TO_HINT}"
         try:
             path = require_remote_resource_source(path)
             result = await service.resources.add_resource(
@@ -551,6 +551,7 @@ async def add_resource(
                 wait=False,
                 watch_interval=watch_interval,
                 enforce_public_remote_targets=True,
+                args=args,
             )
         except Exception as exc:
             return f"Error adding resource: {exc}"
@@ -576,7 +577,6 @@ async def add_resource(
     token, expires_at = upload_token_store.issue(
         ctx.user.account_id,
         ctx.user.user_id,
-        ctx.user.agent_id,
         ttl_seconds=ttl_seconds,
     )
     base_url, url_source = _resolve_public_base_url()
@@ -624,7 +624,7 @@ async def add_resource(
 
 @mcp.tool()
 async def list_watches() -> str:
-    """List watch tasks (auto-refresh subscriptions) visible to the current agent.
+    """List watch tasks (auto-refresh subscriptions) visible to the current user.
 
     Each line shows: target URI, refresh interval (minutes), active/paused status,
     and the next scheduled execution time. Returns "No watch tasks." when empty.
@@ -643,9 +643,8 @@ async def list_watches() -> str:
     tasks = await wm.get_all_tasks(
         ctx.account_id,
         ctx.user.user_id,
-        ctx.role.value,
+        str(ctx.role),
         active_only=False,
-        agent_id=ctx.user.agent_id,
     )
     if not tasks:
         return "No watch tasks."
@@ -680,8 +679,7 @@ async def cancel_watch(to_uri: str) -> str:
         to_uri,
         ctx.account_id,
         ctx.user.user_id,
-        ctx.role.value,
-        ctx.user.agent_id,
+        str(ctx.role),
     )
     if task is None:
         return f"No watch task found for {to_uri}"
@@ -696,8 +694,7 @@ async def cancel_watch(to_uri: str) -> str:
             task.task_id,
             ctx.account_id,
             ctx.user.user_id,
-            ctx.role.value,
-            ctx.user.agent_id,
+            str(ctx.role),
         )
     except _wm_mod.PermissionDeniedError:
         return f"Permission denied for {to_uri}"
@@ -794,9 +791,6 @@ async def forget(uri: str, recursive: bool = False) -> str:
 
 # -- code navigation -------------------------------------------------------
 
-_CODE_SEARCH_FILE_CAP = 200
-_CODE_SEARCH_CONCURRENCY = 10
-
 
 def _require_viking_uri(uri: str) -> Optional[str]:
     """Return error message if uri is not a viking:// URI, else None."""
@@ -808,42 +802,16 @@ def _require_viking_uri(uri: str) -> Optional[str]:
     return None
 
 
-def _entry_field(entry, key: str, fallback_key: str, default):
-    """ls entries are dicts (camelCase) or objects (snake_case); read both."""
-    if isinstance(entry, dict):
-        return entry.get(key, default)
-    return getattr(entry, fallback_key, default)
-
-
-def _filter_code_uris(entries) -> tuple[list[str], bool]:
-    """Pick file entries whose extension is supported by the AST extractor, capped.
-
-    Returns (uris, capped) where capped is True when the 200-file limit was hit
-    and there may be more matching files beyond the cap.
-    """
-    extractor = get_extractor()
-    uris: list[str] = []
-    for e in entries:
-        is_dir = _entry_field(e, "isDir", "is_dir", False)
-        if is_dir:
-            continue
-        entry_uri = _entry_field(e, "uri", "uri", "")
-        if not entry_uri:
-            continue
-        if extractor.supports(entry_uri):
-            uris.append(entry_uri)
-            if len(uris) > _CODE_SEARCH_FILE_CAP:
-                return uris[:_CODE_SEARCH_FILE_CAP], True
-    return uris, False
-
-
 @mcp.tool()
 async def code_outline(uri: str) -> str:
-    """Show a file's symbol structure — classes, functions, methods, and their line ranges.
-    Returns a structural map without reading implementation bodies.
+    """Show a confirmed viking:// source file's symbol structure: classes, functions,
+    methods, and line ranges. Returns a structural map without reading implementation bodies.
 
-    Use to survey a file before deciding what to read. More efficient than reading the whole
-    file when you only need to locate a method or understand a file's API surface.
+    Use only for source files inside an ingested code repository, after you know the exact
+    viking:// file URI. Do not use on directories, documentation-only files, plain text notes,
+    chat/session history, or files that are not supported source code.
+
+    Use read instead when you need the full file content.
     Typical workflow: code_search → code_outline → code_expand.
 
     uri must be a viking:// file URI (not a directory)."""
@@ -863,13 +831,17 @@ async def code_outline(uri: str) -> str:
 
 @mcp.tool()
 async def code_search(query: str, uri: str) -> str:
-    """Search symbol names (class / function / method) by substring across a viking://
-    directory. Returns structured results: symbol type, class context, file URI, line range.
+    """Search AST-supported symbol names (class / function / method) by substring across a
+    confirmed viking:// code repository or source subtree. Returns structured results:
+    symbol type, class context, file URI, line range.
 
-    Use when you don't know which file contains the symbol you're looking for. Returns
-    structural context (class ownership, location) that raw text search does not provide.
+    Use only after you have evidence that the uri contains supported source files. If you have
+    not confirmed that this is an ingested code repository, first use ls/glob/read or
+    add_resource output to verify it.
 
-    Skip if you already know the exact file; use code_outline or Read directly.
+    Do not use for general memory search, documentation-only resources, plain text notes,
+    chat/session history, or local filesystem paths. Skip if you already know the exact file;
+    use code_outline or read directly.
 
     Scans up to 200 source files. Narrow uri to a subdirectory for deeper coverage.
     uri is required to avoid accidentally walking the entire VikingFS."""
@@ -886,11 +858,11 @@ async def code_search(query: str, uri: str) -> str:
     except Exception as exc:
         return f"Error: failed to list {uri}: {exc}"
 
-    code_uris, capped = _filter_code_uris(entries or [])
+    code_uris, capped = filter_code_uris(entries or [])
     if not code_uris:
         return f"No supported source files found under {uri}"
 
-    semaphore = asyncio.Semaphore(_CODE_SEARCH_CONCURRENCY)
+    semaphore = asyncio.Semaphore(CODE_SEARCH_CONCURRENCY)
 
     async def _read(u: str) -> Optional[tuple[str, str]]:
         async with semaphore:
@@ -913,11 +885,13 @@ async def code_search(query: str, uri: str) -> str:
 
 @mcp.tool()
 async def code_expand(uri: str, symbol: str) -> str:
-    """Return the full source of a single named symbol (function, class, or method).
+    """Return the full source of a single named symbol from a confirmed viking:// source file.
     Reads only that symbol's body, avoiding the overhead of reading an entire file.
 
-    Use when you need the implementation of one specific symbol. For reading multiple
-    symbols from the same file, Read is often more efficient.
+    Use only after code_outline or other evidence shows the symbol exists in that file.
+    Do not use for broad exploration, non-code files, documentation, chat/session history,
+    or unverified viking:// resources. For reading multiple symbols from the same file,
+    read is often more efficient.
 
     `symbol` accepts 'bar' (top-level) or 'Foo.bar' (method).
     uri must be a viking:// file URI."""

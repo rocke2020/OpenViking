@@ -69,11 +69,46 @@ import openviking as ov
 client = ov.SyncHTTPClient(
     url="http://localhost:1933",
     api_key="your-key",
-    agent_id="my-agent",
     timeout=120.0,
 )
 client.initialize()
 ```
+
+#### Go SDK Client
+
+The Go SDK is an HTTP-only client for Client-Server mode. It is published from
+the main repository as the `sdk/go` module.
+
+```bash
+go get github.com/volcengine/OpenViking/sdk/go
+```
+
+```go
+client, err := openviking.NewClient(openviking.Config{
+    BaseURL: "http://localhost:1933",
+    APIKey:  "your-key",
+})
+if err != nil {
+    return err
+}
+defer client.CloseIdleConnections()
+```
+
+The Go SDK sends the same identity headers as the Python HTTP client:
+
+| Config field | HTTP header |
+|--------------|-------------|
+| `APIKey` | `X-API-Key` |
+| `Account` | `X-OpenViking-Account` |
+| `User` | `X-OpenViking-User` |
+| `ActorPeerID` | `X-OpenViking-Actor-Peer` |
+
+For normal `api_key` deployments, `APIKey` is enough because the server derives
+tenant identity from the key. Set `Account` and `User` only for trusted
+deployments or gateways that explicitly forward tenant identity.
+
+It does not implement Python embedded mode or legacy `agent_id` compatibility.
+See [`sdk/go/README.md`](../../../sdk/go/README.md) for package-level examples.
 
 When `url` is not explicitly provided, the HTTP client automatically reads connection information from `ovcli.conf`. `ovcli.conf` is a configuration file shared between the HTTP client and CLI. Default path: `~/.openviking/ovcli.conf`. You can also specify the path via environment variable:
 
@@ -88,8 +123,7 @@ Configuration file example:
   "url": "http://localhost:1933",
   "api_key": "your-key",
   "account": "acme",
-  "user": "alice",
-  "agent_id": "my-agent"
+  "user": "alice"
 }
 ```
 
@@ -101,7 +135,6 @@ Configuration field description:
 | `api_key` | API Key | `null` (no auth) |
 | `account` | Default account header for tenant-scoped requests | `null` |
 | `user` | Default user header for tenant-scoped requests | `null` |
-| `agent_id` | Agent identifier header | `null` |
 | `timeout` | HTTP request timeout in seconds | `60.0` |
 | `output` | Default output format: `"table"` or `"json"` | `"table"` |
 
@@ -356,7 +389,31 @@ Below are all HTTP API endpoints provided by OpenViking, grouped by functional m
 |--------|------|-------------|
 | POST | `/api/v1/resources/temp_upload` | Upload local file for raw HTTP resource / pack import |
 | POST | `/api/v1/resources` | Add resource (supports URL or temp_file_id) |
+
+### Skills
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/skills` | List installed skills |
 | POST | `/api/v1/skills` | Add skill |
+| POST | `/api/v1/skills/find` | Search installed skills |
+| POST | `/api/v1/skills/validate` | Validate skill payload |
+| GET | `/api/v1/skills/{skill_name}` | Get skill |
+| PUT | `/api/v1/skills/{skill_name}` | Update skill |
+| DELETE | `/api/v1/skills/{skill_name}` | Delete skill |
+
+### Watches
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/watches` | List watches or get one by `to_uri` |
+| GET | `/api/v1/watches/{task_id}` | Get watch |
+| PATCH | `/api/v1/watches` | Update watch by `to_uri` |
+| PATCH | `/api/v1/watches/{task_id}` | Update watch by task ID |
+| DELETE | `/api/v1/watches` | Delete watch by `to_uri` |
+| DELETE | `/api/v1/watches/{task_id}` | Delete watch by task ID |
+| POST | `/api/v1/watches/trigger` | Trigger watch by `to_uri` |
+| POST | `/api/v1/watches/{task_id}/trigger` | Trigger watch by task ID |
 
 ### Pack
 
@@ -377,6 +434,15 @@ Below are all HTTP API endpoints provided by OpenViking, grouped by functional m
 | POST | `/api/v1/fs/mkdir` | Create directory |
 | DELETE | `/api/v1/fs` | Delete resource |
 | POST | `/api/v1/fs/mv` | Move/rename resource |
+
+### Snapshots (Multi-Version Management)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/v1/snapshot/commit` | Save the current workspace state as a new snapshot |
+| GET | `/api/v1/snapshot/log` | Walk commit history newest-first |
+| GET | `/api/v1/snapshot/show` | View commit metadata, or read a file from a commit |
+| POST | `/api/v1/snapshot/restore` | Restore a directory or the whole account tree to a past snapshot (forward commit) |
 
 ### Content
 
@@ -475,7 +541,6 @@ Below are all HTTP API endpoints provided by OpenViking, grouped by functional m
 | DELETE | `/api/v1/admin/accounts/{account_id}` | Delete workspace (cascade data cleanup) | ROOT |
 | POST | `/api/v1/admin/accounts/{account_id}/users` | Register user | ROOT/ADMIN |
 | GET | `/api/v1/admin/accounts/{account_id}/users` | List users | ROOT/ADMIN |
-| GET | `/api/v1/admin/accounts/{account_id}/agents` | List agent namespaces | ROOT/ADMIN |
 | DELETE | `/api/v1/admin/accounts/{account_id}/users/{user_id}` | Remove user | ROOT/ADMIN |
 | PUT | `/api/v1/admin/accounts/{account_id}/users/{user_id}/role` | Change user role | ROOT |
 | POST | `/api/v1/admin/accounts/{account_id}/users/{user_id}/key` | Regenerate user key | ROOT/ADMIN |
@@ -513,6 +578,7 @@ Subsequent API documentation is organized by functional module as follows:
 | [Resources](02-resources.md) - Resource management API | Adding, importing, exporting resources and skills |
 | [Retrieval](06-retrieval.md) - Search API | Search, relations, context acquisition |
 | [File System](03-filesystem.md) - File system operations | Directory operations, content reading and writing |
+| [Snapshots](11-snapshot.md) - Multi-version management | Snapshot commit, history walk, version restore |
 | [Sessions](05-sessions.md) - Session management | Session creation, message management, memory extraction |
 | [Skills](04-skills.md) - Skill management API | Skill management |
 | [System](07-system.md) - System and monitoring API | System status, monitoring, debug API |

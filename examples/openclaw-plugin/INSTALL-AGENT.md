@@ -99,7 +99,7 @@ openclaw openviking setup \
 Custom agent routing prefix (optional; only when the user explicitly requests a prefix):
 
 ```bash
-openclaw openviking setup --base-url <OPENVIKING_URL> --api-key <API_KEY> --agent-prefix <PREFIX> --json
+openclaw openviking setup --base-url <OPENVIKING_URL> --api-key <API_KEY> --peer-prefix <PREFIX> --json
 ```
 
 Slot replacement retry, only after user approval:
@@ -139,7 +139,7 @@ Also inspect:
 | `health.version` | Records server version |
 | `health.compatibility` | Determines whether to warn |
 | `config.hasApiKey` | Confirms whether an API key was saved |
-| `config.agent_prefix` | Confirms configured agent prefix when present |
+| `config.peer_prefix` | Confirms configured peer prefix when present |
 
 ## Environment Detection
 
@@ -267,7 +267,7 @@ Core fields:
 | `mode` | Legacy compatibility field. Expected value: `remote`. |
 | `baseUrl` | OpenViking HTTP endpoint |
 | `apiKey` | OpenViking API key |
-| `agent_prefix` | Optional; prefix for OpenClaw agent IDs when set. Interactive setup accepts only letters, digits, `_`, and `-`. If unset, the plugin follows session agent IDs. |
+| `peer_prefix` | Optional; prefix for OpenClaw agent IDs when set. Interactive setup accepts only letters, digits, `_`, and `-`. If unset, the plugin follows session agent IDs. |
 | `accountId` | Required for root API keys |
 | `userId` | Required for root API keys |
 
@@ -329,7 +329,7 @@ Existing config fields are preserved during migration. The new plugin reads old 
 
 - `baseUrl`
 - `apiKey`
-- `agent_prefix`: optional; interactive setup accepts only letters, digits, `_`, and `-`
+- `peer_prefix`: optional; interactive setup accepts only letters, digits, `_`, and `-`
 
 ## Backup Path: ov-install
 

@@ -19,6 +19,7 @@ from openviking.core.context import (
 from openviking.core.namespace import (
     classify_uri,
     context_type_for_uri,
+    is_session_uri,
     owner_space_for_uri,
 )
 from openviking.server.dependencies import get_service
@@ -47,6 +48,31 @@ from openviking_cli.utils.config import get_openviking_config
 logger = get_logger(__name__)
 
 REINDEX_TASK_TYPE = "admin_reindex"
+
+
+# Trailing markers VikingFS appends when a directory has no generated .abstract.md/.overview.md
+# (see openviking/storage/viking_fs.py). The rendered value is a placeholder, not semantic
+# content, and must never be embedded as an ABSTRACT (L0) / OVERVIEW (L1) vector (issue #2434).
+_ABSTRACT_NOT_READY_SUFFIX = "[Directory abstract is not ready]"
+_OVERVIEW_NOT_READY_SUFFIX = "[Directory overview is not ready]"
+
+
+def _is_not_ready_sentinel(text: str, suffix: str) -> bool:
+    """Return True if *text* is a VikingFS not-ready directory placeholder.
+
+    VikingFS renders these as a single ``# <uri>`` header followed only by the not-ready marker.
+    Match that exact shape (a ``#`` header with no substantive body before the trailing marker)
+    so the check is uri-agnostic yet never drops real directory content that merely ends with,
+    or mentions, the user-facing marker phrase.
+    """
+    if not text:
+        return False
+    head = text.rstrip()
+    if not head.endswith(suffix):
+        return False
+    head = head[: -len(suffix)].strip()
+    return head.startswith("#") and "\n" not in head
+
 
 _reindex_executor: "ReindexExecutor | None" = None
 
@@ -79,7 +105,6 @@ class ReindexExecutor:
 
     SUPPORTED_MODES_BY_TYPE = {
         "global_namespace": {"vectors_only", "semantic_and_vectors"},
-        "agent_namespace": {"vectors_only", "semantic_and_vectors"},
         "user_namespace": {"vectors_only", "semantic_and_vectors"},
         "skill_namespace": {"vectors_only", "semantic_and_vectors"},
         "resource": {"vectors_only", "semantic_and_vectors"},
@@ -159,14 +184,35 @@ class ReindexExecutor:
         parts = classification.parts
         if not parts:
             return "global_namespace"
+        if is_session_uri(uri):
+            raise OpenVikingError(
+                f"Unsupported reindex URI: {uri}",
+                code="UNSUPPORTED_URI",
+                details={"uri": uri},
+            )
         if parts == ("user",):
             return "user_namespace"
-        if parts == ("agent",):
-            return "agent_namespace"
         if classification.is_user_namespace_root:
             return "user_namespace"
-        if classification.is_agent_namespace_root:
-            return "agent_namespace"
+        if parts[0] == "agent":
+            if len(parts) >= 2 and parts[1] in {"skills", "endpoints", "tools", "payments"}:
+                if classification.is_skill_namespace:
+                    return "skill_namespace"
+                if classification.is_skill_root:
+                    return "skill"
+                if classification.is_skill:
+                    raise OpenVikingError(
+                        f"Unsupported reindex URI: {uri}",
+                        code="UNSUPPORTED_URI",
+                        details={"uri": uri},
+                    )
+                return "resource"
+            raise OpenVikingError(
+                "viking://agent/{agent_id}/... is no longer supported; "
+                "use viking://agent/skills/... or viking://user/... instead.",
+                code="UNSUPPORTED_URI",
+                details={"uri": uri},
+            )
         if classification.is_memory:
             return "memory"
         if classification.is_skill_namespace:
@@ -179,7 +225,7 @@ class ReindexExecutor:
                 code="UNSUPPORTED_URI",
                 details={"uri": uri},
             )
-        if parts[0] in {"resources", "user", "agent"}:
+        if parts[0] in {"resources", "user"}:
             return "resource"
         raise OpenVikingError(
             f"Unsupported reindex URI: {uri}",
@@ -371,12 +417,6 @@ class ReindexExecutor:
                         mode=mode,
                         run=run,
                     )
-                elif object_type == "agent_namespace":
-                    await self._reindex_agent_namespace(
-                        uri=uri,
-                        mode=mode,
-                        run=run,
-                    )
                 elif object_type == "user_namespace":
                     await self._reindex_user_namespace(
                         uri=uri,
@@ -512,12 +552,14 @@ class ReindexExecutor:
         counters = run.counters
         ctx = run.ctx
         if mode == "semantic_and_vectors":
-            await self._run_semantic_processor(
-                uri=uri,
-                context_type="memory",
-                ctx=ctx,
-                lock=run.lock,
-            )
+            stat = await get_viking_fs().stat(uri, ctx=ctx)
+            if stat.get("isDir", stat.get("is_dir")):
+                await self._run_semantic_processor(
+                    uri=uri,
+                    context_type="memory",
+                    ctx=ctx,
+                    lock=run.lock,
+                )
             await self._reindex_memory_vectors(uri=uri, counters=counters, ctx=ctx)
             return
         await self._reindex_memory_vectors(uri=uri, counters=counters, ctx=ctx)
@@ -537,8 +579,8 @@ class ReindexExecutor:
             recursive=True,
             account_id=ctx.account_id,
             user_id=ctx.user.user_id,
-            agent_id=ctx.user.agent_id,
-            role=ctx.role.value,
+            peer_id=ctx.user.user_id,
+            role=str(ctx.role),
             skip_vectorization=True,
         )
         await processor.on_dequeue({"data": msg.to_json()}, lock=lock.as_borrowed())
@@ -664,12 +706,15 @@ class ReindexExecutor:
                 counters.warnings.append(f"No vector source found for {file_uri}")
                 continue
             abstract = self._prefer_non_empty(summary, vector_text)
+            # Read full file content for BM25 content field (not embedding-truncated)
+            full_text = await self._safe_read_text(file_uri, ctx=ctx) or vector_text
             try:
                 await self._upsert_context(
                     uri=file_uri,
                     parent_uri=parent_uri,
                     abstract=abstract,
                     vector_text=vector_text,
+                    full_text=full_text,
                     is_leaf=True,
                     context_type=context_type_for_uri(file_uri),
                     level=ContextLevel.DETAIL,
@@ -679,6 +724,68 @@ class ReindexExecutor:
             except Exception as exc:
                 counters.failed_records += 1
                 counters.warnings.append(f"Failed to reindex {file_uri} vector: {exc}")
+
+    async def reindex_directory_marker(
+        self, *, dir_uri: str, level: ContextLevel, ctx: RequestContext
+    ) -> None:
+        """Recompute ONLY this directory's L0 (ABSTRACT) or L1 (OVERVIEW) vector.
+
+        Non-recursive: does not touch descendants. Used by git restore when a
+        directory's ``.abstract.md`` / ``.overview.md`` marker changed. When the
+        on-disk semantic source is empty, the corresponding vector is deleted
+        instead of upserted.
+        """
+        if level not in (ContextLevel.ABSTRACT, ContextLevel.OVERVIEW):
+            raise ValueError(f"reindex_directory_marker only supports L0/L1, got {level!r}")
+        if dir_uri == "viking://":
+            return
+
+        viking_fs = get_viking_fs()
+        marker_name = ".abstract.md" if level == ContextLevel.ABSTRACT else ".overview.md"
+        lock_path = viking_fs._uri_to_path(f"{dir_uri}/{marker_name}", ctx=ctx)
+        async with LockContext(get_lock_manager(), [lock_path], lock_mode="exact"):
+            abstract = await self._read_directory_abstract(dir_uri, ctx=ctx)
+            if level == ContextLevel.ABSTRACT:
+                vector_text = abstract
+            else:
+                overview = await self._read_directory_overview(dir_uri, ctx=ctx)
+                vector_text = overview or abstract
+
+            if not vector_text:
+                await self.delete_uri_level(uri=dir_uri, level=level, ctx=ctx)
+                return
+
+            await self._upsert_context(
+                uri=dir_uri,
+                parent_uri=VikingURI(dir_uri).parent.uri,
+                abstract=abstract,
+                vector_text=vector_text,
+                is_leaf=False,
+                context_type=context_type_for_uri(dir_uri),
+                level=level,
+                ctx=ctx,
+            )
+
+    async def delete_uri_level(
+        self, *, uri: str, level: ContextLevel, ctx: RequestContext
+    ) -> int:
+        """Delete ONLY the vector record at ``(uri, level)``. Returns count.
+
+        Used by git restore for both directory markers (dir + L0/L1) and
+        deleted source files (file + DETAIL).
+        """
+        service = get_service()
+        assert service.vikingdb_manager is not None
+        records = await service.vikingdb_manager.get_context_by_uri(
+            uri=uri,
+            level=int(level),
+            limit=100,
+            ctx=ctx,
+        )
+        ids = [str(rec["id"]) for rec in records if rec.get("id")]
+        if not ids:
+            return 0
+        return await service.vikingdb_manager.delete(ids, ctx=ctx)
 
     async def _reindex_user_namespace(
         self,
@@ -713,87 +820,6 @@ class ReindexExecutor:
                 return
 
         memory_roots: list[str] = []
-        resource_directories: list[str] = []
-        resource_files: list[str] = []
-
-        for entry in entries:
-            entry_uri = entry.get("uri")
-            if not entry_uri:
-                continue
-            classification = classify_uri(entry_uri)
-            if classification.is_memory:
-                if entry.get("isDir") and classification.is_memory_root:
-                    memory_roots.append(entry_uri)
-                continue
-            if not self._is_resource_entry_for_namespace(entry_uri, target_root):
-                continue
-            if entry.get("isDir"):
-                resource_directories.append(entry_uri)
-            elif not self._is_hidden_meta_file(entry_uri):
-                resource_files.append(entry_uri)
-
-        for memory_root in sorted(set(memory_roots)):
-            memory_mode = (
-                "semantic_and_vectors" if mode == "semantic_and_vectors" else "vectors_only"
-            )
-            await self._reindex_memory(
-                uri=memory_root,
-                mode=memory_mode,
-                run=run,
-            )
-
-        if mode == "semantic_and_vectors":
-            (
-                resource_directories,
-                resource_files,
-            ) = await self._refresh_namespace_resource_semantics(
-                target_root=target_root,
-                directories=resource_directories,
-                files=resource_files,
-                run=run,
-            )
-
-        await self._reindex_resource_vectors_from_entries(
-            root_uri=target_root,
-            directories=resource_directories,
-            files=resource_files,
-            counters=counters,
-            ctx=ctx,
-        )
-
-    async def _reindex_agent_namespace(
-        self,
-        *,
-        uri: str,
-        mode: str,
-        run: _ReindexRunContext,
-    ) -> None:
-        counters = run.counters
-        ctx = run.ctx
-        normalized_uri = uri.rstrip("/")
-        target_root = normalized_uri if normalized_uri else uri
-        viking_fs = get_viking_fs()
-        try:
-            entries = await self._tree_all(viking_fs, target_root, show_all_hidden=True, ctx=ctx)
-        except Exception as exc:
-            raise NotFoundError(uri, "resource") from exc
-
-        if target_root == "viking://agent":
-            agent_roots = [
-                entry.get("uri")
-                for entry in entries
-                if entry.get("isDir") and classify_uri(entry.get("uri", "")).is_agent_namespace_root
-            ]
-            if agent_roots:
-                for agent_root in sorted(set(agent_roots)):
-                    await self._reindex_agent_namespace(
-                        uri=agent_root,
-                        mode=mode,
-                        run=run,
-                    )
-                return
-
-        memory_roots: list[str] = []
         skill_roots: list[str] = []
         resource_directories: list[str] = []
         resource_files: list[str] = []
@@ -801,6 +827,8 @@ class ReindexExecutor:
         for entry in entries:
             entry_uri = entry.get("uri")
             if not entry_uri:
+                continue
+            if is_session_uri(entry_uri):
                 continue
             classification = classify_uri(entry_uri)
             if classification.is_memory:
@@ -874,7 +902,6 @@ class ReindexExecutor:
             raise NotFoundError(uri, "resource") from exc
 
         user_roots: list[str] = []
-        agent_roots: list[str] = []
         resource_directories: list[str] = []
         resource_files: list[str] = []
 
@@ -882,19 +909,14 @@ class ReindexExecutor:
             entry_uri = entry.get("uri")
             if not entry_uri:
                 continue
-            if entry_uri in {"viking://user", "viking://agent"}:
+            if entry_uri == "viking://user":
                 continue
             if entry_uri.startswith("viking://user/"):
                 remainder = entry_uri[len("viking://user/") :]
                 if entry.get("isDir") and remainder and "/" not in remainder:
                     user_roots.append(entry_uri)
                 continue
-            if entry_uri.startswith("viking://agent/"):
-                remainder = entry_uri[len("viking://agent/") :]
-                if entry.get("isDir") and remainder and "/" not in remainder:
-                    agent_roots.append(entry_uri)
-                continue
-            if entry_uri == "viking://session" or entry_uri.startswith("viking://session/"):
+            if is_session_uri(entry_uri):
                 continue
             if not self._is_global_resource_entry(entry_uri):
                 continue
@@ -906,13 +928,6 @@ class ReindexExecutor:
         for user_root in sorted(set(user_roots)):
             await self._reindex_user_namespace(
                 uri=user_root,
-                mode=mode,
-                run=run,
-            )
-
-        for agent_root in sorted(set(agent_roots)):
-            await self._reindex_agent_namespace(
-                uri=agent_root,
                 mode=mode,
                 run=run,
             )
@@ -1229,7 +1244,7 @@ class ReindexExecutor:
                 details={"uri": uri},
             )
 
-        skill_dict, _, _ = SkillProcessor(service.vikingdb_manager)._parse_skill(
+        skill_dict, _, _, _ = SkillProcessor(service.vikingdb_manager)._parse_skill(
             skill_content,
             allow_local_path_resolution=False,
         )
@@ -1249,15 +1264,17 @@ class ReindexExecutor:
 
     async def _read_directory_abstract(self, uri: str, *, ctx: RequestContext) -> str:
         try:
-            return await get_viking_fs().abstract(uri, ctx=ctx)
+            value = await get_viking_fs().abstract(uri, ctx=ctx)
         except Exception:
             return ""
+        return "" if _is_not_ready_sentinel(value, _ABSTRACT_NOT_READY_SUFFIX) else value
 
     async def _read_directory_overview(self, uri: str, *, ctx: RequestContext) -> str:
         try:
-            return await get_viking_fs().overview(uri, ctx=ctx)
+            value = await get_viking_fs().overview(uri, ctx=ctx)
         except Exception:
             return ""
+        return "" if _is_not_ready_sentinel(value, _OVERVIEW_NOT_READY_SUFFIX) else value
 
     async def _best_file_summary(self, uri: str, *, ctx: RequestContext) -> str:
         parent_uri = VikingURI(uri).parent.uri
@@ -1302,6 +1319,7 @@ class ReindexExecutor:
         parent_uri: str,
         abstract: str,
         vector_text: str,
+        full_text: str = "",
         is_leaf: bool,
         context_type: str,
         level: ContextLevel,
@@ -1310,6 +1328,14 @@ class ReindexExecutor:
     ) -> None:
         service = get_service()
         assert service.vikingdb_manager is not None
+        merged_meta = dict(meta or {})
+        existing = await self._fetch_existing_record(uri=uri, level=int(level), ctx=ctx)
+        if (
+            existing
+            and existing.get("search_tags") is not None
+            and "search_tags" not in merged_meta
+        ):
+            merged_meta["search_tags"] = existing.get("search_tags")
 
         context = Context(
             uri=uri,
@@ -1321,9 +1347,9 @@ class ReindexExecutor:
             user=ctx.user,
             account_id=ctx.account_id,
             owner_space=owner_space_for_uri(uri, ctx),
-            meta=meta or {},
+            meta=merged_meta,
         )
-        context.set_vectorize(Vectorize(text=vector_text))
+        context.set_vectorize(Vectorize(text=vector_text, full_text=full_text or vector_text))
         msg = EmbeddingMsgConverter.from_context(context)
         if msg is None:
             raise OpenVikingError(

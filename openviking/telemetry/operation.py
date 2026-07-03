@@ -62,6 +62,12 @@ class TelemetrySummaryBuilder:
         "summarize": "resource.flags.summarize",
         "watch_enabled": "resource.flags.watch_enabled",
     }
+    _SEARCH_DURATION_KEYS = {
+        "target_abstract": "search.target_abstract.duration_ms",
+        "intent_analysis": "search.intent_analysis.duration_ms",
+        "embed_query": "search.embed_query.duration_ms",
+        "vector_retrieval": "search.vector_retrieval.duration_ms",
+    }
 
     @staticmethod
     def _i(value: Any, default: int = 0) -> int:
@@ -162,6 +168,8 @@ class TelemetrySummaryBuilder:
         llm_input_tokens = cls._i(counters.get("tokens.llm.input"), 0)
         llm_output_tokens = cls._i(counters.get("tokens.llm.output"), 0)
         llm_total_tokens = cls._i(counters.get("tokens.llm.total"), 0)
+        llm_prompt_cached_tokens = cls._i(counters.get("tokens.llm.prompt_cached"), 0)
+        llm_completion_reasoning_tokens = cls._i(counters.get("tokens.llm.completion_reasoning"), 0)
         embedding_total_tokens = cls._i(counters.get("tokens.embedding.total"), 0)
         rerank_total_tokens = cls._i(counters.get("tokens.rerank.total"), 0)
         stage_token_summary = cls._build_stage_token_summary(counters)
@@ -183,6 +191,8 @@ class TelemetrySummaryBuilder:
                     "input": llm_input_tokens,
                     "output": llm_output_tokens,
                     "total": llm_total_tokens,
+                    "prompt_cached": llm_prompt_cached_tokens,
+                    "completion_reasoning": llm_completion_reasoning_tokens,
                 },
                 "embedding": {"total": embedding_total_tokens},
                 "rerank": {"total": rerank_total_tokens},
@@ -280,6 +290,18 @@ class TelemetrySummaryBuilder:
                 },
             }
 
+        if cls._has_metric_prefix("search", counters, gauges):
+            search_summary = {
+                public_key: {
+                    "duration_ms": cls._f(gauges.get(metric_key), 0.0),
+                }
+                for public_key, metric_key in cls._SEARCH_DURATION_KEYS.items()
+            }
+            typed_queries_count = gauges.get("search.typed_queries_count")
+            if typed_queries_count is not None:
+                search_summary["typed_queries_count"] = cls._i(typed_queries_count, 0)
+            summary["search"] = search_summary
+
         if error_stage or error_code or error_message:
             summary["errors"] = {
                 "stage": error_stage,
@@ -287,7 +309,16 @@ class TelemetrySummaryBuilder:
                 "message": error_message,
             }
 
-        for key in ("tokens", "queue", "vector", "semantic_nodes", "memory", "resource", "errors"):
+        for key in (
+            "tokens",
+            "queue",
+            "vector",
+            "semantic_nodes",
+            "memory",
+            "resource",
+            "search",
+            "errors",
+        ):
             if key not in summary:
                 continue
             pruned_value = cls._prune_zero_metrics(summary[key])
@@ -365,10 +396,23 @@ class OperationTelemetry:
             self.add_duration(key, (time.perf_counter() - start) * 1000)
 
     def add_token_usage(
-        self, input_tokens: int, output_tokens: int, *, stage: str | None = None
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        *,
+        stage: str | None = None,
+        prompt_cached_tokens: int = 0,
+        completion_reasoning_tokens: int = 0,
     ) -> None:
         """Record LLM token usage into aggregate and optional stage-specific counters."""
-        self.add_token_usage_by_source("llm", input_tokens, output_tokens, stage=stage)
+        self.add_token_usage_by_source(
+            "llm",
+            input_tokens,
+            output_tokens,
+            stage=stage,
+            prompt_cached_tokens=prompt_cached_tokens,
+            completion_reasoning_tokens=completion_reasoning_tokens,
+        )
 
     def record_token_usage(
         self,
@@ -377,9 +421,18 @@ class OperationTelemetry:
         output_tokens: int = 0,
         *,
         stage: str | None = None,
+        prompt_cached_tokens: int = 0,
+        completion_reasoning_tokens: int = 0,
     ) -> None:
         """Record source-scoped token usage into aggregate and optional stage-specific counters."""
-        self.add_token_usage_by_source(source, input_tokens, output_tokens, stage=stage)
+        self.add_token_usage_by_source(
+            source,
+            input_tokens,
+            output_tokens,
+            stage=stage,
+            prompt_cached_tokens=prompt_cached_tokens,
+            completion_reasoning_tokens=completion_reasoning_tokens,
+        )
 
     def add_token_usage_by_source(
         self,
@@ -388,6 +441,8 @@ class OperationTelemetry:
         output_tokens: int = 0,
         *,
         stage: str | None = None,
+        prompt_cached_tokens: int = 0,
+        completion_reasoning_tokens: int = 0,
     ) -> None:
         """Record token usage for one source and optionally mirror it into a fixed stage bucket."""
         if not self.enabled:
@@ -396,6 +451,8 @@ class OperationTelemetry:
         normalized_input = max(input_tokens, 0)
         normalized_output = max(output_tokens, 0)
         normalized_total = normalized_input + normalized_output
+        normalized_prompt_cached = max(prompt_cached_tokens, 0)
+        normalized_completion_reasoning = max(completion_reasoning_tokens, 0)
 
         self.count("tokens.input", normalized_input)
         self.count("tokens.output", normalized_output)
@@ -403,6 +460,12 @@ class OperationTelemetry:
         self.count(f"tokens.{source}.input", normalized_input)
         self.count(f"tokens.{source}.output", normalized_output)
         self.count(f"tokens.{source}.total", normalized_total)
+        if source == "llm":
+            self.count(f"tokens.{source}.prompt_cached", normalized_prompt_cached)
+            self.count(
+                f"tokens.{source}.completion_reasoning",
+                normalized_completion_reasoning,
+            )
         if stage is None:
             try:
                 from .context import get_current_telemetry_stage
@@ -416,6 +479,15 @@ class OperationTelemetry:
                 self.count(f"tokens.stages.{normalized_stage}.{source}.input", normalized_input)
                 self.count(f"tokens.stages.{normalized_stage}.{source}.output", normalized_output)
                 self.count(f"tokens.stages.{normalized_stage}.{source}.total", normalized_total)
+                if source == "llm":
+                    self.count(
+                        f"tokens.stages.{normalized_stage}.{source}.prompt_cached",
+                        normalized_prompt_cached,
+                    )
+                    self.count(
+                        f"tokens.stages.{normalized_stage}.{source}.completion_reasoning",
+                        normalized_completion_reasoning,
+                    )
 
     def set_error(self, stage: str, code: str, message: str) -> None:
         if not self.enabled:

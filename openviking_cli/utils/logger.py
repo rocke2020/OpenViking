@@ -4,10 +4,13 @@
 Logging utilities for OpenViking.
 """
 
+import atexit
 import logging
+import queue
 import sys
+import threading
 from contextlib import contextmanager
-from logging.handlers import TimedRotatingFileHandler
+from logging.handlers import QueueHandler, QueueListener, TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any, Optional, Tuple
 from uuid import uuid4
@@ -60,6 +63,16 @@ except ImportError:
 _otel_log_handler_initialized = False
 _otel_log_handler: Any = None
 
+_MANAGED_LOGGER_ROOTS = ("openviking", "openviking_cli", "uvicorn")
+_shared_log_handler: Optional[logging.Handler] = None
+_shared_log_handler_key: Optional[tuple[Any, ...]] = None
+
+# QueueListeners for thread-safe stdout/stderr logging (avoids StreamHandler stalls
+# on application threads when process managers redirect streams).
+_std_stream_handlers: dict[str, Tuple[QueueListener, logging.Handler]] = {}
+_std_stream_handlers_lock = threading.RLock()
+_std_stream_atexit_registered = False
+
 
 def _get_log_context() -> dict[str, Any]:
     """
@@ -85,7 +98,6 @@ def _get_log_context() -> dict[str, Any]:
         "operation": "",
         "account_id": "",
         "user_id": "",
-        "agent_id": "",
     }
 
     # 1. Get trace_id and span_id from OTel span if available
@@ -383,6 +395,9 @@ def add_otel_log_handler_to_logger(logger: logging.Logger) -> None:
         logger: The logger instance to add the handler to.
     """
     if _otel_log_handler is not None:
+        root_name = _managed_root_name(logger.name)
+        if root_name and logger.name != root_name:
+            logger = logging.getLogger(root_name)
         # Check if the handler has already been added
         if not any(isinstance(h, type(_otel_log_handler)) for h in logger.handlers):
             logger.addHandler(_otel_log_handler)
@@ -422,7 +437,6 @@ class TraceContextFilter(logging.Filter):
         record.operation = context.get("operation", "")
         record.account_id = context.get("account_id", "")
         record.user_id = context.get("user_id", "")
-        record.agent_id = context.get("agent_id", "")
 
         return True
 
@@ -525,7 +539,6 @@ class LogToSpanEventFilter(logging.Filter):
             "operation",
             "account_id",
             "user_id",
-            "agent_id",
         }
 
         for key, value in record.__dict__.items():
@@ -618,6 +631,7 @@ def _load_log_config() -> Tuple[str, str, str, Optional[Any]]:
             log_dir.mkdir(parents=True, exist_ok=True)
             log_output = str(log_dir / "openviking.log")
     except Exception:
+        config = None
         log_level_str = "INFO"
         log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
         log_output = "stdout"
@@ -625,15 +639,71 @@ def _load_log_config() -> Tuple[str, str, str, Optional[Any]]:
     return log_level_str, log_format, log_output, config
 
 
+def _managed_root_name(name: str) -> Optional[str]:
+    for root_name in _MANAGED_LOGGER_ROOTS:
+        if name == root_name or name.startswith(f"{root_name}."):
+            return root_name
+    return None
+
+
+def _stop_std_stream_listeners() -> None:
+    """Stop queue listeners created for stdout/stderr logging."""
+    with _std_stream_handlers_lock:
+        listeners = list(_std_stream_handlers.values())
+        _std_stream_handlers.clear()
+
+    for listener, real_handler in listeners:
+        try:
+            listener.stop()
+        except Exception:
+            pass
+        try:
+            real_handler.close()
+        except Exception:
+            pass
+
+
+def _create_queued_stream_handler(log_output: str) -> QueueHandler:
+    """Create a QueueHandler backed by a per-stream QueueListener."""
+    global _std_stream_atexit_registered
+
+    if log_output not in ("stdout", "stderr"):
+        raise ValueError(f"unsupported stream log output: {log_output}")
+
+    with _std_stream_handlers_lock:
+        entry = _std_stream_handlers.get(log_output)
+        if entry is None:
+            stream = sys.stdout if log_output == "stdout" else sys.stderr
+            real_handler = logging.StreamHandler(stream)
+            log_queue: queue.Queue = queue.Queue(-1)
+            listener = QueueListener(log_queue, real_handler, respect_handler_level=True)
+            listener.start()
+            _std_stream_handlers[log_output] = (listener, real_handler)
+            entry = (listener, real_handler)
+            if not _std_stream_atexit_registered:
+                atexit.register(_stop_std_stream_listeners)
+                _std_stream_atexit_registered = True
+
+        listener, real_handler = entry
+        handler = QueueHandler(listener.queue)
+        handler._ov_real_handler = real_handler  # type: ignore[attr-defined]
+        return handler
+
+
+def _add_trace_id_filter(handler: logging.Handler) -> None:
+    from openviking.telemetry.tracer import TraceIdLoggingFilter
+
+    if not any(isinstance(filter_, TraceIdLoggingFilter) for filter_ in handler.filters):
+        handler.addFilter(TraceIdLoggingFilter())
+
+
 def _create_log_handler(log_output: str, config: Optional[Any]) -> logging.Handler:
     # Prevent creating a file literally named "file"
     if log_output == "file":
         log_output = "stdout"
 
-    if log_output == "stdout":
-        return logging.StreamHandler(sys.stdout)
-    elif log_output == "stderr":
-        return logging.StreamHandler(sys.stderr)
+    if log_output in ("stdout", "stderr"):
+        return _create_queued_stream_handler(log_output)
     else:
         if config is not None:
             try:
@@ -664,33 +734,79 @@ def _create_log_handler(log_output: str, config: Optional[Any]) -> logging.Handl
             return logging.FileHandler(log_output, encoding="utf-8")
 
 
-def _configure_logger_instance(
-    logger: logging.Logger,
-    *,
-    level: int,
-    formatter: logging.Formatter,
-    handler: logging.Handler,
-) -> None:
-    """Apply a fully configured handler to a logger."""
-    logger.handlers.clear()
-    logger.addHandler(handler)
-    logger.propagate = False
-    logger.setLevel(level)
-
-
 def _build_standard_handler(
     log_output: str,
     config: Optional[Any],
     format_string: str,
 ) -> logging.Handler:
     handler = _create_log_handler(log_output, config)
+
+    # QueueHandler must enrich and format records on the caller thread so
+    # context-local trace data and per-logger format strings are captured before
+    # the shared listener-side stream handler writes the prepared message.
+    if isinstance(handler, QueueHandler):
+        real = getattr(handler, "_ov_real_handler", None)
+        if real is not None:
+            real.setFormatter(logging.Formatter("%(message)s"))
+        handler.setFormatter(logging.Formatter(format_string))
+        _add_trace_id_filter(handler)
+        return handler
+
     handler.setFormatter(logging.Formatter(format_string))
-
-    # Add trace id filter
-    from openviking.telemetry.tracer import TraceIdLoggingFilter
-
-    handler.addFilter(TraceIdLoggingFilter())
+    _add_trace_id_filter(handler)
     return handler
+
+
+def _get_shared_handler(
+    log_output: str,
+    config: Optional[Any],
+    format_string: str,
+    *,
+    force: bool = False,
+) -> logging.Handler:
+    global _shared_log_handler, _shared_log_handler_key
+
+    if config is None:
+        handler_key = (log_output, format_string, None)
+    else:
+        handler_key = (
+            log_output,
+            format_string,
+            bool(config.log.rotation),
+            config.log.rotation_interval,
+            config.log.rotation_days,
+        )
+    if not force and _shared_log_handler is not None and _shared_log_handler_key == handler_key:
+        return _shared_log_handler
+
+    _shared_log_handler = _build_standard_handler(log_output, config, format_string)
+    _shared_log_handler_key = handler_key
+    return _shared_log_handler
+
+
+def _configure_logger_instance(
+    logger: logging.Logger,
+    *,
+    level: int,
+    handler: Optional[logging.Handler],
+    propagate: bool,
+) -> None:
+    old_handlers = list(logger.handlers)
+    logger.handlers.clear()
+    if handler is not None:
+        logger.addHandler(handler)
+        if _otel_log_handler is not None and isinstance(_otel_log_handler, logging.Handler):
+            logger.addHandler(_otel_log_handler)
+    logger.propagate = propagate
+    logger.setLevel(level)
+    current_handlers = set(logger.handlers)
+    for old_handler in old_handlers:
+        if old_handler in current_handlers or old_handler is _otel_log_handler:
+            continue
+        try:
+            old_handler.close()
+        except Exception:
+            pass
 
 
 def get_logger(
@@ -715,10 +831,26 @@ def get_logger(
         level = getattr(logging, log_level_str, logging.INFO)
         if format_string is None:
             format_string = log_format
-        handler = _build_standard_handler(log_output, config, format_string)
-        _configure_logger_instance(
-            logger, level=level, formatter=logging.Formatter(format_string), handler=handler
-        )
+        root_name = _managed_root_name(name)
+        if root_name:
+            handler = _get_shared_handler(log_output, config, format_string)
+            root_logger = logging.getLogger(root_name)
+            _configure_logger_instance(
+                root_logger,
+                level=level,
+                handler=handler,
+                propagate=False,
+            )
+            if name != root_name:
+                _configure_logger_instance(logger, level=level, handler=None, propagate=True)
+        else:
+            handler = _build_standard_handler(log_output, config, format_string)
+            _configure_logger_instance(
+                logger,
+                level=level,
+                handler=handler,
+                propagate=False,
+            )
 
     # If OTel log export is globally initialized, attach the handler automatically.
     if add_otel_handler or _otel_log_handler_initialized:
@@ -744,31 +876,24 @@ def reconfigure_logging() -> None:
     """Re-apply logging configuration to already-created OpenViking loggers."""
     log_level_str, log_format, log_output, config = _load_log_config()
     level = getattr(logging, log_level_str, logging.INFO)
+    handler = _get_shared_handler(log_output, config, log_format, force=True)
 
     logger_dict = logging.Logger.manager.loggerDict
     target_names = [
         name
         for name, candidate in logger_dict.items()
-        if isinstance(candidate, logging.Logger)
-        and (name == "openviking" or name.startswith("openviking.") or name.startswith("uvicorn"))
+        if isinstance(candidate, logging.Logger) and _managed_root_name(name)
     ]
-    if "openviking" not in target_names:
-        target_names.append("openviking")
+    target_names.extend(_MANAGED_LOGGER_ROOTS)
 
     for logger_name in sorted(set(target_names)):
         logger = logging.getLogger(logger_name)
-        format_string = log_format
-        if logger_name.startswith("uvicorn"):
-            handler = _create_log_handler(log_output, config)
-            handler.setFormatter(logging.Formatter(log_format))
-            handler.addFilter(TraceContextFilter())
-        else:
-            handler = _build_standard_handler(log_output, config, format_string)
+        root_name = _managed_root_name(logger_name)
         _configure_logger_instance(
             logger,
             level=level,
-            formatter=logging.Formatter(format_string),
-            handler=handler,
+            handler=handler if root_name == logger_name else None,
+            propagate=root_name != logger_name,
         )
 
 
@@ -780,17 +905,15 @@ def configure_uvicorn_logging() -> None:
     """
     log_level_str, log_format, log_output, config = _load_log_config()
     level = getattr(logging, log_level_str, logging.INFO)
+    handler = _get_shared_handler(log_output, config, log_format)
 
     # Configure all Uvicorn loggers
     uvicorn_logger_names = ["uvicorn", "uvicorn.error", "uvicorn.access"]
     for logger_name in uvicorn_logger_names:
         logger = logging.getLogger(logger_name)
-        handler = _create_log_handler(log_output, config)
-        handler.setFormatter(logging.Formatter(log_format))
-        handler.addFilter(TraceContextFilter())
         _configure_logger_instance(
             logger,
             level=level,
-            formatter=logging.Formatter(log_format),
-            handler=handler,
+            handler=handler if logger_name == "uvicorn" else None,
+            propagate=logger_name != "uvicorn",
         )

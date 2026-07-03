@@ -6,7 +6,7 @@
       "env_http_headers": {
         "X-OpenViking-Account": "OPENVIKING_ACCOUNT",
         "X-OpenViking-User": "OPENVIKING_USER",
-        "X-OpenViking-Agent": "OPENVIKING_AGENT_ID"
+        "X-OpenViking-Actor-Peer": "OPENVIKING_PEER_ID"
       }
     }
   }

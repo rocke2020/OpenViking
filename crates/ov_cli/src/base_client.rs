@@ -52,6 +52,20 @@ fn ignore_dirs_filter<'a>(
     }
 }
 
+fn normalize_zip_entry_name(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn zip_entry_name(relative_path: &Path) -> Result<String> {
+    let name = relative_path.to_str().ok_or_else(|| {
+        Error::InvalidPath(format!(
+            "Non-UTF-8 path: {}",
+            relative_path.to_string_lossy()
+        ))
+    })?;
+    Ok(normalize_zip_entry_name(name))
+}
+
 pub fn api_error_from_envelope(json: &Value, status: StatusCode) -> String {
     let error_code = json
         .get("error")
@@ -84,7 +98,7 @@ pub fn unwrap_success_envelope(json: Value, preserve_profile: bool) -> Value {
         return result.clone();
     }
 
-    let Some(profile) = json.get("profile") else {
+    let Some(profile) = json.get("profile").filter(|profile| !profile.is_null()) else {
         return result.clone();
     };
 
@@ -145,37 +159,18 @@ pub struct BaseClient {
     pub(crate) api_key: Option<String>,
     pub(crate) account: Option<String>,
     pub(crate) user: Option<String>,
-    pub(crate) agent_id: Option<String>,
+    pub(crate) actor_peer_id: Option<String>,
     pub(crate) profile_enabled: bool,
     pub(crate) extra_headers: Option<std::collections::HashMap<String, String>>,
 }
 
 impl BaseClient {
-    /// Create a new BaseClient with minimal configuration for health probing
-    pub fn new_simple(base_url: impl Into<String>, timeout_secs: f64) -> Self {
-        let http = ReqwestClient::builder()
-            .timeout(std::time::Duration::from_secs_f64(timeout_secs))
-            .build()
-            .expect("Failed to build HTTP client");
-
-        Self {
-            http,
-            base_url: base_url.into().trim_end_matches('/').to_string(),
-            api_key: None,
-            account: None,
-            user: None,
-            agent_id: None,
-            profile_enabled: false,
-            extra_headers: None,
-        }
-    }
-
     pub fn new(
         base_url: impl Into<String>,
         api_key: Option<String>,
-        agent_id: Option<String>,
         account: Option<String>,
         user: Option<String>,
+        actor_peer_id: Option<String>,
         timeout_secs: f64,
         profile_enabled: bool,
         extra_headers: Option<std::collections::HashMap<String, String>>,
@@ -191,7 +186,7 @@ impl BaseClient {
             api_key,
             account,
             user,
-            agent_id,
+            actor_peer_id,
             profile_enabled,
             extra_headers,
         }
@@ -205,16 +200,12 @@ impl BaseClient {
         merged
     }
 
-    pub fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
     pub fn user_id(&self) -> Option<&str> {
         self.user.as_deref()
     }
 
-    pub fn agent_id(&self) -> Option<&str> {
-        self.agent_id.as_deref()
+    pub fn actor_peer_id(&self) -> Option<&str> {
+        self.actor_peer_id.as_deref()
     }
 
     pub fn api_key(&self) -> Option<&str> {
@@ -232,11 +223,6 @@ impl BaseClient {
                 headers.insert("X-API-Key", value);
             }
         }
-        if let Some(agent_id) = &self.agent_id {
-            if let Ok(value) = reqwest::header::HeaderValue::from_str(agent_id) {
-                headers.insert("X-OpenViking-Agent", value);
-            }
-        }
         if let Some(account) = &self.account {
             if let Ok(value) = reqwest::header::HeaderValue::from_str(account) {
                 headers.insert("X-OpenViking-Account", value);
@@ -245,6 +231,11 @@ impl BaseClient {
         if let Some(user) = &self.user {
             if let Ok(value) = reqwest::header::HeaderValue::from_str(user) {
                 headers.insert("X-OpenViking-User", value);
+            }
+        }
+        if let Some(actor_peer_id) = &self.actor_peer_id {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(actor_peer_id) {
+                headers.insert("X-OpenViking-Actor-Peer", value);
             }
         }
         if let Some(extra_headers) = &self.extra_headers {
@@ -287,7 +278,10 @@ impl BaseClient {
         };
 
         if !status.is_success() {
-            return Err(Error::Api(api_error_from_envelope(&json, status)));
+            return Err(Error::api_with_status(
+                api_error_from_envelope(&json, status),
+                status.as_u16(),
+            ));
         }
 
         if let Some(error) = json.get("error") {
@@ -300,7 +294,10 @@ impl BaseClient {
                     .get("message")
                     .and_then(|m| m.as_str())
                     .unwrap_or("Unknown error");
-                return Err(Error::Api(format!("[{}] {}", code, message)));
+                return Err(Error::api_with_status(
+                    format!("[{}] {}", code, message),
+                    status.as_u16(),
+                ));
             }
         }
 
@@ -315,7 +312,10 @@ impl BaseClient {
         })
     }
 
-    pub(crate) fn create_client_with_timeout(&self, timeout: std::time::Duration) -> Result<ReqwestClient> {
+    pub(crate) fn create_client_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<ReqwestClient> {
         ReqwestClient::builder()
             .timeout(timeout)
             .build()
@@ -386,10 +386,7 @@ impl BaseClient {
         let url = format!("{}{}", self.base_url, path);
         let client = self.create_client_with_timeout(timeout)?;
 
-        let request = client
-            .post(&url)
-            .headers(self.build_headers())
-            .json(body);
+        let request = client.post(&url).headers(self.build_headers()).json(body);
         let request = if self.profile_enabled {
             request.query(&[("profile", "1")])
         } else {
@@ -409,11 +406,7 @@ impl BaseClient {
         body: &B,
     ) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
-        let request = self
-            .http
-            .put(&url)
-            .headers(self.build_headers())
-            .json(body);
+        let request = self.http.put(&url).headers(self.build_headers()).json(body);
         let request = if self.profile_enabled {
             request.query(&[("profile", "1")])
         } else {
@@ -548,6 +541,26 @@ mod tests {
     }
 
     #[test]
+    fn unwrap_success_envelope_drops_null_profile_for_value_results() {
+        let body = json!({
+            "status": "ok",
+            "result": [
+                {"id": "1"}
+            ],
+            "profile": null
+        });
+
+        let result = unwrap_success_envelope(body, true);
+
+        assert_eq!(
+            result,
+            json!([
+                {"id": "1"}
+            ])
+        );
+    }
+
+    #[test]
     fn unwrap_success_envelope_wraps_scalar_results_when_profile_is_preserved() {
         let body = json!({
             "status": "ok",
@@ -598,7 +611,8 @@ mod tests {
             None,
         );
 
-        let params = client.append_profile_query(&[("to_uri".to_string(), "viking://x".to_string())]);
+        let params =
+            client.append_profile_query(&[("to_uri".to_string(), "viking://x".to_string())]);
 
         assert_eq!(
             params,
@@ -626,6 +640,22 @@ mod tests {
 
         assert_eq!(params, vec![("profile".to_string(), "1".to_string())]);
     }
+
+    #[test]
+    fn zip_entry_name_normalizes_windows_separators() {
+        let entry = zip_entry_name(Path::new("scripts\\check_bounding_boxes.py"))
+            .expect("path should be utf-8");
+
+        assert_eq!(entry, "scripts/check_bounding_boxes.py");
+    }
+
+    #[test]
+    fn zip_entry_name_preserves_posix_separators() {
+        let entry = zip_entry_name(Path::new("scripts/check_bounding_boxes.py"))
+            .expect("path should be utf-8");
+
+        assert_eq!(entry, "scripts/check_bounding_boxes.py");
+    }
 }
 
 // ============ FileUploader ============
@@ -649,7 +679,11 @@ impl<'a> FileUploader<'a> {
         self
     }
 
-    pub fn zip_directory(&self, dir_path: &Path, ignore_dirs: Option<&str>) -> Result<NamedTempFile> {
+    pub fn zip_directory(
+        &self,
+        dir_path: &Path,
+        ignore_dirs: Option<&str>,
+    ) -> Result<NamedTempFile> {
         if !dir_path.is_dir() {
             return Err(Error::Network(format!(
                 "Path {} is not a directory",
@@ -673,9 +707,7 @@ impl<'a> FileUploader<'a> {
             let path = entry.path();
             if path.is_file() {
                 let name = path.strip_prefix(dir_path).unwrap_or(path);
-                let name_str = name.to_str().ok_or_else(|| {
-                    Error::InvalidPath(format!("Non-UTF-8 path: {}", name.to_string_lossy()))
-                })?;
+                let name_str = zip_entry_name(name)?;
                 zip.start_file(name_str, options)?;
                 let mut file = File::open(path)?;
                 std::io::copy(&mut file, &mut zip)?;
@@ -748,9 +780,7 @@ impl<'a> FileUploader<'a> {
             let path = entry.path();
             if path.is_file() {
                 let name = path.strip_prefix(dir_path).unwrap_or(path);
-                let name_str = name.to_str().ok_or_else(|| {
-                    Error::InvalidPath(format!("Non-UTF-8 path: {}", name.to_string_lossy()))
-                })?;
+                let name_str = zip_entry_name(name)?;
                 if verbose {
                     eprintln!("  Adding: {}", name_str);
                 }
@@ -778,7 +808,10 @@ impl<'a> FileUploader<'a> {
 
         if let Some(pb) = pb {
             if total_size > 0 {
-                pb.finish_with_message(format!("Compression complete: {:.2} MiB → {:.2} MiB", original_size_mb, zip_size_mb));
+                pb.finish_with_message(format!(
+                    "Compression complete: {:.2} MiB → {:.2} MiB",
+                    original_size_mb, zip_size_mb
+                ));
             } else {
                 pb.finish_with_message(format!("Compression complete: {:.2} MiB", zip_size_mb));
             }
@@ -849,15 +882,22 @@ impl<'a> FileUploader<'a> {
         let file_size = file_content.len() as u64;
 
         if verbose {
-            eprintln!("Uploading: {} ({:.2} MB)", file_name, file_size as f64 / 1024.0 / 1024.0);
+            eprintln!(
+                "Uploading: {} ({:.2} MB)",
+                file_name,
+                file_size as f64 / 1024.0 / 1024.0
+            );
         }
 
         let pb = ProgressBar::new_spinner();
-        pb.set_message(format!("Uploading {} ({:.2} MB)...", file_name, file_size as f64 / 1024.0 / 1024.0));
+        pb.set_message(format!(
+            "Uploading {} ({:.2} MB)...",
+            file_name,
+            file_size as f64 / 1024.0 / 1024.0
+        ));
         pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-        let part = reqwest::multipart::Part::bytes(file_content)
-            .file_name(file_name.to_string());
+        let part = reqwest::multipart::Part::bytes(file_content).file_name(file_name.to_string());
 
         let part = part
             .mime_str("application/octet-stream")

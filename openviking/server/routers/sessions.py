@@ -4,14 +4,15 @@
 
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, Body, Depends, Path, Query, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Request
 from pydantic import BaseModel, Field, model_validator
 
 from openviking.core.path_variables import resolve_path_variables
+from openviking.core.peer_id import normalize_peer_id
 from openviking.message.part import Part, TextPart, part_from_dict
 from openviking.server.auth import get_request_context
 from openviking.server.dependencies import get_service
-from openviking.server.identity import AuthMode, RequestContext
+from openviking.server.identity import RequestContext
 from openviking.server.models import ErrorInfo, Response
 from openviking.server.responses import error_response
 from openviking.server.telemetry import run_operation
@@ -83,7 +84,9 @@ class AddMessageRequest(BaseModel):
     """
 
     role: str
-    role_id: Optional[str] = None
+    peer_id: Optional[str] = None
+    agent_id: Optional[str] = None
+    agent_uri: Optional[str] = None
     content: Optional[str] = None
     parts: Optional[List[Dict[str, Any]]] = None
     created_at: Optional[str] = None
@@ -93,6 +96,7 @@ class AddMessageRequest(BaseModel):
     def validate_content_or_parts(self) -> "AddMessageRequest":
         if self.content is None and self.parts is None:
             raise ValueError("Either 'content' or 'parts' must be provided")
+        self.peer_id = normalize_peer_id(self.peer_id)
         return self
 
 
@@ -114,25 +118,42 @@ class CreateSessionRequest(BaseModel):
     """Request model for creating a session."""
 
     session_id: Optional[str] = None
+    memory_policy: Optional[Dict[str, Any]] = None
     telemetry: TelemetryRequest = False
 
 
 def _resolve_message_parts(msg_request: AddMessageRequest) -> List[Part]:
     """Resolve parts from an AddMessageRequest, handling path variables."""
     if msg_request.parts is not None:
-        resolved_parts = []
-        for p in msg_request.parts:
-            part_copy = dict(p)
-            if part_copy.get("type") == "context" and "uri" in part_copy:
-                part_copy["uri"] = resolve_path_variables(part_copy["uri"])
-            if part_copy.get("type") == "tool":
-                if "tool_uri" in part_copy:
-                    part_copy["tool_uri"] = resolve_path_variables(part_copy["tool_uri"])
-                if "skill_uri" in part_copy:
-                    part_copy["skill_uri"] = resolve_path_variables(part_copy["skill_uri"])
-            resolved_parts.append(part_copy)
-        return [part_from_dict(p) for p in resolved_parts]
+        return [_part_request_to_part(p) for p in msg_request.parts]
     return [TextPart(text=msg_request.content or "")]
+
+
+def _part_request_to_part(raw_part: Dict[str, Any]) -> Part:
+    """Convert request part payload into an internal Part."""
+    if not isinstance(raw_part, dict):
+        return TextPart(text=str(raw_part))
+
+    part_copy = dict(raw_part)
+    if part_copy.get("type") == "context" and "uri" in part_copy:
+        part_copy["uri"] = resolve_path_variables(part_copy["uri"])
+    if part_copy.get("type") == "tool":
+        if "tool_uri" in part_copy:
+            part_copy["tool_uri"] = resolve_path_variables(part_copy["tool_uri"])
+        if "skill_uri" in part_copy:
+            part_copy["skill_uri"] = resolve_path_variables(part_copy["skill_uri"])
+    if part_copy.get("type") == "image_url":
+        image_url = part_copy.get("image_url")
+        if isinstance(image_url, dict) and "url" in image_url:
+            image_url = dict(image_url)
+            image_url["url"] = resolve_path_variables(image_url["url"])
+            part_copy["image_url"] = image_url
+        elif isinstance(image_url, str):
+            part_copy["image_url"] = resolve_path_variables(image_url)
+    try:
+        return part_from_dict(part_copy)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _to_jsonable(value: Any) -> Any:
@@ -147,11 +168,11 @@ def _to_jsonable(value: Any) -> Any:
     return value
 
 
-def _request_auth_mode(request: Request) -> AuthMode:
+def _request_auth_mode(request: Request) -> str:
     config = getattr(request.app.state, "config", None)
     if config is not None and hasattr(config, "get_effective_auth_mode"):
         return config.get_effective_auth_mode()
-    return AuthMode.API_KEY
+    return "api_key"
 
 
 @router.post("")
@@ -168,10 +189,14 @@ async def create_session(
 
     async def _create() -> dict[str, Any]:
         await service.initialize_user_directories(_ctx)
-        await service.initialize_agent_directories(_ctx)
-        session = await service.sessions.create(_ctx, request.session_id)
+        session = await service.sessions.create(
+            _ctx,
+            request.session_id,
+            memory_policy=request.memory_policy,
+        )
         return {
             "session_id": session.session_id,
+            "uri": session.uri,
             "user": session.user.to_dict(),
         }
 
@@ -206,11 +231,9 @@ async def get_session(
     try:
         session = await service.sessions.get(session_id, _ctx, auto_create=auto_create)
     except NotFoundError:
-        return Response(
-            status="error",
-            error=ErrorInfo(code="NOT_FOUND", message=f"Session {session_id} not found"),
-        )
+        return error_response("NOT_FOUND", f"Session {session_id} not found")
     result = session.meta.to_dict()
+    result["uri"] = session.uri
     result["user"] = session.user.to_dict()
     result["pending_tokens"] = int(session.meta.pending_tokens or 0)
     return Response(status="ok", result=result)
@@ -293,8 +316,7 @@ async def get_session_context(
         )
 
     service = get_service()
-    session = service.sessions.session(_ctx, session_id)
-    await session.load()
+    session = await service.sessions.get(session_id, _ctx, auto_create=False)
     result = await session.get_session_context(token_budget=token_budget)
     return Response(status="ok", result=_to_jsonable(result))
 
@@ -309,8 +331,7 @@ async def get_session_archive(
     from openviking_cli.exceptions import NotFoundError
 
     service = get_service()
-    session = service.sessions.session(_ctx, session_id)
-    await session.load()
+    session = await service.sessions.get(session_id, _ctx, auto_create=False)
     try:
         result = await session.get_session_archive(archive_id)
     except NotFoundError:
@@ -371,7 +392,9 @@ async def commit_session(
         operation="session.commit",
         telemetry=body.telemetry,
         fn=lambda: service.sessions.commit_async(
-            session_id, _ctx, keep_recent_count=body.keep_recent_count
+            session_id,
+            _ctx,
+            keep_recent_count=body.keep_recent_count,
         ),
     )
     return Response(
@@ -417,15 +440,18 @@ async def add_message(
 
     async def _add() -> dict[str, Any]:
         session = await service.sessions.get(session_id, _ctx, auto_create=True)
-        role_id = _ctx.resolve_role_id(request.role, request.role_id)
         parts = _resolve_message_parts(request)
 
-        session.add_messages([{
-            "role": request.role,
-            "parts": parts,
-            "role_id": role_id,
-            "created_at": request.created_at,
-        }])
+        session.add_messages(
+            [
+                {
+                    "role": request.role,
+                    "parts": parts,
+                    "peer_id": request.peer_id,
+                    "created_at": request.created_at,
+                }
+            ]
+        )
         return {
             "session_id": session_id,
             "message_count": len(session.messages),
@@ -456,14 +482,15 @@ async def batch_add_messages(
         session = await service.sessions.get(session_id, _ctx, auto_create=True)
         specs = []
         for msg_request in request.messages:
-            role_id = _ctx.resolve_role_id(msg_request.role, msg_request.role_id)
             parts = _resolve_message_parts(msg_request)
-            specs.append({
-                "role": msg_request.role,
-                "parts": parts,
-                "role_id": role_id,
-                "created_at": msg_request.created_at,
-            })
+            specs.append(
+                {
+                    "role": msg_request.role,
+                    "parts": parts,
+                    "peer_id": msg_request.peer_id,
+                    "created_at": msg_request.created_at,
+                }
+            )
         msgs = session.add_messages(specs)
         return {
             "session_id": session_id,
@@ -487,8 +514,7 @@ async def record_used(
 ):
     """Record actually used contexts and skills in a session."""
     service = get_service()
-    session = service.sessions.session(_ctx, session_id)
-    await session.load()
+    session = await service.sessions.get(session_id, _ctx, auto_create=False)
 
     # Resolve path variables in contexts
     resolved_contexts = None

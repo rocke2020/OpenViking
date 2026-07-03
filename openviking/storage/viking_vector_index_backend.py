@@ -12,6 +12,7 @@ from openviking.core.namespace import canonicalize_uri, visible_roots
 from openviking.server.identity import RequestContext, Role
 from openviking.storage.expr import And, Eq, FilterExpr, In, Or, PathScope, RawDSL
 from openviking.storage.vectordb.collection.collection import Collection
+from openviking.storage.vectordb.collection.result import UpdateResult
 from openviking.storage.vectordb.utils.logging_init import init_cpp_logging
 from openviking.storage.vectordb_adapters import create_collection_adapter
 from openviking_cli.utils import get_logger
@@ -26,6 +27,7 @@ RETRIEVAL_OUTPUT_FIELDS = [
     "abstract",
     "active_count",
     "updated_at",
+    "search_tags",
 ]
 
 LOOKUP_OUTPUT_FIELDS = [
@@ -44,10 +46,10 @@ MEMORY_DEDUP_OUTPUT_FIELDS = [
     "level",
     "account_id",
     "owner_user_id",
-    "owner_agent_id",
 ]
 
 FETCH_BY_URI_OUTPUT_FIELDS = [
+    "id",
     "uri",
     "type",
     "context_type",
@@ -58,18 +60,25 @@ FETCH_BY_URI_OUTPUT_FIELDS = [
     "name",
     "description",
     "tags",
+    "search_tags",
     "abstract",
     "account_id",
     "owner_user_id",
-    "owner_agent_id",
 ]
 
 URI_REWRITE_OUTPUT_FIELDS = [
     "id",
     "uri",
     "level",
+    "name",
+    "description",
+    "tags",
+    "abstract",
+    "content",
     "account_id",
 ]
+
+VIKINGDB_CONTENT_MAX_SIZE = 1024 * 1024
 
 
 class _AsyncVectorAdapter:
@@ -155,7 +164,29 @@ class _SingleAccountBackend:
         """Drop runtime-only or stale legacy fields before writing back to the current schema."""
         payload = {k: v for k, v in data.items() if v is not None}
         filtered = self._filter_known_fields(payload)
-        return {k: v for k, v in filtered.items() if v is not None}
+        result = {k: v for k, v in filtered.items() if v is not None}
+
+        # Ensure text fields required by the schema are present (even if empty).
+        # VikingDB requires all schema-defined fields in upsert data.
+        try:
+            coll = self._get_collection()
+            meta = self._get_meta_data(coll)
+            for field in meta.get("Fields", []):
+                if field.get("FieldType") == "text" and field.get("FieldName") not in result:
+                    result[field["FieldName"]] = ""
+        except Exception:
+            pass
+
+        content = result.get("content")
+        if isinstance(content, (str, bytes)):
+            result["content"] = content[:VIKINGDB_CONTENT_MAX_SIZE]
+
+        return result
+
+    @staticmethod
+    def _is_not_found_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "not found" in message or "does not exist" in message
 
     async def _refresh_meta_data_async(self) -> None:
         self._meta_data_cache = await self._async_adapter.collection_meta()
@@ -237,12 +268,11 @@ class _SingleAccountBackend:
     # Data Operations (with tenant enforcement)
     # =========================================================================
 
-    async def upsert(self, data: Dict[str, Any]) -> str:
+    async def upsert(self, data: Dict[str, Any], partial_update: bool = False) -> str:
         payload = dict(data)
         logger.debug(
             f"[_SingleAccountBackend.upsert] Input data.account_id={payload.get('account_id')}, bound_account_id={self._bound_account_id}"
         )
-
         if self._bound_account_id and not payload.get("account_id"):
             payload["account_id"] = self._bound_account_id
         logger.debug(
@@ -261,9 +291,78 @@ class _SingleAccountBackend:
         if not payload.get("id"):
             payload["id"] = str(uuid.uuid4())
 
+        if partial_update:
+            try:
+                existing_records = await self._async_adapter.call("get", [payload["id"]])
+                if self._bound_account_id:
+                    existing_records = [
+                        record
+                        for record in existing_records
+                        if record.get("account_id") == self._bound_account_id
+                    ]
+            except Exception as e:
+                logger.error("Error reading existing record before partial update: %s", e)
+                return ""
+
+            if existing_records:
+                existing = dict(existing_records[0])
+                existing.update({k: v for k, v in payload.items() if v is not None})
+                payload = existing
+
         payload = await self._async_adapter.run(self._prepare_upsert_payload, payload)
         ids = await self._async_adapter.call("upsert", payload)
         return ids[0] if ids else ""
+
+    async def update(self, data: Dict[str, Any]) -> UpdateResult:
+        """Strict update path. The target record must already exist."""
+        try:
+            payload = dict(data)
+            logger.debug(
+                f"[_SingleAccountBackend.update] Input data.account_id={payload.get('account_id')}, bound_account_id={self._bound_account_id}"
+            )
+
+            if self._bound_account_id and not payload.get("account_id"):
+                payload["account_id"] = self._bound_account_id
+
+            if not payload.get("id"):
+                raise ValueError("id is required for update")
+
+            context_type = payload.get("context_type")
+            if context_type and context_type not in VikingVectorIndexBackend.ALLOWED_CONTEXT_TYPES:
+                allowed = sorted(VikingVectorIndexBackend.ALLOWED_CONTEXT_TYPES)
+                raise ValueError(f"Invalid context_type: {context_type}. Must be one of {allowed}")
+
+            payload = await self._async_adapter.run(self._prepare_upsert_payload, payload)
+            ids = await self._async_adapter.call("update_data", [payload])
+            normalized_ids = [str(item) for item in (ids or []) if item is not None]
+            return UpdateResult(
+                ok=bool(normalized_ids),
+                ids=normalized_ids,
+                updated_count=len(normalized_ids),
+                error_code=None if normalized_ids else "UPDATE_FAILED",
+                error_message=None
+                if normalized_ids
+                else "update completed without any updated ids",
+            )
+        except ValueError as e:
+            message = str(e)
+            error_code = "NOT_FOUND" if "not found" in message.lower() else "INVALID_ARGUMENT"
+            return UpdateResult(
+                ok=False,
+                ids=[],
+                updated_count=0,
+                error_code=error_code,
+                error_message=message,
+            )
+        except Exception as e:
+            logger.error("Error updating record: %s", e)
+            return UpdateResult(
+                ok=False,
+                ids=[],
+                updated_count=0,
+                error_code="UPDATE_FAILED",
+                error_message=str(e),
+            )
 
     async def get(self, ids: List[str]) -> List[Dict[str, Any]]:
         try:
@@ -356,7 +455,7 @@ class _SingleAccountBackend:
                 order_desc=order_desc,
             )
         except Exception as e:
-            logger.error("Error querying collection: %s", e)
+            logger.error("Error querying collection: %s", e, exc_info=True)
             return []
 
     async def search(
@@ -481,6 +580,38 @@ class _SingleAccountBackend:
         logger.info("Optimization requested")
         return True
 
+    async def search_by_keywords(
+        self,
+        keywords: Optional[List[str]] = None,
+        query: Optional[str] = None,
+        limit: int = 10,
+        offset: int = 0,
+        filter: Optional[Dict[str, Any] | FilterExpr] = None,
+        output_fields: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        try:
+            if self._bound_account_id:
+                account_filter = Eq("account_id", self._bound_account_id)
+                if filter:
+                    if isinstance(filter, dict):
+                        filter = RawDSL(filter)
+                    filter = And([account_filter, filter])
+                else:
+                    filter = account_filter
+
+            return await asyncio.to_thread(
+                self._adapter.search_by_keywords,
+                keywords=keywords,
+                query=query,
+                limit=limit,
+                offset=offset,
+                filter=filter,
+                output_fields=output_fields,
+            )
+        except Exception as e:
+            logger.error("Error searching by keywords: %s", e)
+            raise
+
     async def close(self) -> None:
         try:
             await self._async_adapter.call("close")
@@ -534,6 +665,7 @@ class VikingVectorIndexBackend:
         init_cpp_logging()
 
         self._config = config
+        self._backend_type = config.backend  # expose for engine resolution
         self.vector_dim = config.dimension
         self.distance_metric = config.distance_metric
         self.sparse_weight = config.sparse_weight
@@ -619,8 +751,16 @@ class VikingVectorIndexBackend:
     async def get_collection_info(self) -> Optional[Dict[str, Any]]:
         return await self._get_default_backend().get_collection_info()
 
-    async def get_collection_meta(self) -> Optional[Dict[str, Any]]:
-        return await self._get_default_backend().get_collection_meta()
+    async def get_collection_meta(
+        self,
+        *,
+        ctx: Optional[RequestContext] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if ctx:
+            backend = self._get_backend_for_context(ctx)
+        else:
+            backend = self._get_default_backend()
+        return await backend.get_collection_meta()
 
     async def update_collection_description(self, description: str) -> bool:
         return await self._get_default_backend().update_collection_description(description)
@@ -629,16 +769,40 @@ class VikingVectorIndexBackend:
     # 公开数据操作 API（强制要求 ctx）
     # =========================================================================
 
-    async def upsert(self, data: Dict[str, Any], *, ctx: RequestContext) -> str:
+    async def upsert(
+        self, data: Dict[str, Any], *, ctx: RequestContext, partial_update: bool = False
+    ) -> str:
+        """Main write entrypoint.
+
+        With the default ``partial_update=False``, this preserves the legacy
+        full-record upsert behavior. When ``partial_update=True``, the backend
+        first reads the current record and preserves unspecified existing
+        fields before issuing the final upsert.
+        """
         logger.debug(
-            f"[VikingVectorIndexBackend.upsert] Called with ctx.account_id={ctx.account_id}, data={data}"
+            f"[VikingVectorIndexBackend.upsert] Called with ctx.account_id={ctx.account_id}, partial_update={partial_update}, data={data}"
         )
         backend = self._get_backend_for_context(ctx)
         logger.debug(
             f"[VikingVectorIndexBackend.upsert] Using backend for account_id={ctx.account_id}"
         )
-        result = await backend.upsert(data)
-        logger.debug(f"[VikingVectorIndexBackend.upsert] Completed, result={result}")
+        result = await backend.upsert(data, partial_update=partial_update)
+        logger.debug(
+            f"[VikingVectorIndexBackend.upsert] Completed with partial_update={partial_update}, result={result}"
+        )
+        return result
+
+    async def update(self, data: Dict[str, Any], *, ctx: RequestContext) -> UpdateResult:
+        """Strict update path. The target record must already exist."""
+        logger.debug(
+            f"[VikingVectorIndexBackend.update] Called with ctx.account_id={ctx.account_id}, data={data}"
+        )
+        backend = self._get_backend_for_context(ctx)
+        logger.debug(
+            f"[VikingVectorIndexBackend.update] Using backend for account_id={ctx.account_id}"
+        )
+        result = await backend.update(data)
+        logger.debug(f"[VikingVectorIndexBackend.update] Completed, result={result}")
         return result
 
     async def get(self, ids: List[str], *, ctx: RequestContext) -> List[Dict[str, Any]]:
@@ -656,6 +820,116 @@ class VikingVectorIndexBackend:
     async def fetch_by_uri(self, uri: str, *, ctx: RequestContext) -> Optional[Dict[str, Any]]:
         backend = self._get_backend_for_context(ctx)
         return await backend.fetch_by_uri(uri)
+
+    async def update_search_tags(
+        self,
+        uri: str,
+        tags: List[str],
+        *,
+        mode: str,
+        levels: Optional[List[int]] = None,
+        ctx: RequestContext,
+    ) -> List[Dict[str, Any]]:
+        """Update search tags for the exact indexed record or directory summary records."""
+        if mode not in {"replace", "append"}:
+            raise ValueError(f"unsupported tag mode: {mode}")
+
+        from openviking.utils.tags import merge_search_tags
+
+        canonical_uri = canonicalize_uri(uri, ctx)
+        if levels is None:
+            record = await self.fetch_by_uri(canonical_uri, ctx=ctx)
+            if not record or not record.get("id"):
+                return []
+
+            full_records = await self.get([str(record["id"])], ctx=ctx)
+            if not full_records:
+                logger.warning(
+                    "update_search_tags failed to fetch full exact record uri=%s account_id=%s id=%s",
+                    canonical_uri,
+                    ctx.account_id,
+                    record.get("id"),
+                )
+                return []
+
+            updated_record = dict(full_records[0])
+            try:
+                if mode == "append":
+                    updated_record["search_tags"] = merge_search_tags(
+                        updated_record.get("search_tags"), tags
+                    )
+                else:
+                    updated_record["search_tags"] = list(tags)
+            except Exception as exc:
+                logger.warning(
+                    "update_search_tags failed to merge exact record tags uri=%s "
+                    "account_id=%s existing_tags=%s incoming_tags=%s error=%s",
+                    canonical_uri,
+                    ctx.account_id,
+                    updated_record.get("search_tags"),
+                    tags,
+                    exc,
+                )
+                return []
+
+            if await self.upsert(updated_record, ctx=ctx):
+                return [updated_record]
+            return []
+
+        records = await self.filter(
+            filter=And([Eq("uri", canonical_uri), In("level", levels)]),
+            limit=max(len(levels), 2),
+            output_fields=FETCH_BY_URI_OUTPUT_FIELDS,
+            ctx=ctx,
+        )
+        if not records:
+            return []
+
+        record_ids = [str(record["id"]) for record in records if record.get("id")]
+        if not record_ids:
+            return []
+        full_records = await self.get(record_ids, ctx=ctx)
+        full_records_by_id = {
+            str(record["id"]): record for record in full_records if record.get("id") is not None
+        }
+
+        updated_records: List[Dict[str, Any]] = []
+        for record in records:
+            if not record or not record.get("id"):
+                continue
+            full_record = full_records_by_id.get(str(record["id"]))
+            if not full_record:
+                logger.warning(
+                    "update_search_tags failed to fetch full leveled record uri=%s account_id=%s level=%s id=%s",
+                    canonical_uri,
+                    ctx.account_id,
+                    record.get("level"),
+                    record.get("id"),
+                )
+                continue
+            updated_record = dict(full_record)
+            try:
+                if mode == "append":
+                    updated_record["search_tags"] = merge_search_tags(
+                        updated_record.get("search_tags"), tags
+                    )
+                else:
+                    updated_record["search_tags"] = list(tags)
+            except Exception as exc:
+                logger.warning(
+                    "update_search_tags failed to merge leveled record tags uri=%s "
+                    "account_id=%s level=%s existing_tags=%s incoming_tags=%s error=%s",
+                    canonical_uri,
+                    ctx.account_id,
+                    updated_record.get("level"),
+                    updated_record.get("search_tags"),
+                    tags,
+                    exc,
+                )
+                return []
+            if await self.upsert(updated_record, ctx=ctx):
+                updated_records.append(updated_record)
+        return updated_records
 
     async def query(
         self,
@@ -756,6 +1030,30 @@ class VikingVectorIndexBackend:
         else:
             backend = self._get_default_backend()
         return await backend.count(filter=filter)
+
+    async def search_by_keywords(
+        self,
+        keywords: Optional[List[str]] = None,
+        query: Optional[str] = None,
+        limit: int = 10,
+        offset: int = 0,
+        filter: Optional[Dict[str, Any] | FilterExpr] = None,
+        output_fields: Optional[List[str]] = None,
+        *,
+        ctx: Optional[RequestContext] = None,
+    ) -> List[Dict[str, Any]]:
+        if ctx:
+            backend = self._get_backend_for_context(ctx)
+        else:
+            backend = self._get_default_backend()
+        return await backend.search_by_keywords(
+            keywords=keywords,
+            query=query,
+            limit=limit,
+            offset=offset,
+            filter=filter,
+            output_fields=output_fields,
+        )
 
     async def clear(self, *, ctx: Optional[RequestContext] = None) -> bool:
         if ctx:
@@ -1049,7 +1347,8 @@ class VikingVectorIndexBackend:
                     record.get("id"),
                 )
                 continue
-            if await self.upsert(updated, ctx=ctx):
+            result = await self.upsert(updated, ctx=ctx)
+            if result:
                 success = True
                 old_id = record.get("id")
                 if old_id and old_id != new_id:
@@ -1074,8 +1373,8 @@ class VikingVectorIndexBackend:
             uri_updated = False
             for record in full_records:
                 current = int(record.get("active_count", 0) or 0)
-                record["active_count"] = current + 1
-                if await self.upsert(record, ctx=ctx):
+                result = await self.upsert(record | {"active_count": current + 1}, ctx=ctx)
+                if result:
                     uri_updated = True
             if uri_updated:
                 updated += 1

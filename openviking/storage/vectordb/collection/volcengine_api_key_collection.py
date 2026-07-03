@@ -300,6 +300,14 @@ class VolcengineApiKeyCollection(ICollection):
         }
         return self._data_post(path, data)
 
+    def update_data(self, data_list: List[Dict[str, Any]]):
+        path = "/api/vikingdb/data/update"
+        data = {
+            **self._base_data_payload(),
+            "data": data_list,
+        }
+        return self._data_post(path, data)
+
     def fetch_data(self, primary_keys: List[Any]) -> FetchDataInCollectionResult:
         path = "/api/vikingdb/data/fetch_in_collection"
         data = {
@@ -372,6 +380,7 @@ class VolcengineApiKeyCollection(ICollection):
             "limit": limit,
             "offset": offset,
         }
+        data = {k: v for k, v in data.items() if v is not None}
         resp_data = self._data_post(path, data)
         return self._parse_search_result(resp_data)
 

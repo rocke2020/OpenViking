@@ -14,7 +14,7 @@ function makeLogger() {
 
 function makeEngine(opts?: {
   autoCapture?: boolean;
-  commitTokenThreshold?: number;
+  commitTokenThresholdRatio?: number;
   getSession?: Record<string, unknown>;
   addSessionMessageError?: Error;
   cfgOverrides?: Record<string, unknown>;
@@ -24,7 +24,7 @@ function makeEngine(opts?: {
     baseUrl: "http://127.0.0.1:1933",
     autoCapture: opts?.autoCapture ?? true,
     autoRecall: false,
-    commitTokenThreshold: opts?.commitTokenThreshold ?? 20000,
+    commitTokenThresholdRatio: opts?.commitTokenThresholdRatio ?? 0.5,
     emitStandardDiagnostics: true,
     ...(opts?.cfgOverrides ?? {}),
   });
@@ -201,7 +201,7 @@ describe("context-engine afterTurn()", () => {
 
   it("records senderId from runtimeContext in afterTurn diagnostics", async () => {
     const { engine, logger } = makeEngine({
-      commitTokenThreshold: 50,
+      commitTokenThresholdRatio: 0.01,
       getSession: { pending_tokens: 5000 },
     });
 
@@ -263,7 +263,7 @@ describe("context-engine afterTurn()", () => {
 
   it("does not commit when pendingTokens < threshold", async () => {
     const { engine, client } = makeEngine({
-      commitTokenThreshold: 20000,
+      commitTokenThresholdRatio: 0.8,
       getSession: { pending_tokens: 100 },
     });
 
@@ -284,7 +284,7 @@ describe("context-engine afterTurn()", () => {
 
   it("commits when pendingTokens >= threshold", async () => {
     const { engine, client } = makeEngine({
-      commitTokenThreshold: 20000,
+      commitTokenThresholdRatio: 0.1,
       getSession: { pending_tokens: 25000 },
     });
 
@@ -303,6 +303,31 @@ describe("context-engine afterTurn()", () => {
     expect(client.commitSession).toHaveBeenCalledTimes(1);
     const commitCall = client.commitSession.mock.calls[0];
     expect(commitCall[1]).toMatchObject({ wait: false });
+  });
+
+  it("keeps afterTurn write and commit enabled when recall target types default to resources only", async () => {
+    const { engine, client } = makeEngine({
+      commitTokenThresholdRatio: 0.1,
+      getSession: { pending_tokens: 25000 },
+      cfgOverrides: {
+        recallTargetTypes: [],
+      },
+    });
+
+    await engine.afterTurn!({
+      sessionId: "s1",
+      sessionFile: "",
+      messages: [
+        { role: "user", content: "persist this user turn even with resource-only recall" },
+        { role: "assistant", content: "persist this assistant turn too" },
+      ],
+      prePromptMessageCount: 0,
+    });
+
+    expect(client.addSessionMessage).toHaveBeenCalledTimes(2);
+    expect(client.addSessionMessage.mock.calls[0][1]).toBe("user");
+    expect(client.addSessionMessage.mock.calls[1][1]).toBe("assistant");
+    expect(client.commitSession).toHaveBeenCalledTimes(1);
   });
 
   it("catches errors without throwing", async () => {
@@ -330,7 +355,7 @@ describe("context-engine afterTurn()", () => {
 
   it("commit uses OV session ID derived from sessionId", async () => {
     const { engine, client } = makeEngine({
-      commitTokenThreshold: 100,
+      commitTokenThresholdRatio: 0.01,
       getSession: { pending_tokens: 5000 },
     });
 
@@ -352,7 +377,7 @@ describe("context-engine afterTurn()", () => {
 
   it("commit passes wait=false for afterTurn (async Phase 2)", async () => {
     const { engine, client } = makeEngine({
-      commitTokenThreshold: 100,
+      commitTokenThresholdRatio: 0.01,
       getSession: { pending_tokens: 5000 },
     });
 
@@ -547,7 +572,7 @@ describe("context-engine afterTurn()", () => {
     expect(assistantParts.map(p => p.text).join(" ")).toContain("Here is context");
   });
 
-  it("skips heartbeat messages from being stored", async () => {
+  it("stores heartbeat-looking messages when host does not flag the turn", async () => {
     const { engine, client } = makeEngine();
 
     const messages = [
@@ -562,7 +587,35 @@ describe("context-engine afterTurn()", () => {
       prePromptMessageCount: 0,
     });
 
-    expect(client.addSessionMessage).not.toHaveBeenCalled();
+    expect(client.addSessionMessage).toHaveBeenCalledTimes(2);
+    expect(client.addSessionMessage.mock.calls[0][1]).toBe("user");
+    const userParts = client.addSessionMessage.mock.calls[0][2] as Array<{ text?: string }>;
+    expect(userParts.map(p => p.text).join(" ")).toContain("HEARTBEAT.md");
+  });
+
+  it("stores normal user messages that mention heartbeat artifacts", async () => {
+    const { engine, client } = makeEngine();
+
+    const messages = [
+      {
+        role: "user",
+        content:
+          "Please explain why HEARTBEAT.md appeared in the logs and whether HEARTBEAT_OK means success.",
+      },
+      { role: "assistant", content: "HEARTBEAT_OK is the heartbeat acknowledgement token." },
+    ];
+
+    await engine.afterTurn!({
+      sessionId: "s1",
+      sessionFile: "",
+      messages,
+      prePromptMessageCount: 0,
+    });
+
+    expect(client.addSessionMessage).toHaveBeenCalledTimes(2);
+    expect(client.addSessionMessage.mock.calls[0][1]).toBe("user");
+    const userParts = client.addSessionMessage.mock.calls[0][2] as Array<{ text?: string }>;
+    expect(userParts.map(p => p.text).join(" ")).toContain("HEARTBEAT.md");
   });
 
   it("skips heartbeat via isHeartbeat flag", async () => {

@@ -2,10 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { OpenVikingClient } from "../../client.js";
 import { memoryOpenVikingConfigSchema } from "../../config.js";
-import {
-  createMemoryOpenVikingContextEngine,
-  openClawSessionToOvStorageId,
-} from "../../context-engine.js";
+import { createMemoryOpenVikingContextEngine } from "../../context-engine.js";
+import { openClawSessionToOvStorageId } from "../../routing/identity-routing.js";
 
 function makeLogger() {
   return {

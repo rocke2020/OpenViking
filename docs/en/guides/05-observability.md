@@ -135,7 +135,8 @@ Prerequisites:
 
 This TUI is useful for two kinds of inspection:
 
-- checking what actually exists under `viking://resources`, `viking://user`, `viking://agent`, and `viking://session`
+- checking what actually exists under `viking://resources` and `viking://user`
+  (sessions live under `viking://user/{user_id}/sessions`)
 - checking whether vector records for a URI were actually written, and how many there are
 
 Common keys:
@@ -261,6 +262,7 @@ OpenViking groups signal-level observability configuration under `server.observa
 - `server.observability.traces`: trace export configuration
 - `server.observability.logs`: log export configuration
 - `server.observability.dump_body`: attaches HTTP request/response bodies (filtered by content-type, truncated by bytes) as attributes on the active trace span so they can be inspected in trace UIs. Off by default — bodies may contain secrets and high-cardinality content
+- `server.observability.usage_audit`: per-request usage/cost audit log, stored in SQLite. `sqlite_path` overrides the database location (use a per-instance local path for multi-instance deployments); `timezone` controls timestamp localization. Enabled by default
 
 Example:
 
@@ -310,6 +312,11 @@ Example:
       "dump_body": {
         "enabled": false,
         "max_bytes": 4096
+      },
+      "usage_audit": {
+        "enabled": true,
+        "sqlite_path": null,
+        "timezone": "local"
       }
     }
   }
@@ -367,8 +374,8 @@ If there is no data yet, go back to the Prometheus scrape configuration above an
 
 The OpenViking repository already includes ready-to-import dashboard JSON:
 
-- [openviking_demo_dashboard.json](../../../examples/grafana/openviking_demo_dashboard.json)
-- [openviking_token_demo_dashboard.json](../../../examples/grafana/openviking_token_demo_dashboard.json) (Note: this dashboard depends on the `tim012432-calendarheatmap-panel` Grafana plugin. Install it before importing to ensure panels render correctly.)
+- [openviking_demo_dashboard.json](https://github.com/volcengine/OpenViking/blob/main/examples/grafana/openviking_demo_dashboard.json)
+- [openviking_token_demo_dashboard.json](https://github.com/volcengine/OpenViking/blob/main/examples/grafana/openviking_token_demo_dashboard.json) (Note: this dashboard depends on the `tim012432-calendarheatmap-panel` Grafana plugin. Install it before importing to ensure panels render correctly.)
 
 You can import it with the following steps:
 

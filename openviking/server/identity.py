@@ -14,41 +14,64 @@ if TYPE_CHECKING:
 from openviking_cli.session.user_id import UserIdentifier
 
 
-class Role(str, Enum):
+class Role(str):
+    """Role type — supports built-in roles and custom plugin-defined roles.
+
+    Built-in roles (root/admin/user) are available as class attributes.
+    Custom roles can be registered via ``Role.register(name, rank)``.
+
+    Role comparison is string-based, so ``Role.ROOT == "root"`` and
+    ``Role("custom") == "custom"`` both work.
+    """
+
     ROOT = "root"
     ADMIN = "admin"
     USER = "user"
 
+    # Privilege ranking for role-downgrade detection.
+    # Higher rank => more privilege.
+    _BUILTIN_RANK: dict[str, int] = {
+        USER: 0,
+        ADMIN: 1,
+        ROOT: 2,
+    }
+    _CUSTOM_RANK: dict[str, int] = {}
+
+    @classmethod
+    def register(cls, name: str, rank: int) -> None:
+        """Register a custom role with a privilege rank.
+
+        Args:
+            name: Role identifier string.
+            rank: Privilege rank — higher = more privilege.
+        """
+        cls._CUSTOM_RANK[name] = rank
+
+    @property
+    def rank(self) -> int:
+        """Return the privilege rank for this role."""
+        return self._BUILTIN_RANK.get(self, self._CUSTOM_RANK.get(self, 0))
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Role):
+            return str(self) == str(other)
+        if isinstance(other, str):
+            return str(self) == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(str(self))
+
 
 class AuthMode(str, Enum):
-    """Authentication modes for OpenViking server."""
+    """Authentication modes for OpenViking server.
+
+    Built-in modes. Custom modes are plain strings not in this enum.
+    """
 
     API_KEY = "api_key"
     TRUSTED = "trusted"
     DEV = "dev"
-
-
-@dataclass(frozen=True)
-class AccountNamespacePolicy:
-    """Account-level namespace isolation policy."""
-
-    isolate_user_scope_by_agent: bool = False
-    isolate_agent_scope_by_user: bool = False
-
-    @classmethod
-    def from_dict(cls, data: Optional[dict]) -> "AccountNamespacePolicy":
-        if not isinstance(data, dict):
-            return cls()
-        return cls(
-            isolate_user_scope_by_agent=bool(data.get("isolate_user_scope_by_agent", False)),
-            isolate_agent_scope_by_user=bool(data.get("isolate_agent_scope_by_user", False)),
-        )
-
-    def to_dict(self) -> dict:
-        return {
-            "isolate_user_scope_by_agent": self.isolate_user_scope_by_agent,
-            "isolate_agent_scope_by_user": self.isolate_agent_scope_by_user,
-        }
 
 
 @dataclass
@@ -58,8 +81,6 @@ class ResolvedIdentity:
     role: Role
     account_id: Optional[str] = None
     user_id: Optional[str] = None
-    agent_id: Optional[str] = None
-    namespace_policy: AccountNamespacePolicy = field(default_factory=AccountNamespacePolicy)
     # True when this identity was minted from an OAuth-issued bearer token;
     # downstream checks (e.g. ROOT-requires-explicit-tenant headers) can skip
     # rules that target raw API-key auth, since OAuth claims already pin
@@ -73,7 +94,9 @@ class RequestContext:
 
     user: UserIdentifier
     role: Role
-    namespace_policy: AccountNamespacePolicy = field(default_factory=AccountNamespacePolicy)
+    # Request-level view filter for the current user's peers collection. This does
+    # not change tenant/user identity or session ownership.
+    actor_peer_id: Optional[str] = None
     # Mirrors ResolvedIdentity.from_oauth. Routes that mint OAuth state
     # (OTP issuance, oauth-verify) reject callers with from_oauth=True to
     # prevent a stolen access token from laundering itself into a long-lived
@@ -83,25 +106,6 @@ class RequestContext:
     @property
     def account_id(self) -> str:
         return self.user.account_id
-
-    def resolve_role_id(self, message_role: str, override: Optional[str] = None) -> Optional[str]:
-        """Resolve the role_id for a message, with fallback to ctx identity.
-
-        `message_role` is the message-level role ("user" / "assistant"), distinct
-        from `RequestContext.role` (the authz role).
-
-        - If `override` is truthy, returns it as-is (caller-supplied wins).
-        - For message_role="user", falls back to `user.user_id`.
-        - For message_role="assistant", falls back to `user.agent_id`.
-        - Any other message_role returns None when no override is given.
-        """
-        if override:
-            return override
-        if message_role == "user":
-            return self.user.user_id
-        if message_role == "assistant":
-            return self.user.agent_id
-        return None
 
 
 @dataclass

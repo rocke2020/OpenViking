@@ -38,6 +38,14 @@ session.add_message(
         ContextPart(uri="viking://user/memories/profile.md"),
     ]
 )
+
+session.add_message(
+    "user",
+    [
+        TextPart("Remember this studio layout."),
+        ImagePart(url="https://example.com/studio.png", detail="auto"),
+    ]
+)
 ```
 
 ### used
@@ -48,7 +56,7 @@ session.used(contexts=["viking://user/memories/profile.md"])
 
 # Record used skill
 session.used(skill={
-    "uri": "viking://agent/skills/code-search",
+    "uri": "viking://user/skills/code-search",
     "input": "search config",
     "output": "found 3 files",
     "success": True
@@ -62,7 +70,7 @@ result = session.commit()
 # {
 #   "status": "accepted",
 #   "task_id": "uuid-xxx",
-#   "archive_uri": "viking://session/.../history/archive_001",
+#   "archive_uri": "viking://user/{user_id}/sessions/.../history/archive_001",
 #   "archived": True
 # }
 
@@ -90,6 +98,7 @@ class Message:
 | Type | Description |
 |------|-------------|
 | `TextPart` | Text content |
+| `ImagePart` | Image URL content. During memory extraction, OpenViking can describe it with the configured VLM. |
 | `ContextPart` | Context reference (URI + abstract) |
 | `ToolPart` | Tool call (input + output) |
 
@@ -175,7 +184,7 @@ Each `session.commit()` writes a `memory_diff.json` to the archive directory, re
 
 ```json
 {
-  "archive_uri": "viking://session/{session_id}/history/archive_001",
+  "archive_uri": "viking://user/{user_id}/sessions/{session_id}/history/archive_001",
   "extracted_at": "2026-04-21T10:00:00Z",
   "operations": {
     "adds": [
@@ -223,7 +232,7 @@ An empty `memory_diff.json` (all counts zero) is written even when no memory ope
 ## Storage Structure
 
 ```
-viking://session/{session_id}/
+viking://user/{user_id}/sessions/{session_id}/
 ├── messages.jsonl            # Current messages
 ├── .abstract.md              # Current abstract
 ├── .overview.md              # Current overview
@@ -244,12 +253,18 @@ viking://user/memories/
 ├── entities/
 └── events/
 
-viking://agent/memories/
+viking://user/memories/
 ├── cases/
 ├── patterns/
 ├── tools/
 └── skills/
 ```
+
+`viking://user/sessions/{session_id}` is accepted as a short form relative to
+the current request user and is canonicalized to
+`viking://user/{user_id}/sessions/{session_id}`. The old
+`viking://session/{session_id}` form is accepted as a backward-compatible alias
+for the same current-user session path and is not a separate storage root.
 
 ## Related Documents
 

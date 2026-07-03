@@ -5,10 +5,10 @@
 本轮测试围绕 `examples/openclaw-plugin` 的多租户与会话身份透传能力展开，重点验证以下目标：
 
 1. 验证插件在 `api_key` 与 `trusted` 两种服务认证模式下的请求头行为是否正确。
-2. 验证插件是否按照服务侧命名空间策略，将 `viking://user/memories` 与 `viking://agent/memories` 正确展开为 canonical URI。
+2. 验证插件是否在 account/user 租户身份外，按 `peer_role` / `peer_prefix` 生成一致的 `peer_id` 与 `X-OpenViking-Actor-Peer`。
 3. 验证 `senderId` / `requesterSenderId` 是否能够稳定映射为会话消息的 `role_id`。
 4. 验证 `afterTurn` 与 `memory_store` 两条写会话路径的身份语义是否一致。
-5. 验证多租户场景下默认用户空间、按 agent 隔离空间、共享 agent 空间等路径的召回行为是否符合预期。
+5. 验证多租户场景下默认用户空间与不同 actor peer 视角下的召回行为是否符合预期。
 
 ## 2. 测试方法
 
@@ -19,9 +19,9 @@
 - 使用 `curl` 调用 `/health`、`/api/v1/system/status`、`/api/v1/search/find`
 - 直接验证显式 URI，例如：
   - `viking://user/default/memories`
-  - `viking://user/default/agent/main/memories`
-  - `viking://agent/main/memories`
-  - `viking://agent/main/user/default/memories`
+  - `viking://resources`
+  - `viking://user/skills`
+  - `viking://session/<session_id>/history`
 - 通过结构化 seed 与分层 `reindex`，确保召回验证基线可用
 
 ### 2.2 插件端到端验证
@@ -55,11 +55,11 @@
 
 ### 3.2 命名空间策略
 
-- `ff`：user 不按 agent 隔离，agent 不按 user 隔离
-- `tf`：user 按 agent 隔离，agent 不按 user 隔离
-- `tt`：user 按 agent 隔离，agent 按 user 隔离
+- `ff`：user 不按 actor peer 归因，agent 不按 user 隔离
+- `tf`：user 按 actor peer 归因，agent 不按 user 隔离
+- `tt`：user 按 actor peer 归因，agent 按 user 隔离
 - 兼容路径：
-  - `agentScopeMode=agent`
+  - `legacy peer scope mode=agent`
   - 新 policy 覆盖旧 alias
 
 ### 3.3 身份透传
@@ -76,12 +76,12 @@
 |---|---|---|---|
 | `api_key` | `api_key_without_key_dev` | 通过 | 不再合成 `default/default` 租户 header |
 | `api_key` | `personal_token_default` | 通过 | 命中 `DEFAULT_USER_TOKEN_19950` |
-| `api_key` | `agentid_prefix_worker` | 通过 | 实际 agent 值为 `worker_main` |
-| 兼容 | `deprecated_agent_alias` | 通过 | `agentScopeMode=agent` 兼容正常 |
+| `api_key` | `peer_prefix_worker` | 通过 | 实际 agent 值为 `worker_main` |
+| 兼容 | `deprecated_agent_alias` | 通过 | `legacy peer scope mode=agent` 兼容正常 |
 | 覆盖优先级 | `new_policy_overrides_deprecated` | 通过 | 新 policy 覆盖旧 alias |
 | namespace | `ff_user_token` | 通过 | user 共享空间命中正确 |
 | namespace | `ff_agent_token` | 通过 | agent 共享空间命中正确 |
-| namespace | `tf_user_token` | 通过 | user 按 agent 隔离命中正确 |
+| namespace | `tf_user_token` | 通过 | user 按 actor peer 归因命中正确 |
 | namespace | `tf_agent_token` | 通过 | agent 共享空间命中正确 |
 | namespace | `tt_user_token` | 通过 | user/agent 双隔离命中正确 |
 | namespace | `tt_agent_token` | 通过 | agent/user 双隔离命中正确 |
@@ -105,7 +105,7 @@
 
 ## 5. 关键结论
 
-1. 插件侧 canonical namespace policy、显式租户 header 与 `role_id` 透传能力已完成联调验证。
+1. 插件侧 peer identity routing、显式租户 header 与 `role_id` 透传能力已完成联调验证。
 2. `afterTurn` 路径可通过 `runtimeContext.senderId` 正确写出 `role_id`。
 3. `memory_store` 路径在工具上下文中无法直接读取 `senderId`，但可稳定通过 `requesterSenderId` 写出 `role_id`。
 4. 在真实机器人私聊与群聊场景中，已确认不同用户会被映射为不同的 `role_id`，且 assistant message 保持 `role_id:null`。

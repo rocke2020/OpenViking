@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 
+import { prepareRecallQuery } from "../../auto-recall.js";
 import {
-  prepareRecallQuery,
-  sanitizeOpenVikingAgentIdHeader,
   createSessionAgentResolver,
-} from "../../index.js";
+  sanitizeOpenVikingAgentIdHeader,
+} from "../../routing/identity-routing.js";
 
 describe("sanitizeOpenVikingAgentIdHeader", () => {
   it("keeps clean alphanumeric+dash+underscore strings", () => {

@@ -556,7 +556,7 @@ openviking-server doctor
 | `model` | str | 模型名称 |
 | `api_base` | str | API 端点（可选） |
 | `thinking` | bool | 启用思考模式（仅对部分火山模型生效，默认：`false`） |
-| `max_concurrent` | int | 语义处理阶段 LLM 最大并发调用数（默认：`100`） |
+| `max_concurrent` | int | 语义处理阶段 LLM 最大并发调用数（默认：`64`） |
 | `max_retries` | int | VLM provider 瞬时错误的最大重试次数（默认：`3`；`0` 表示禁用重试） |
 | `backup` | object | 可选的备用 VLM 配置（结构与 `vlm` 相同），当主 VLM 遇到限流、`5xx`、超时或连接失败等可重试错误时自动切换。仅支持 1 层备用 &mdash; 备用 VLM 本身不能再嵌套 `backup` |
 | `timeout` | float | 单次 VLM API 请求的 HTTP 超时时间（秒），传递给底层 OpenAI/LiteLLM 客户端。慢端点（如 DashScope、本地推理）可调大。必须 `> 0`（默认：`60.0`） |
@@ -660,13 +660,23 @@ LiteLLM 的 Bedrock bearer-token API-key 鉴权，请设置 `forward_api_key=tru
 
 可选的轻量模型配置，用于检索前的意图分析和 query 规划/改写。配置结构与 `vlm` 相同，但只影响 `search()` 的意图分析和 query expansion。未配置或配置为空时，OpenViking 会回退到 `vlm`，保持向后兼容。
 
-只有在环境里已经部署好 planner 模型时才需要添加这一段配置。例如下面的 Ollama 模型需要先在本地 pull 并启动后才能使用。
+> 在 `openviking-server init` 里可勾选启用本地轻量 query planner，向导会自动拉取 Ollama 模型并写入 `query_planner` 配置。对于已知的 query planner 模型，`search()` 会在运行时自动选择匹配的内置 prompt；不在映射表中的模型继续使用 `retrieval.intent_analysis`。
+
+推荐优先使用本地 Ollama 模型 [`guoxuter/ov_intent_analysis_sft:v7_q8`](https://ollama.com/guoxuter/ov_intent_analysis_sft:v7_q8)。该模型基于 Qwen3.5-0.8B 进行微调，可本地部署，适合用小模型承担检索规划：在闲聊、问候或上下文已足够的场景下拒绝检索，从而减少不必要的记忆注入和 token 消耗；需要检索时，再生成面向 `skill`、`resource`、`memory` 的结构化查询。此前的 [`v4_q8`](https://ollama.com/guoxuter/ov_intent_analysis_sft:v4_q8) 版本仍作为可选项继续支持。
+
+使用前请先拉取模型，并确保 Ollama 服务可访问：
+
+```bash
+ollama pull guoxuter/ov_intent_analysis_sft:v7_q8
+```
+
+然后在 OpenViking 配置中添加：
 
 ```json
 {
   "query_planner": {
     "provider": "litellm",
-    "model": "ollama/guoxuter/ov_intent_analysis_sft:v1_q8",
+    "model": "ollama/guoxuter/ov_intent_analysis_sft:v7_q8",
     "api_base": "http://127.0.0.1:11434",
     "temperature": 0.0,
     "timeout": 60,
@@ -677,7 +687,10 @@ LiteLLM 的 Bedrock bearer-token API-key 鉴权，请设置 `forward_api_key=tru
 }
 ```
 
-适合用小模型承担检索规划，同时保留更强的 `vlm` 处理语义提取、记忆提取和多模态内容。
+对于 `ollama/guoxuter/ov_intent_analysis_sft:v7_q8`（以及 `v4_q8`），OpenViking 会在 search 阶段自动使用对应的内置 prompt（分别为 `retrieval.ov_intent_analysis_sft_v7` 和 `retrieval.ov_intent_analysis_sft_v4`），不需要替换 prompt 文件，也不需要设置 `prompts.templates_dir`。如果使用未映射的模型，OpenViking 会继续使用默认的 `retrieval.intent_analysis` prompt。
+
+这样可以用小模型承担检索规划，降低延迟，同时保留更强的 `vlm` 处理语义提取、记忆提取和多模态内容。
+
 
 ### feishu
 
@@ -741,6 +754,30 @@ AST 提取支持：Python、JavaScript/TypeScript、Rust、Go、Java、C/C++。�
 
 详见 [代码骨架提取](../concepts/06-extraction.md#代码骨架提取ast-模式)。
 
+#### 远程资源网络防护
+
+通过 URL 拉取资源时，OpenViking 会拒绝环回、链路本地、私有及其他非公网目标，以及不在代码托管白名单中的主机，并抛出 `PermissionDeniedError`。要从自建 GitHub Enterprise / GitLab / Azure DevOps 拉取代码，请将主机加入 `code` 下对应的白名单：
+
+| 字段 | 类型 | 说明 | 默认值 |
+|------|------|------|--------|
+| `github_domains` | list[str] | 允许的 GitHub 主机（在此添加你的 GitHub Enterprise 主机） | `["github.com", "www.github.com"]` |
+| `gitlab_domains` | list[str] | 允许的 GitLab 主机（在此添加你的自建 GitLab 主机） | `["gitlab.com", "www.gitlab.com"]` |
+| `azure_devops_domains` | list[str] | 允许的 Azure DevOps 主机 | `["dev.azure.com", "ssh.dev.azure.com", "vs-ssh.visualstudio.com"]` |
+| `code_hosting_domains` | list[str] | 额外的通用代码托管主机 | `["github.com", "gitlab.com"]` |
+
+要从私有/内网地址（例如内部镜像）拉取，请将顶层的 `allow_private_networks` 设为 `true`（默认关闭，因此仅允许公网地址）：
+
+```json
+{
+  "allow_private_networks": false,
+  "code": {
+    "github_domains": ["github.com", "github.example.com"]
+  }
+}
+```
+
+`PermissionDeniedError` 的报错信息会指明针对被拦截主机应添加的具体配置键。
+
 ### rerank
 
 用于搜索结果精排的 Rerank 模型。支持 VikingDB (火山引擎)、Cohere 和 OpenAI 兼容接口。
@@ -768,6 +805,7 @@ AST 提取支持：Python、JavaScript/TypeScript、Rust、Go、Java、C/C++。�
     "api_key": "your-api-key",
     "api_base": "https://dashscope.aliyuncs.com/compatible-api/v1/reranks",
     "model": "qwen3-vl-rerank",
+    "timeout": 120,
     "threshold": 0.1
   }
 }
@@ -784,6 +822,7 @@ AST 提取支持：Python、JavaScript/TypeScript、Rust、Go、Java、C/C++。�
 | `api_key` | str | API Key（用于 `openai` 或 `cohere` 提供方） |
 | `api_base` | str | 接口地址（用于 `openai` 提供方） |
 | `model` | str | 模型名称（用于 `openai` 提供方） |
+| `timeout` | float | OpenAI 兼容 provider 的 HTTP 请求超时时间，单位为秒。对于较慢或冷启动的本地 rerank 服务可适当增大。默认：`30.0` |
 | `threshold` | float | 分数阈值，范围为 `0.0` 到 `1.0`。低于此值的结果会被过滤。默认：`0.1` |
 | `extra_headers` | object | 自定义 HTTP 请求头（OpenAI 兼容 provider 可用，可选） |
 
@@ -814,6 +853,26 @@ AST 提取支持：Python、JavaScript/TypeScript、Rust、Go、Java、C/C++。�
 
 如果需要分数严格反映向量相似度，保持 `hotness_alpha` 为 `0.0`。只有当希望高频访问或最近更新的上下文获得排序提升时，才将它设置为大于 `0.0`。
 
+### grep
+
+Grep 引擎配置，用于内容模式搜索。这些设置为服务端配置，不支持请求级别覆盖。
+
+```json
+{
+  "grep": {
+    "engine": "auto",
+    "switch_to_remote_threshold": 10000
+  }
+}
+```
+
+| 参数 | 类型 | 说明 | 默认值 |
+|------|------|------|--------|
+| `engine` | str | 搜索引擎模式：`"auto"` 在可用时使用 VikingDB BM25 召回，不可用时回退到本地文件系统搜索；`"fs"` 强制仅使用本地文件系统搜索。 | `"auto"` |
+| `switch_to_remote_threshold` | int | 切换到 VikingDB BM25 召回的 L2 记录数阈值。当搜索范围内的 L2 文件数达到此阈值时，使用 VikingDB BM25 进行第一阶段召回；否则使用本地文件系统搜索。设为 `0` 表示始终使用 VikingDB BM25。必须 ≥ 0。 | `10000` |
+
+对于 VikingDB / Volcengine FullText grep，OpenViking 会写入 `content` text 字段用于 BM25 召回。源上下文中保留完整内容，仅在最终写入向量库 adapter payload 时将该字段截断到 **1 MB**，以满足后端 payload 限制。
+
 ### storage
 
 用于存储上下文数据 ，包括文件存储（RAGFS）和向量库存储（VectorDB）。
@@ -823,6 +882,7 @@ AST 提取支持：Python、JavaScript/TypeScript、Rust、Go、Java、C/C++。�
 | 参数 | 类型 | 说明 | 默认值 |
 |------|------|------|--------|
 | `workspace` | str | 本地数据存储路径（主要配置） | "./data" |
+| `skip_process_lock` | bool | 是否跳过 `storage.workspace` 的启动进程锁检查。启用后，OpenViking 不会检查或创建 `.openviking.pid` 锁文件。 | `false` |
 | `agfs` | object | RAGFS（Rust 实现的 AGFS）配置 | {} |
 | `vectordb` | object | 向量库存储配置 | {} |
 
@@ -848,6 +908,8 @@ AST 提取支持：Python、JavaScript/TypeScript、Rust、Go、Java、C/C++。�
 |------|------|------|--------|
 | `backend` | str | `"local"`、`"s3"` 或 `"memory"` | `"local"` |
 | `timeout` | float | 请求超时时间（秒） | `10.0` |
+| `backups` | object | 多写存储配置。配置后顶层 `backend` 作为 primary，`backups.items[]` 作为 backup | `null` |
+| `redirects` | array | 多写存储的文件重定向策略。命中后文件写入指定 backup，而不是 primary | `[]` |
 | `queuefs` | object | QueueFS 配置。控制 `/queue` 的命名空间模式、后端和运行时参数 | `{ "mode": "shared", "backend": "sqlite", "recover_stale_sec": 0, "busy_timeout_ms": 5000 }` |
 | `queue_db_path` | str（可选）| 旧版兼容字段，用于覆盖 QueueFS 的 sqlite 数据库文件路径。已被 `storage.agfs.queuefs.db_path` 取代。未设置时默认为 `{storage.workspace}/_system/queue/queue.db`。适用于 workspace 卷不支持 sqlite 的场景（例如某些网络文件系统） | `null` |
 | `s3` | object | S3 backend configuration (when backend is 's3') | - |
@@ -856,6 +918,85 @@ AST 提取支持：Python、JavaScript/TypeScript、Rust、Go、Java、C/C++。�
 **配置示例**
 
 RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系统。
+
+> [!WARNING]
+> `storage.agfs` 已不再支持 AGFS HTTP client 模式，也无需再配置旧的 HTTP client 入口。当前 AGFS / RAGFS 文件系统访问仅通过 Rust binding（`RAGFSBindingClient`）在进程内完成。这不影响 OpenViking server 的 HTTP API、`ov` CLI，或 `AsyncHTTPClient` / `SyncHTTPClient` 访问 OpenViking 服务端的能力。
+
+##### 多写存储配置
+
+`storage.agfs.backups` 用于启用多写存储。未配置时，OpenViking 保持单 backend 模式。
+
+```json
+{
+  "storage": {
+    "workspace": "./data",
+    "agfs": {
+      "backend": "local",
+      "redirects": [
+        {
+          "type": "FileExtensionPolicy",
+          "extensions": ["(pdf|ppt|zip)"],
+          "target": ["s3-backup"]
+        }
+      ],
+      "backups": {
+        "sync_type": "async",
+        "items": [
+          {
+            "name": "s3-backup",
+            "backend": "s3",
+            "s3": {
+              "bucket": "openviking-backup",
+              "region": "cn-beijing",
+              "endpoint": "https://tos-s3-cn-beijing.volces.com",
+              "access_key": "your-ak",
+              "secret_key": "your-sk",
+              "prefix": "multi-write"
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+`backups` 常用字段：
+
+| 参数 | 类型 | 说明 | 默认值 |
+|------|------|------|--------|
+| `sync_type` | str | 多写同步模式，支持 `"async"` 或 `"sync"` | `"async"` |
+| `write_ack_count` | int | `sync` 模式下返回前需要的 backup 确认数 | 全部 backup |
+| `write_ack_timeout_ms` | int | `sync` 模式下等待 backup 确认的超时时间，单位毫秒 | `null` |
+| `write_concurrency` | int | 异步 backup 写入并发上限 | `null` |
+| `items` | array | backup backend 列表，每个 item 复用普通 backend 配置并增加 `name`、`operations`、`excludes`、`encryption` 等字段 | `[]` |
+
+`redirects` 常用字段：
+
+| 参数 | 类型 | 说明 | 默认值 |
+|------|------|------|--------|
+| `type` | str | 策略类型，支持 `"FileExtensionPolicy"` 或 `"FileOverSizePolicy"` | 必填 |
+| `extensions` | array | `FileExtensionPolicy` 使用的扩展名正则列表，例如 `["(pdf\|ppt)"]` | `[]` |
+| `max_size_mb` | int | `FileOverSizePolicy` 使用的文件大小阈值，单位 MB | `null` |
+| `target` | array | 命中策略后写入的 backup `name` 列表 | 必填 |
+
+按文件大小重定向示例：
+
+```json
+{
+  "type": "FileOverSizePolicy",
+  "max_size_mb": 100,
+  "target": ["s3-backup"]
+}
+```
+
+注意：
+
+- `redirects` 配置在顶层 `storage.agfs`，表示 primary 的重定向策略。
+- `target` 必须引用 `backups.items[]` 中已经定义的 backup `name`。
+- 命中 redirect 的文件仍会通过普通文件系统 API 呈现为可读、可列举的文件。
+
+更多配置示例见 [多写存储指南](./13-multi-write-storage.md)。
 
 ##### QueueFS 配置
 
@@ -935,6 +1076,7 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 | `prefix` | str | 用于命名空间隔离的可选键前缀 | "" |
 | `use_ssl` | bool | 为 S3 连接启用/禁用 SSL（HTTPS）。也用于决定 `endpoint` 仅填主机名时自动补的协议前缀 | true |
 | `use_path_style` | bool | true 表示对 MinIO 和某些 S3 兼容服务使用 PathStyle；false 表示对 TOS 和某些 S3 兼容服务使用 VirtualHostStyle | true |
+| `auto_detect_content_type` | bool | 上传时根据 object key / 文件名后缀自动推断 MIME 类型，并写入 S3 对象的 `Content-Type` | false |
 | `directory_marker_mode` | str | 目录 marker 的持久化方式，可选 `none`、`empty`、`nonempty` | `"empty"` |
 | `normalize_encoding_chars` | str | 需要在 S3 object key 中转义为 `!HH` 十六进制字节的字符集合；空字符串表示关闭编码 | `"?#%+@"` |
 
@@ -956,6 +1098,32 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 - 被转义的字节会编码成 `!HH`，其中 `HH` 是该字节的大写十六进制值。
 - 没有列在 `normalize_encoding_chars` 里的字符，包括中文和其他 Unicode 字符，都会保持原样。
 - 设为 `""` 时，会在 object key 中保留原始路径段。
+
+`auto_detect_content_type` 默认关闭，以兼容历史行为。开启后，RAGFS 会根据 object key / 文件名后缀推断 MIME 类型，并写入 S3 对象的 `Content-Type`：
+
+- 探测依据是 object key / 文件名后缀，不做文件内容 sniff。
+- key 以 `/` 结尾的目录 marker 不会写 `Content-Type`。
+- 无法识别的后缀会回退到 `application/octet-stream`。
+
+示例：
+
+```json
+{
+  "storage": {
+    "agfs": {
+      "backend": "s3",
+      "s3": {
+        "bucket": "my-bucket",
+        "endpoint": "s3.amazonaws.com",
+        "region": "us-east-1",
+        "access_key": "your-ak",
+        "secret_key": "your-sk",
+        "auto_detect_content_type": true
+      }
+    }
+  }
+}
+```
 
 <details>
 <summary><b>PathStyle S3</b></summary>
@@ -1013,7 +1181,7 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 
 | 参数 | 类型 | 说明 | 默认值 |
 |------|------|------|--------|
-| `backend` | str | VectorDB 后端类型: 'local'（基于文件）, 'http'（远程服务）, 'volcengine'（云上VikingDB）或 'vikingdb'（私有部署） | "local" |
+| `backend` | str | VectorDB 后端类型: 'local'（基于文件）, 'http'（远程服务）, 'volcengine'（云上 VikingDB）, 'vikingdb'（私有部署）, 'qdrant' 或 'opengauss' | "local" |
 | `name` | str | VectorDB 的集合名称 | "context" |
 | `url` | str | 'http' 类型的远程服务 URL（例如 'http://localhost:5000'） | null |
 | `project_name` | str | 项目名称（别名 project） | "default" |
@@ -1022,6 +1190,8 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 | `sparse_weight` | float | 混合向量搜索的稀疏权重，仅在使用混合索引时生效 | 0.0 |
 | `volcengine` | object | 'volcengine' 类型的 VikingDB 配置 | - |
 | `vikingdb` | object | 'vikingdb' 类型的私有部署配置 | - |
+| `qdrant` | object | 'qdrant' 类型的 Qdrant 配置 | - |
+| `opengauss` | object | 'opengauss' 原生向量后端配置 | - |
 
 默认使用本地模式
 ```
@@ -1053,6 +1223,39 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
   }
 }
 ```
+</details>
+
+<details>
+<summary><b>openGauss</b></summary>
+
+需要 openGauss 服务端支持原生 `vector` 类型，并使用允许远程连接的数据库用户。
+可通过 `pip install "openviking[opengauss]"` 安装可选驱动。
+官方容器中的初始 `omm` 用户可能限制远程登录，必要时请为 OpenViking 创建普通数据库用户。
+
+```json
+{
+  "storage": {
+    "vectordb": {
+      "name": "context",
+      "backend": "opengauss",
+      "project": "default",
+      "distance_metric": "cosine",
+      "dimension": 1024,
+      "opengauss": {
+        "host": "127.0.0.1",
+        "port": 5432,
+        "user": "openviking",
+        "password": "your-password",
+        "db_name": "postgres",
+        "schema": "public",
+        "mode": "standalone"
+      }
+    }
+  }
+}
+```
+
+分布式 openGauss 部署可将 `mode` 设为 `"distributed"`；OpenViking 会尝试把元数据表标记为 reference table，并按 `id` 分布集合表。
 </details>
 
 
@@ -1088,20 +1291,20 @@ openviking-server --config /path/to/ov.conf
 ```json
 {
   "memory": {
-    "agent_scope_mode": "user+agent"
+    "version": "v2"
   }
 }
 ```
 
 | 字段 | 说明 | 默认值 |
 |------|------|--------|
-| `agent_scope_mode` | 已废弃且被忽略。仅为兼容旧版 `ov.conf` 保留。当前 agent/user 命名空间行为由 account 级 namespace policy 控制。 | `"user+agent"` |
-
-`agent_scope_mode` 不再影响命名空间行为。服务端现在根据 account 级 namespace policy 在 `viking://agent/{agent_id}/...` 与 `viking://agent/{agent_id}/user/{user_id}/...` 之间选择。
+| `version` | 记忆实现版本。仅支持 `"v2"`（#2264 已移除旧版 `"v1"`；传入 `"v1"` 会在配置加载时抛出 `ValueError`）。 | `"v2"` |
 
 ### ovcli.conf
 
-你可以手动编辑此文件，也可以用 `ov config setup-cli` 交互式生成。如果你维护着多个服务端的配置，可以用 `ov config switch` 在它们之间切换。
+你可以手动编辑此文件，也可以用 `ov config` 交互式生成。如果你维护着多个服务端的配置，可以用 `ov config switch` 在它们之间切换。
+
+如需按步骤配置 CLI，请阅读 [OpenViking CLI 配置指南](../getting-started/05-cli-setup.md)。
 
 HTTP 客户端（`SyncHTTPClient` / `AsyncHTTPClient`）和 CLI 工具连接远程服务端的配置文件：
 
@@ -1109,9 +1312,6 @@ HTTP 客户端（`SyncHTTPClient` / `AsyncHTTPClient`）和 CLI 工具连接远�
 {
   "url": "http://localhost:1933",
   "api_key": "your-secret-key",
-  "account": "acme",
-  "user": "alice",
-  "agent_id": "my-agent",
   "profile": false,
   "upload": {
     "mode": "local",
@@ -1126,9 +1326,8 @@ HTTP 客户端（`SyncHTTPClient` / `AsyncHTTPClient`）和 CLI 工具连接远�
 |------|------|--------|
 | `url` | 服务端地址 | （必填） |
 | `api_key` | API Key 认证（root key 或 user key） | `null`（无认证） |
-| `account` | 默认发送为 `X-OpenViking-Account` 的租户标识 | `null` |
-| `user` | 默认发送为 `X-OpenViking-User` 的用户标识 | `null` |
-| `agent_id` | Agent 标识，用于 agent space 隔离 | `null` |
+| `account` | 可选的 trusted 模式 account 身份 header | `null` |
+| `user` | 可选的 trusted 模式 user 身份 header | `null` |
 | `profile` | 是否默认给 HTTP 请求追加 `profile=1`。对 Python HTTP client 和 `ov` CLI 都生效；也可通过 CLI 的 `--profile` 单次开启。是否真正生效还取决于服务端是否开启 `server.profile_enabled`。 | `false` |
 | `upload.ignore_dirs` | `add-resource` 默认忽略目录列表（CSV） | `null` |
 | `upload.include` | `add-resource` 默认包含模式（CSV） | `null` |
@@ -1137,10 +1336,10 @@ HTTP 客户端（`SyncHTTPClient` / `AsyncHTTPClient`）和 CLI 工具连接远�
 
 本地目录上传会默认遵循 `.gitignore`（根目录和子目录，含 `!` 反向规则）。`ignore_dirs/include/exclude` 会在此基础上进一步过滤。
 
-也可以在单次命令里用 CLI 参数覆盖这些身份字段：
+trusted 网关部署下，也可以在单次命令里用 CLI 参数覆盖这些身份字段：
 
 ```bash
-openviking --account acme --user alice --agent-id assistant-2 ls viking://
+openviking --account acme --user alice ls viking://
 ```
 
 对于 `add-resource`，上传过滤参数会与 `ovcli.conf` 默认值做合并（追加），不会覆盖：
@@ -1312,25 +1511,17 @@ openviking add-resource ./docs --exclude "*.tmp"
 
 路径锁机制的详细说明见 [路径锁与崩溃恢复](../concepts/09-transaction.md)。
 
-## storage.task_tracker 段
+## Task Tracker 持久化
 
-任务跟踪器记录异步任务状态，适用于返回 `task_id` 的接口（任务类型包括 `session_commit`、`add_resource`、`add_skill`、`admin_reindex`）。`persistent` 后端把任务状态写到 workspace 卷上，因此**一个实例返回的 `task_id` 可以在另一个实例上查询**，并且任务历史在重启后仍可访问。默认 `memory` 后端把任务状态保留在进程内存中——适合单实例部署。
+任务跟踪器记录异步任务状态，适用于返回 `task_id` 的接口（任务类型包括 `session_commit`、`add_resource`、`add_skill`、`admin_reindex`）。Task 记录始终持久化到 AGFS，因此一个实例返回的 `task_id` 可以在另一个实例上查询，任务历史也能在重启后继续访问。
 
-```json
-{
-  "storage": {
-    "task_tracker": {
-      "backend": "memory"
-    }
-  }
-}
+无需配置 `storage.task_tracker`。如果旧配置里仍包含 `storage.task_tracker`，OpenViking 会记录 warning 并忽略它。
+
+Task 记录文件位于所属账号的系统目录：
+
+```text
+/local/{account_id}/_system/tasks/{user_id}/{task_id}.json
 ```
-
-| 参数 | 类型 | 说明 | 默认值 |
-|------|------|------|--------|
-| `backend` | str | 任务跟踪器后端。`"memory"` 把任务状态保留在进程内存（单实例）；`"persistent"` 启用跨实例任务查询并在重启后仍可访问 | `"memory"` |
-
-多实例部署中如果调用方可能从任一实例 poll `GET /api/v1/tasks/{task_id}`，或者任务历史需要超过进程生命周期，请把 `backend` 设为 `"persistent"`。
 
 ## 完整 Schema
 
@@ -1356,7 +1547,7 @@ openviking add-resource ./docs --exclude "*.tmp"
     "model": "string",
     "api_base": "string",
     "thinking": false,
-    "max_concurrent": 100,
+    "max_concurrent": 64,
     "max_retries": 3,
     "extra_headers": {},
     "extra_request_body": {},

@@ -136,7 +136,7 @@ Phase 3 会等待异步 commit 完成（默认最多 300 秒）。这是正常�
 | `--openviking <url>` | 自动 | OpenViking 地址 |
 | `--token <token>` | 自动 | Gateway bearer token |
 | `--openviking-api-key <key>` | 自动 | OpenViking API key |
-| `--agent-id <id>` | `default` | OpenViking agent id |
+| `--actor-peer <id>` | `main` | OpenViking 直连检查请求使用的 actor peer |
 | `--user-id <id>` | 随机 | 测试会话的 user id |
 | `--openclaw-config <path>` | 自动 | `openclaw.json` 路径 |
 | `--chat-timeout <秒>` | `120` | 每次 Gateway 聊天请求的超时 |

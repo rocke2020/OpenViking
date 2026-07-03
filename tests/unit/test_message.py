@@ -6,7 +6,9 @@
 import json
 from datetime import datetime, timezone
 
-from openviking.message import ContextPart, Message, TextPart, ToolPart
+import pytest
+
+from openviking.message import ContextPart, ImagePart, Message, TextPart, ToolPart
 from openviking.message.part import part_from_dict
 
 
@@ -108,6 +110,29 @@ class TestContextPart:
         assert part.context_type == "resource"
 
 
+class TestImagePart:
+    """Test ImagePart dataclass."""
+
+    def test_default_values(self):
+        """Test default values."""
+        part = ImagePart()
+
+        assert part.url == ""
+        assert part.detail is None
+        assert part.type == "image_url"
+
+    def test_custom_values(self):
+        """Test custom values."""
+        part = ImagePart(
+            url="https://example.com/image.png",
+            detail="auto",
+        )
+
+        assert part.url == "https://example.com/image.png"
+        assert part.detail == "auto"
+        assert part.type == "image_url"
+
+
 class TestToolPart:
     """Test ToolPart dataclass."""
 
@@ -136,7 +161,7 @@ class TestToolPart:
             tool_id="call-123",
             tool_name="search",
             tool_uri="viking://session/test/tools/call-123",
-            skill_uri="viking://agent/test/skills/search",
+            skill_uri="viking://user/test/skills/search",
             tool_input={"query": "test"},
             tool_output="Result",
             tool_status="completed",
@@ -155,7 +180,7 @@ class TestToolPart:
         assert part.tool_id == "call-123"
         assert part.tool_name == "search"
         assert part.tool_uri == "viking://session/test/tools/call-123"
-        assert part.skill_uri == "viking://agent/test/skills/search"
+        assert part.skill_uri == "viking://user/test/skills/search"
         assert part.tool_input == {"query": "test"}
         assert part.tool_output == "Result"
         assert part.tool_status == "completed"
@@ -232,7 +257,7 @@ class TestPartFromDict:
             "tool_id": "call-123",
             "tool_name": "search",
             "tool_uri": "viking://session/test/tools/call-123",
-            "skill_uri": "viking://agent/test/skills/search",
+            "skill_uri": "viking://user/test/skills/search",
             "tool_input": {"query": "test"},
             "tool_output": "Result",
             "tool_status": "completed",
@@ -257,6 +282,37 @@ class TestPartFromDict:
         assert part.tool_output_original_chars == 1000
         assert part.tool_output_preview_chars == 100
         assert part.tool_output_sha256 == "abc123"
+
+    def test_image_part_from_openai_style_dict(self):
+        """Test creating ImagePart from OpenAI-style image_url dict."""
+        data = {
+            "type": "image_url",
+            "image_url": {"url": "https://example.com/image.png", "detail": "high"},
+        }
+
+        part = part_from_dict(data)
+
+        assert isinstance(part, ImagePart)
+        assert part.url == "https://example.com/image.png"
+        assert part.detail == "high"
+
+    def test_image_part_rejects_flat_dict(self):
+        """OpenAI-style image_url payloads require the nested image_url shape."""
+        data = {"type": "image_url", "url": "https://example.com/image.png"}
+
+        with pytest.raises(ValueError, match="image_url part requires a non-empty URL"):
+            part_from_dict(data)
+
+    def test_image_part_rejects_missing_url(self):
+        """Test image_url parts require a non-empty URL."""
+        data = {"type": "image_url", "image_url": {}}
+
+        try:
+            part_from_dict(data)
+        except ValueError as exc:
+            assert "image_url part requires a non-empty URL" in str(exc)
+        else:
+            raise AssertionError("Expected ValueError for missing image URL")
 
     def test_unknown_type_defaults_to_text(self):
         """Test unknown type defaults to TextPart."""
@@ -473,6 +529,30 @@ class TestMessageToDict:
         assert d["parts"][0]["tool_output_preview_chars"] == 100
         assert d["parts"][0]["tool_output_externalized_reason"] == "single_threshold"
 
+    def test_to_dict_with_image_part(self):
+        """Test to_dict with ImagePart."""
+        msg = Message(
+            id="msg-1",
+            role="user",
+            parts=[
+                TextPart(text="Look at this"),
+                ImagePart(
+                    url="https://example.com/image.png",
+                    detail="auto",
+                ),
+            ],
+        )
+
+        d = msg.to_dict()
+
+        assert d["parts"][1] == {
+            "type": "image_url",
+            "image_url": {
+                "url": "https://example.com/image.png",
+                "detail": "auto",
+            },
+        }
+
     def test_to_dict_timestamp_format(self):
         """Test timestamp format in to_dict."""
         now = datetime(2026, 3, 26, 10, 30, 0, tzinfo=timezone.utc)
@@ -561,6 +641,31 @@ class TestMessageFromDict:
         assert msg.parts[0].tool_output_preview_chars == 100
         assert msg.parts[0].tool_output_externalized_reason == "single_threshold"
 
+    def test_from_dict_with_image_part(self):
+        """Test from_dict with ImagePart."""
+        d = {
+            "id": "msg-1",
+            "role": "user",
+            "parts": [
+                {"type": "text", "text": "Look at this"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://example.com/image.png",
+                        "detail": "auto",
+                    },
+                },
+            ],
+            "created_at": "2026-03-26T10:30:00Z",
+        }
+
+        msg = Message.from_dict(d)
+
+        assert isinstance(msg.parts[0], TextPart)
+        assert isinstance(msg.parts[1], ImagePart)
+        assert msg.parts[1].url == "https://example.com/image.png"
+        assert msg.parts[1].detail == "auto"
+
     def test_from_dict_supports_legacy_content_only_messages(self):
         """Legacy messages with only content should load as a TextPart."""
         d = {
@@ -607,7 +712,7 @@ class TestMessageFromDict:
             "content": "Legacy message",
             "created_at": "2026-03-26T10:30:00Z",
         }
-        fresh = Message.create_user("Fresh message", msg_id="msg-fresh")
+        fresh = Message(id="msg-fresh", role="user", parts=[TextPart("Fresh message")])
 
         reloaded_messages = [Message.from_dict(legacy_row), Message.from_dict(fresh.to_dict())]
 
@@ -623,86 +728,8 @@ class TestMessageFromDict:
         ]
 
 
-class TestMessageFactoryMethods:
-    """Test Message factory methods."""
-
-    def test_create_user(self):
-        """Test create_user factory method."""
-        msg = Message.create_user("Hello, assistant!")
-
-        assert msg.role == "user"
-        assert msg.content == "Hello, assistant!"
-        assert len(msg.parts) == 1
-        assert msg.id.startswith("msg_")
-
-    def test_create_user_with_id(self):
-        """Test create_user with custom ID."""
-        msg = Message.create_user("Hello", msg_id="custom-id")
-
-        assert msg.id == "custom-id"
-
-    def test_create_assistant(self):
-        """Test create_assistant factory method."""
-        msg = Message.create_assistant("Hello, user!")
-
-        assert msg.role == "assistant"
-        assert msg.content == "Hello, user!"
-        assert len(msg.parts) == 1
-
-    def test_create_assistant_with_context_refs(self):
-        """Test create_assistant with context references."""
-        msg = Message.create_assistant(
-            content="Here's what I found:",
-            context_refs=[
-                {"uri": "viking://test/1.md", "context_type": "memory"},
-                {"uri": "viking://test/2.md", "context_type": "resource"},
-            ],
-        )
-
-        assert msg.role == "assistant"
-        assert len(msg.parts) == 3  # 1 text + 2 context
-
-    def test_create_assistant_with_tool_calls(self):
-        """Test create_assistant with tool calls."""
-        msg = Message.create_assistant(
-            content="Let me search for that.",
-            tool_calls=[
-                {"id": "call-1", "name": "search", "uri": "viking://tools/1"},
-            ],
-        )
-
-        assert msg.role == "assistant"
-        assert len(msg.parts) == 2  # 1 text + 1 tool
-
-    def test_create_assistant_empty(self):
-        """Test create_assistant with no content."""
-        msg = Message.create_assistant()
-
-        assert msg.role == "assistant"
-        assert msg.content == ""
-        assert len(msg.parts) == 0
-
-
 class TestMessageMethods:
     """Test Message methods."""
-
-    def test_get_context_parts(self):
-        """Test get_context_parts method."""
-        msg = Message(
-            id="msg-1",
-            role="assistant",
-            parts=[
-                TextPart(text="Hello"),
-                ContextPart(uri="viking://test/1.md"),
-                TextPart(text="More text"),
-                ContextPart(uri="viking://test/2.md"),
-            ],
-        )
-
-        context_parts = msg.get_context_parts()
-
-        assert len(context_parts) == 2
-        assert all(isinstance(p, ContextPart) for p in context_parts)
 
     def test_get_tool_parts(self):
         """Test get_tool_parts method."""

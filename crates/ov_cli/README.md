@@ -27,8 +27,7 @@ Create `~/.openviking/ovcli.conf`:
   "url": "http://localhost:1933",
   "api_key": "your-api-key",
   "account": "acme",
-  "user": "alice",
-  "agent_id": "assistant-1"
+  "user": "alice"
 }
 ```
 
@@ -105,6 +104,9 @@ ov read viking://resources/...
 - `config show` - Show configuration
 - `config validate` - Validate config
 
+### Display
+- `language` (`lang`) - Choose CLI display language (`en` / `zh-CN`)
+
 ## Output Formats
 
 ```bash
@@ -132,7 +134,7 @@ ov find "API authentication" --threshold 0.7 --limit 5
 ov ls viking://resources --recursive
 
 # Temporarily override identity from CLI flags
-ov --account acme --user alice --agent-id assistant-2 ls viking://
+ov --account acme --user alice ls viking://
 
 # Glob search
 ov glob "**/*.md" --uri viking://resources
@@ -149,9 +151,16 @@ ov session commit --session-id $SESSION
 # Build
 cargo build --release
 
+# Smoke the exact binary that was built
+target/release/ov --version
+target/release/ov -o json system health
+
 # Run tests
 cargo test
 
 # Install locally
 cargo install --path .
 ```
+
+When driving external e2e harnesses, point them at `target/release/ov` explicitly
+instead of relying on an older `ov` that may already be installed on `PATH`.

@@ -59,7 +59,9 @@ OpenVikingを使えば、開発者はローカルファイルを管理するよ�
 
 ## クイックスタート
 
-### 前提条件
+### ローカルデプロイ
+
+#### 前提条件
 
 OpenVikingを始める前に、環境が以下の要件を満たしていることを確認してください：
 
@@ -69,15 +71,15 @@ OpenVikingを始める前に、環境が以下の要件を満たしているこ�
 - **オペレーティングシステム**: Linux、macOS、Windows
 - **ネットワーク接続**: 安定したネットワーク接続が必要（依存関係のダウンロードとモデルサービスへのアクセスのため）
 
-### 1. インストール
+#### 1. インストール
 
-#### Pythonパッケージ
+##### Pythonパッケージ
 
 ```bash
 pip install openviking --upgrade --force-reinstall
 ```
 
-#### Rust CLI（オプション）
+##### Rust CLI（オプション）
 
 ```bash
 npm i -g @openviking/cli
@@ -89,13 +91,13 @@ npm i -g @openviking/cli
 cargo install --git https://github.com/volcengine/OpenViking ov_cli
 ```
 
-### 2. モデルの準備
+#### 2. モデルの準備
 
 OpenVikingには以下のモデル機能が必要です：
 - **VLMモデル**: 画像とコンテンツの理解用
 - **Embeddingモデル**: ベクトル化とセマンティック検索用
 
-#### サポートされているVLMプロバイダー
+##### サポートされているVLMプロバイダー
 
 OpenVikingは3つのVLMプロバイダーをサポートしています：
 
@@ -104,7 +106,7 @@ OpenVikingは3つのVLMプロバイダーをサポートしています：
 | `volcengine` | Volcengine Doubaoモデル | [Volcengineコンソール](https://console.volcengine.com/ark/region:ark+cn-beijing/overview?briefPage=0&briefType=introduce&type=new&utm_content=OpenViking&utm_medium=devrel&utm_source=OWO&utm_term=OpenViking) |
 | `openai` | OpenAI公式API | [OpenAIプラットフォーム](https://platform.openai.com) |
 
-#### プロバイダー固有の注意事項
+##### プロバイダー固有の注意事項
 
 <details>
 <summary><b>Volcengine（Doubao）</b></summary>
@@ -168,9 +170,9 @@ OpenAIの公式APIを使用：
 
 </details>
 
-### 3. 環境設定
+#### 3. 環境設定
 
-#### サーバー設定テンプレート
+##### サーバー設定テンプレート
 
 設定ファイル `~/.openviking/ov.conf` を作成します。コピー前にコメントを削除してください：
 
@@ -205,7 +207,7 @@ OpenAIの公式APIを使用：
 
 > **注意**: Embeddingモデルについては、`volcengine`（Doubao）、`openai`、`azure`、`jina`、`ollama`、`voyage`、`dashscope`、`minimax`、`cohere`、`vikingdb`、`gemini`（`pip install "google-genai>=1.0.0"` が必要）、`litellm`、`local` プロバイダーがサポートされています。VLMモデルについては、`volcengine`、`openai`、`openai-codex`、`kimi`、`glm` をサポートしています。
 
-#### サーバー設定例
+##### サーバー設定例
 
 👇 お使いのモデルサービスの設定例を展開して確認：
 
@@ -277,7 +279,7 @@ OpenAIの公式APIを使用：
 
 </details>
 
-#### サーバー設定の環境変数の設定
+##### サーバー設定の環境変数の設定
 
 設定ファイルを作成後、環境変数を設定してファイルを指定します（Linux/macOS）：
 
@@ -301,7 +303,7 @@ set "OPENVIKING_CONFIG_FILE=%USERPROFILE%\.openviking\ov.conf"
 
 > 💡 **ヒント**: 設定ファイルは他の場所に配置することもできます。環境変数で正しいパスを指定するだけです。
 
-#### CLI/クライアント設定例
+##### CLI/クライアント設定例
 
 👇 CLI/クライアントの設定例を展開して確認：
 
@@ -334,13 +336,13 @@ $env:OPENVIKING_CLI_CONFIG_FILE = "$HOME/.openviking/ovcli.conf"
 set "OPENVIKING_CLI_CONFIG_FILE=%USERPROFILE%\.openviking\ovcli.conf"
 ```
 
-### 4. 最初の例を実行
+#### 4. 最初の例を実行
 
 > 📝 **前提条件**: 前のステップで設定（ov.confとovcli.conf）が完了していることを確認してください。
 
 それでは、完全な例を実行してOpenVikingのコア機能を体験しましょう。
 
-#### サーバーの起動
+##### サーバーの起動
 
 ```bash
 openviking-server
@@ -352,7 +354,7 @@ openviking-server
 nohup openviking-server > /data/log/openviking.log 2>&1 &
 ```
 
-#### CLIの実行
+##### CLIの実行
 
 ```bash
 ov status
@@ -365,6 +367,10 @@ ov grep "openviking" --uri viking://resources/volcengine/OpenViking/docs/zh
 ```
 
 おめでとうございます！OpenVikingの実行に成功しました 🎉
+
+### 商用版へのアクセス
+
+OpenViking Personal が正式に提供開始されました。オープンソース版と比較して、Service 版は公式にホスティングされてすぐに利用でき、VikingDB によりローカルハードウェアをはるかに超える規模までスケールし、より豊富な統合機能とプロフェッショナルサポートが付属します。最大 50 ファイルまでの無料トライアルが含まれており、既存のオープンソース版ユーザーは移行ツールを使ってスムーズに乗り換えることができます。
 
 ### VikingBotクイックスタート
 
@@ -418,7 +424,7 @@ OpenViking統合後：
 
 👉 **[参照: OpenClawコンテキストプラグイン](examples/openclaw-plugin/README.md)**
 
-👉 **[参照: OpenCodeメモリプラグインの例](examples/opencode-memory-plugin/README.md)**
+👉 **[参照: OpenCode統合プラグイン](examples/opencode-plugin/README.md)**
 
 👉 **[参照: Claude Codeメモリプラグインの例](examples/claude-code-memory-plugin/README.md)**
 

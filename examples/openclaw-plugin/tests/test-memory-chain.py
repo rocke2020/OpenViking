@@ -161,7 +161,7 @@ class OpenVikingInspector:
         if self.api_key:
             h["X-API-Key"] = self.api_key
         if self.agent_id:
-            h["X-OpenViking-Agent"] = self.agent_id
+            h["X-OpenViking-Actor-Peer"] = self.agent_id
         return h
 
     def _get(self, path: str, timeout: int = 10) -> dict | None:

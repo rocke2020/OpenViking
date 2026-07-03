@@ -15,35 +15,36 @@ name = "ragfs"
 path = "src/lib.rs"
 
 [[bin]]
-name = "ragfs-server"
-path = "src/server/main.rs"
-
-[[bin]]
 name = "ragfs-shell"
 path = "src/shell/main.rs"
+
+[[test]]
+name = "cache_wrapper"
+path = "tests/cache_wrapper.rs"
+required-features = ["cache"]
 
 [dependencies]
 # Async runtime
 tokio = { version = "1.38", features = ["full"] }
 async-trait = "0.1"
 
-# HTTP server
-axum = "0.7"
-tower = "0.5"
-tower-http = { version = "0.5", features = ["trace", "cors"] }
-hyper = "1.0"
-
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yaml = "0.9"
-
-# Configuration
-clap = { version = "4.5", features = ["derive", "env"] }
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Git (gitoxide)
+gix-hash = "0.14"
+gix-object = "0.42"
+gix-features = { version = "0.38", features = ["zlib"] }
+gix-actor = "0.31"
+gix-date = "0.8"
+
+# Git backend dependencies
+dashmap = "5.0"
+flate2 = "1.0"
 
 # Path handling and filesystem
 path-clean = "1.0"
@@ -78,6 +79,13 @@ lru = "0.12"
 
 # Regular expressions for grep
 regex = "1.10"
+mime_guess = "2.0"
+
+# Encryption (envelope encryption: AES-256-GCM + HKDF-SHA256)
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
 
 # Stream combinators for concurrent I/O
 futures = "0.3"
@@ -93,17 +101,17 @@ grep-searcher = "0.1.16"
 [dev-dependencies]
 tempfile = "3.12"
 criterion = "0.5"
+tokio = { version = "1.38", features = ["full"] }
+toml = "0.8"
+# Used by the S3/TOS git integration tests (crates/ragfs/tests/git_s3_integration.rs)
+gix-hash = "0.14"
+gix-object = "0.42"
+bytes = "1.5"
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["v4"] }
 
 [features]
 default = []
+cache = []
 s3 = ["aws-sdk-s3", "aws-config", "aws-types"]
-full = ["s3"]
-
-[profile.release]
-opt-level = 3
-lto = true
-strip = true
-codegen-units = 1
-
-[profile.dev]
-opt-level = 0
+full = ["s3", "cache"]

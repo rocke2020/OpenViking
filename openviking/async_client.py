@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Union
 from openviking.client import LocalClient, Session
 from openviking.service.debug_service import SystemStatus
 from openviking.telemetry import TelemetryRequest
+from openviking.utils.search_filters import SearchContextTypeInput
 from openviking_cli.client.base import BaseClient
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger
@@ -46,14 +47,16 @@ class AsyncOpenViking:
     def __init__(
         self,
         path: Optional[str] = None,
-        **kwargs,
+        actor_peer_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
     ):
         """
         Initialize OpenViking client (embedded mode).
 
         Args:
             path: Local storage path (overrides ov.conf storage path).
-            **kwargs: Additional configuration parameters.
+            actor_peer_id: Optional view filter for the current user's peer collection.
+            agent_id: Legacy alias for actor_peer_id.
         """
         # Singleton guard for repeated initialization
         if hasattr(self, "_singleton_initialized") and self._singleton_initialized:
@@ -61,11 +64,14 @@ class AsyncOpenViking:
 
         self.user = UserIdentifier.the_default_user()
         self._initialized = False
+        self._snapshot: Optional["AsyncSnapshotNamespace"] = None
         # Mark initialized only after LocalClient is successfully constructed.
         self._singleton_initialized = False
 
         self._client: BaseClient = LocalClient(
             path=path,
+            actor_peer_id=actor_peer_id,
+            agent_id=agent_id,
         )
         self._singleton_initialized = True
 
@@ -129,7 +135,10 @@ class AsyncOpenViking:
         return await self._client.session_exists(session_id)
 
     async def create_session(
-        self, session_id: Optional[str] = None, telemetry: TelemetryRequest = False
+        self,
+        session_id: Optional[str] = None,
+        telemetry: TelemetryRequest = False,
+        memory_policy: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Create a new session.
 
@@ -138,7 +147,11 @@ class AsyncOpenViking:
                        If None, creates a new session with auto-generated ID.
         """
         await self._ensure_initialized()
-        return await self._client.create_session(session_id, telemetry=telemetry)
+        return await self._client.create_session(
+            session_id,
+            telemetry=telemetry,
+            memory_policy=memory_policy,
+        )
 
     async def list_sessions(self) -> List[Any]:
         """List all sessions."""
@@ -174,7 +187,7 @@ class AsyncOpenViking:
         content: str | None = None,
         parts: list[dict] | None = None,
         created_at: str | None = None,
-        role_id: str | None = None,
+        peer_id: str | None = None,
         telemetry: TelemetryRequest = False,
     ) -> Dict[str, Any]:
         """Add a message to a session.
@@ -183,9 +196,9 @@ class AsyncOpenViking:
             session_id: Session ID
             role: Message role ("user" or "assistant")
             content: Text content (simple mode)
-            parts: Parts array (full Part support: TextPart, ContextPart, ToolPart)
+            parts: Parts array (full Part support: TextPart, ContextPart, ImagePart, ToolPart)
             created_at: Message creation time (ISO format string)
-            role_id: Optional explicit actor identity. Omit to let the client/server derive it.
+            peer_id: Optional stable interaction peer identity.
 
         If both content and parts are provided, parts takes precedence.
         """
@@ -196,21 +209,59 @@ class AsyncOpenViking:
             content=content,
             parts=parts,
             created_at=created_at,
-            role_id=role_id,
+            peer_id=peer_id,
+            telemetry=telemetry,
+        )
+
+    async def batch_add_messages(
+        self,
+        session_id: str,
+        messages: list[dict],
+        telemetry: TelemetryRequest = False,
+    ) -> Dict[str, Any]:
+        """Add multiple messages to a session in a single request."""
+        await self._ensure_initialized()
+        return await self._client.batch_add_messages(
+            session_id=session_id,
+            messages=messages,
             telemetry=telemetry,
         )
 
     async def commit_session(
-        self, session_id: str, telemetry: TelemetryRequest = False
+        self,
+        session_id: str,
+        telemetry: TelemetryRequest = False,
+        *,
+        keep_recent_count: int = 0,
     ) -> Dict[str, Any]:
         """Commit a session (archive and extract memories)."""
         await self._ensure_initialized()
-        return await self._client.commit_session(session_id, telemetry=telemetry)
+        return await self._client.commit_session(
+            session_id,
+            telemetry=telemetry,
+            keep_recent_count=keep_recent_count,
+        )
 
     async def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
         """Query background task status."""
         await self._ensure_initialized()
         return await self._client.get_task(task_id)
+
+    async def list_tasks(
+        self,
+        task_type: Optional[str] = None,
+        status: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """List background tasks visible to the current caller."""
+        await self._ensure_initialized()
+        return await self._client.list_tasks(
+            task_type=task_type,
+            status=status,
+            resource_id=resource_id,
+            limit=limit,
+        )
 
     async def reindex(
         self,
@@ -240,6 +291,7 @@ class AsyncOpenViking:
         build_index: bool = True,
         summarize: bool = False,
         watch_interval: float = 0,
+        args: Optional[Dict[str, Any]] = None,
         telemetry: TelemetryRequest = False,
         **kwargs,
     ) -> Dict[str, Any]:
@@ -274,12 +326,25 @@ class AsyncOpenViking:
             summarize=summarize,
             telemetry=telemetry,
             watch_interval=watch_interval,
+            args=args,
             **kwargs,
         )
 
     @property
     def _service(self):
         return self._client.service
+
+    @property
+    def snapshot(self) -> "AsyncSnapshotNamespace":
+        """Snapshot version control namespace.
+
+        Lazy-initialized on first access so importing the client does not
+        pull in the snapshot module when it's not needed.
+        """
+        if getattr(self, "_snapshot", None) is None:
+            from openviking.snapshot_namespace import AsyncSnapshotNamespace
+            self._snapshot = AsyncSnapshotNamespace(self)
+        return self._snapshot
 
     async def wait_processed(self, timeout: float = None) -> Dict[str, Any]:
         """Wait for all queued processing to complete."""
@@ -312,12 +377,16 @@ class AsyncOpenViking:
         wait: bool = False,
         timeout: float = None,
         telemetry: TelemetryRequest = False,
+        target_uri: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Add skill to OpenViking.
 
         Args:
             wait: Whether to wait for vectorization to complete
             timeout: Wait timeout in seconds
+            target_uri: Optional target root URI override. Defaults to the
+                user's private ``viking://user/{user_id}/skills`` directory.
+                Pass ``viking://agent/skills`` to install a shared skill.
         """
         await self._ensure_initialized()
         return await self._client.add_skill(
@@ -325,6 +394,111 @@ class AsyncOpenViking:
             wait=wait,
             timeout=timeout,
             telemetry=telemetry,
+            target_uri=target_uri,
+        )
+
+    async def list_skills(
+        self,
+        node_limit: int = 1000,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """List installed skills."""
+        await self._ensure_initialized()
+        return await self._client.list_skills(
+            node_limit=node_limit,
+            target_uri=target_uri,
+        )
+
+    async def find_skills(
+        self,
+        query: str,
+        limit: int = 10,
+        score_threshold: Optional[float] = None,
+        level: Optional[List[int]] = None,
+        telemetry: TelemetryRequest = False,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Find skills by semantic search."""
+        await self._ensure_initialized()
+        return await self._client.find_skills(
+            query=query,
+            limit=limit,
+            score_threshold=score_threshold,
+            level=level,
+            telemetry=telemetry,
+            target_uri=target_uri,
+        )
+
+    async def get_skill(
+        self,
+        skill_name: str,
+        include_content: Optional[bool] = None,
+        include_files: bool = True,
+        include_source: bool = False,
+        level: Optional[int] = None,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get a skill by name."""
+        await self._ensure_initialized()
+        return await self._client.get_skill(
+            skill_name=skill_name,
+            include_content=include_content,
+            include_files=include_files,
+            include_source=include_source,
+            level=level,
+            target_uri=target_uri,
+        )
+
+    async def update_skill(
+        self,
+        skill_name: str,
+        data: Any,
+        wait: bool = False,
+        timeout: Optional[float] = None,
+        source_metadata: Optional[Dict[str, Any]] = None,
+        telemetry: TelemetryRequest = False,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Update an existing skill."""
+        await self._ensure_initialized()
+        return await self._client.update_skill(
+            skill_name=skill_name,
+            data=data,
+            wait=wait,
+            timeout=timeout,
+            source_metadata=source_metadata,
+            telemetry=telemetry,
+            target_uri=target_uri,
+        )
+
+    async def delete_skill(
+        self,
+        skill_name: str,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Delete a skill."""
+        await self._ensure_initialized()
+        return await self._client.delete_skill(
+            skill_name=skill_name,
+            target_uri=target_uri,
+        )
+
+    async def validate_skill(
+        self,
+        data: Any,
+        strict: bool = False,
+        source_path: Optional[str] = None,
+        skill_dir_name: Optional[str] = None,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Validate skill data."""
+        await self._ensure_initialized()
+        return await self._client.validate_skill(
+            data=data,
+            strict=strict,
+            source_path=source_path,
+            skill_dir_name=skill_dir_name,
+            target_uri=target_uri,
         )
 
     # ============= Search methods =============
@@ -338,6 +512,8 @@ class AsyncOpenViking:
         limit: int = 10,
         score_threshold: Optional[float] = None,
         filter: Optional[Dict] = None,
+        context_type: Optional[SearchContextTypeInput] = None,
+        tags: Optional[List[str]] = None,
         telemetry: TelemetryRequest = False,
         since: Optional[str] = None,
         until: Optional[str] = None,
@@ -367,6 +543,8 @@ class AsyncOpenViking:
             limit=limit,
             score_threshold=score_threshold,
             filter=filter,
+            context_type=context_type,
+            tags=tags,
             telemetry=telemetry,
             since=since,
             until=until,
@@ -381,6 +559,8 @@ class AsyncOpenViking:
         limit: int = 10,
         score_threshold: Optional[float] = None,
         filter: Optional[Dict] = None,
+        context_type: Optional[SearchContextTypeInput] = None,
+        tags: Optional[List[str]] = None,
         telemetry: TelemetryRequest = False,
         since: Optional[str] = None,
         until: Optional[str] = None,
@@ -395,6 +575,8 @@ class AsyncOpenViking:
             limit=limit,
             score_threshold=score_threshold,
             filter=filter,
+            context_type=context_type,
+            tags=tags,
             telemetry=telemetry,
             since=since,
             until=until,
@@ -439,6 +621,24 @@ class AsyncOpenViking:
             telemetry=telemetry,
         )
 
+    async def set_tags(
+        self,
+        uri: str,
+        tags: List[str],
+        mode: str = "replace",
+        recursive: bool = False,
+        telemetry: TelemetryRequest = False,
+    ) -> Dict[str, Any]:
+        """Replace explicit retrieval tags for a file or directory."""
+        await self._ensure_initialized()
+        return await self._client.set_tags(
+            uri=uri,
+            tags=tags,
+            mode=mode,
+            recursive=recursive,
+            telemetry=telemetry,
+        )
+
     async def ls(self, uri: str, **kwargs) -> List[Any]:
         """
         List directory contents.
@@ -463,10 +663,16 @@ class AsyncOpenViking:
             show_all_hidden=show_all_hidden,
         )
 
-    async def rm(self, uri: str, recursive: bool = False) -> None:
+    async def rm(
+        self,
+        uri: str,
+        recursive: bool = False,
+        wait: bool = False,
+        timeout: Optional[float] = None,
+    ) -> None:
         """Remove resource"""
         await self._ensure_initialized()
-        await self._client.rm(uri, recursive=recursive)
+        await self._client.rm(uri, recursive=recursive, wait=wait, timeout=timeout)
 
     async def grep(
         self,
@@ -475,6 +681,7 @@ class AsyncOpenViking:
         case_insensitive: bool = False,
         node_limit: Optional[int] = None,
         exclude_uri: Optional[str] = None,
+        level_limit: int = 5,
     ) -> Dict:
         """Content search"""
         await self._ensure_initialized()
@@ -484,6 +691,7 @@ class AsyncOpenViking:
             case_insensitive=case_insensitive,
             node_limit=node_limit,
             exclude_uri=exclude_uri,
+            level_limit=level_limit,
         )
 
     async def glob(self, pattern: str, uri: str = "viking://") -> Dict:

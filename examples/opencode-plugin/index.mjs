@@ -3,8 +3,10 @@ import { fileURLToPath } from "url"
 import { initializeRuntime } from "./lib/runtime.mjs"
 import { createRepoContext } from "./lib/repo-context.mjs"
 import { createMemorySessionManager } from "./lib/memory-session.mjs"
+import { createCodeTools } from "./lib/code-tools.mjs"
 import { createMemoryTools } from "./lib/memory-tools.mjs"
 import { createMemoryRecall } from "./lib/memory-recall.mjs"
+import { createVikingUriGuard } from "./lib/viking-uri-guard.mjs"
 import { initLogger, loadConfig, log, resolveDataDir } from "./lib/utils.mjs"
 
 const pluginRoot = dirname(fileURLToPath(import.meta.url))
@@ -25,7 +27,9 @@ export async function OpenVikingPlugin({ client, directory }) {
   const repoContext = createRepoContext({ config })
   const sessionManager = createMemorySessionManager({ config, pluginRoot: dataDir })
   const recall = createMemoryRecall({ config })
+  const vikingUriGuard = createVikingUriGuard()
   const tools = createMemoryTools({ config, sessionManager, projectDirectory: directory })
+  const codeTools = createCodeTools({ config })
 
   await sessionManager.init()
 
@@ -42,7 +46,9 @@ export async function OpenVikingPlugin({ client, directory }) {
       }
     },
 
-    tool: tools,
+    "tool.execute.before": vikingUriGuard,
+
+    tool: { ...tools, ...codeTools },
 
     "experimental.chat.system.transform": (_input, output) => {
       const prompt = repoContext.getRepoSystemPrompt()
@@ -56,6 +62,16 @@ export async function OpenVikingPlugin({ client, directory }) {
       } catch (error) {
         log("WARN", "recall", "Auto recall failed", { error: error?.message ?? String(error) })
       }
+    },
+
+    "experimental.session.compacting": async (input) => {
+      log("INFO", "compaction", "OpenCode session compacting", {
+        opencode_session: input.sessionID,
+      })
+      await sessionManager.flushSession(input.sessionID, {
+        commit: true,
+        reason: "experimental.session.compacting",
+      })
     },
 
     stop: async () => {

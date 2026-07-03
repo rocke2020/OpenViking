@@ -186,7 +186,7 @@ This category is mainly used to support retrieval or indexing workflows with rel
 
 ### Memory
 
-These YAML files define the structure of different memory types. They are not single-inference prompts. Together, they determine how user memories and agent memories are stored, updated, and used by later retrieval.
+These YAML files define the structure of different memory types. They are not single-inference prompts. Together, they determine how user and peer memories are stored, updated, and used by later retrieval.
 
 - `cases`
   - Effective stage: case-memory persistence and update stage
@@ -247,6 +247,12 @@ These YAML files define the structure of different memory types. They are not si
   - Affects: tool usage experience, optimal parameters, and failure pattern accumulation
   - Purpose: defines the storage structure for tool call statistics and tool-usage experience
   - Key fields: `tool_name`, `static_desc`, `call_count`, `success_time`, `when_to_use`, `optimal_params`
+
+- `trajectories`
+  - Effective stage: agent trajectory memory persistence stage (agent-only, add-only)
+  - Affects: reusable operation contracts distilled from agent task trajectories — multi-step decisions, tool calls, and execution traces
+  - Purpose: defines compact trajectory memory for "what reusable operation/contract emerged from a task trajectory"
+  - Key fields: `trajectory_name`, `outcome`, `retrieval_anchor`, `content`
 
 ### Parsing
 
