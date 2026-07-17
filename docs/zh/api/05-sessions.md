@@ -42,7 +42,7 @@ Session API 按认证用户作用域访问会话，并返回 canonical user sess
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | session_id | str | 否 | None | 会话 ID。如果为 None，则创建一个自动生成 ID 的新会话 |
-| memory_policy | object | 否 | None | 会话默认的记忆抽取策略。可选的 `self` 和 `peer` 开关控制写入目标；可选的顶层 `memory_types` 将抽取限制为指定的 enabled memory schema。未传或为 `null` 时允许所有 enabled memory schema。非法结构或未知 memory type 会以 `InvalidArgumentError` 拒绝。 |
+| memory_policy | object | 否 | None | 会话默认的记忆抽取策略。可选的 `self` 和 `peer` 开关控制写入目标；可选的 `working_memory.enabled=false` 跳过 archive summary；可选的顶层 `memory_types` 将抽取限制为指定的 enabled memory schema。未传或为 `null` 时允许所有 enabled memory schema。非法结构或未知 memory type 会以 `InvalidArgumentError` 拒绝。 |
 
 #### 3. 使用示例
 
@@ -80,6 +80,13 @@ print(f"Session ID: {result['session_id']}")
 # 创建指定 ID 的新会话
 result = await client.create_session(session_id="my-custom-session-id")
 print(f"Session ID: {result['session_id']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+const session = await client.createSession();
+console.log(session);
 ```
 
 **Go SDK**
@@ -159,6 +166,12 @@ client = ov.Client(base_url="http://localhost:1933", api_key="your-key")
 sessions = await client.list_sessions()
 for s in sessions:
     print(f"{s['session_id']} -> {s['uri']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.listSessions());
 ```
 
 **Go SDK**
@@ -258,6 +271,12 @@ print(f"Commits: {info['commit_count']}")
 
 # 获取或创建会话
 info = await client.get_session("a1b2c3d4", auto_create=True)
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.getSession("session-id"));
 ```
 
 **Go SDK**
@@ -386,6 +405,12 @@ print(context["latest_archive_overview"])
 print(len(context["messages"]))
 ```
 
+**TypeScript SDK**
+
+```typescript
+console.log(await client.getSessionContext("session-id"));
+```
+
 **Go SDK**
 
 ```go
@@ -488,6 +513,12 @@ archive = await client.get_session_archive("a1b2c3d4", "archive_002")
 print(archive["archive_id"])
 print(archive["overview"])
 print(len(archive["messages"]))
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.getSessionArchive("session-id", "archive-id"));
 ```
 
 **Go SDK**
@@ -594,6 +625,12 @@ client = ov.Client(base_url="http://localhost:1933", api_key="your-key")
 
 # 删除会话
 await client.delete_session("a1b2c3d4")
+```
+
+**TypeScript SDK**
+
+```typescript
+await client.deleteSession("session-id");
 ```
 
 **Go SDK**
@@ -765,6 +802,12 @@ await client.add_message(
 )
 ```
 
+**TypeScript SDK**
+
+```typescript
+await client.addMessage("session-id", { role: "user", content: "Hello" });
+```
+
 **Go SDK**
 
 ```go
@@ -866,6 +909,15 @@ result = await client.batch_add_messages(
     ],
 )
 print(f"Added: {result['added']}, Total: {result['message_count']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+await client.batchAddMessages("session-id", [
+  { role: "user", content: "Hello" },
+  { role: "assistant", content: "Hi" },
+]);
 ```
 
 **Go SDK**
@@ -970,7 +1022,7 @@ curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/used \
 
 #### 1. API 实现介绍
 
-提交会话。归档消息（Phase 1）立即完成，摘要生成和记忆提取（Phase 2）在后台异步执行。返回 `task_id` 用于查询后台任务状态。
+提交会话。归档消息（Phase 1）立即完成；有消息被归档时，摘要生成和记忆提取（Phase 2）在后台异步执行。产生归档的 commit 返回 `status: "accepted"` 和 `task_id`；没有可归档内容的 no-op commit 返回 `status: "skipped"` 和 `task_id: null`。
 
 **两阶段提交流程**：
 - **Phase 1（同步）**: 快照当前消息，清空 live session，创建归档目录，写入原始消息
@@ -978,6 +1030,7 @@ curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/used \
 
 **注意事项**：
 - 同一 session 的多次快速连续 commit 会被接受；每次请求都会拿到独立的 `task_id`
+- 空 session，或所有消息都仍在 `keep_recent_count` 保留窗口内时，会同步完成并返回 `archived: false`
 - 后台 Phase 2 会按 archive 顺序串行推进：`archive_N+1` 会等待 `archive_N` 写出 `.done` 后再继续
 - 如果更早的 archive 已失败且没有 `.done`，后续 commit 会直接返回错误，直到该失败被处理
 - 如果提交的消息中包含带 `viking://resources/...` 的长期事实、评价、偏好或事件，记忆抽取会把资源保留为 markdown 链接，并写入 `MEMORY_FIELDS.resource_refs`
@@ -1036,6 +1089,12 @@ if task["status"] == "completed":
     print(f"Memories extracted: {total}")
 ```
 
+**TypeScript SDK**
+
+```typescript
+console.log(await client.commitSession("session-id"));
+```
+
 **Go SDK**
 
 ```go
@@ -1072,6 +1131,22 @@ ov session commit a1b2c3d4
     "task_id": "uuid-xxx",
     "archive_uri": "viking://user/alice/sessions/a1b2c3d4/history/archive_001",
     "archived": true
+  }
+}
+```
+
+**No-op 响应示例**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "session_id": "a1b2c3d4",
+    "status": "skipped",
+    "task_id": null,
+    "archive_uri": null,
+    "archived": false,
+    "reason": "no_messages"
   }
 }
 ```
@@ -1162,6 +1237,12 @@ client = ov.Client(base_url="http://localhost:1933", api_key="your-key")
 
 task = await client.get_task(task_id="uuid-xxx")
 print(f"Status: {task['status']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.getTask("task-id"));
 ```
 
 **Go SDK**
@@ -1281,6 +1362,12 @@ tasks = await client.list_tasks(
 )
 for task in tasks:
     print(task["task_id"], task["status"])
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.listTasks());
 ```
 
 **Go SDK**

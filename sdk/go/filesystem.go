@@ -31,6 +31,12 @@ func (c *Client) List(ctx context.Context, uri string, opts *ListOptions) ([]any
 	queryInt(query, "abs_limit", absLimit)
 	queryBool(query, "show_all_hidden", opts.ShowAllHidden)
 	queryInt(query, "node_limit", nodeLimit)
+	if opts.SortBy != "" {
+		query.Set("sort_by", opts.SortBy)
+	}
+	if opts.SortOrder != "" {
+		query.Set("sort_order", opts.SortOrder)
+	}
 	var result []any
 	err := c.doJSON(ctx, http.MethodGet, "/api/v1/fs/ls", query, nil, &result)
 	return result, err
@@ -69,6 +75,14 @@ func (c *Client) Stat(ctx context.Context, uri string) (map[string]any, error) {
 	query := url.Values{"uri": []string{NormalizeURI(uri)}}
 	var result map[string]any
 	err := c.doJSON(ctx, http.MethodGet, "/api/v1/fs/stat", query, nil, &result)
+	return result, err
+}
+
+// Attrs returns logical extended attributes for a URI.
+func (c *Client) Attrs(ctx context.Context, uri string) (map[string]any, error) {
+	query := url.Values{"uri": []string{NormalizeURI(uri)}}
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/fs/attrs", query, nil, &result)
 	return result, err
 }
 
@@ -176,7 +190,7 @@ func (c *Client) SetTags(ctx context.Context, uri string, tags []string, opts *S
 	}
 	setAny(payload, "telemetry", opts.Telemetry)
 	var result map[string]any
-	err := c.doJSON(ctx, http.MethodPost, "/api/v1/content/set_tags", nil, payload, &result)
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/fs/attrs/set_tags", nil, payload, &result)
 	return result, err
 }
 
@@ -190,9 +204,10 @@ func (c *Client) Reindex(ctx context.Context, uri string, opts *ReindexOptions) 
 		mode = "vectors_only"
 	}
 	payload := map[string]any{
-		"uri":  NormalizeURI(uri),
-		"mode": mode,
-		"wait": opts.Wait,
+		"uri":     NormalizeURI(uri),
+		"mode":    mode,
+		"wait":    opts.Wait,
+		"dry_run": opts.DryRun,
 	}
 	var result map[string]any
 	err := c.doJSON(ctx, http.MethodPost, "/api/v1/content/reindex", nil, payload, &result)

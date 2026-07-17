@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
     from openviking.session import Session
+    from openviking.snapshot_namespace import SyncSnapshotNamespace
 
 from openviking.async_client import AsyncOpenViking
 from openviking.telemetry import TelemetryRequest
@@ -183,6 +184,7 @@ class SyncOpenViking:
         uri: str,
         mode: str = "vectors_only",
         wait: bool = True,
+        dry_run: bool = False,
     ) -> Dict[str, Any]:
         """Reindex semantic/vector artifacts for a URI."""
         return run_async(
@@ -190,6 +192,7 @@ class SyncOpenViking:
                 uri=uri,
                 mode=mode,
                 wait=wait,
+                dry_run=dry_run,
             )
         )
 
@@ -209,6 +212,11 @@ class SyncOpenViking:
         **kwargs,
     ) -> Dict[str, Any]:
         """Add resource to OpenViking (resources scope only)
+
+        A sitemap / RSS / Atom URL ingests the whole site as one resource tree;
+        pass ``args={"site": True}`` to force whole-site ingestion from a bare
+        domain. A ``watch_interval`` on a sitemap/feed URL keeps the whole site
+        refreshed.
 
         Args:
             to: Exact target URI. Existing targets keep the add_resource incremental-update behavior.
@@ -368,7 +376,7 @@ class SyncOpenViking:
 
     def search(
         self,
-        query: str,
+        query: str = "",
         target_uri: Union[str, List[str]] = "",
         session: Optional["Session"] = None,
         session_id: Optional[str] = None,
@@ -382,6 +390,7 @@ class SyncOpenViking:
         until: Optional[str] = None,
         time_field: Optional[str] = None,
         level: Optional[List[int]] = None,
+        image: Optional[Any] = None,
     ):
         """Execute complex retrieval (intent analysis, hierarchical retrieval)."""
         return run_async(
@@ -400,12 +409,13 @@ class SyncOpenViking:
                 until=until,
                 time_field=time_field,
                 level=level,
+                image=image,
             )
         )
 
     def find(
         self,
-        query: str,
+        query: str = "",
         target_uri: Union[str, List[str]] = "",
         limit: int = 10,
         score_threshold: Optional[float] = None,
@@ -417,6 +427,7 @@ class SyncOpenViking:
         until: Optional[str] = None,
         time_field: Optional[str] = None,
         level: Optional[List[int]] = None,
+        image: Optional[Any] = None,
     ):
         """Quick retrieval"""
         return run_async(
@@ -433,6 +444,7 @@ class SyncOpenViking:
                 until,
                 time_field,
                 level,
+                image,
             )
         )
 
@@ -646,6 +658,7 @@ class SyncOpenViking:
         """Snapshot version control namespace (synchronous)."""
         if getattr(self, "_snapshot", None) is None:
             from openviking.snapshot_namespace import SyncSnapshotNamespace
+
             self._snapshot = SyncSnapshotNamespace(self)
         return self._snapshot
 

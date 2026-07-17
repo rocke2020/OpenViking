@@ -13,6 +13,8 @@ The four core commands:
 | `show` | View a commit's metadata, or read a file's content from that commit |
 | `restore` | Restore a directory (or the whole account tree) to a past snapshot |
 
+In addition, account-level `.ovgitignore` exclusion rules can be managed (`get`/`set`/`delete`) to exclude matching files from `commit`. See [Ignore management](#ignore-management).
+
 ## Core Concepts
 
 - **Commit**: A snapshot is a commit, uniquely identified by a 40-hex SHA-1 `commit_oid`. Most commands also accept an abbreviated OID prefix or a branch name (e.g. `main`).
@@ -22,10 +24,10 @@ The four core commands:
 
 ## Implementation
 
-- HTTP routes: [snapshot.py](file:///cloudide/workspace/OpenViking/openviking/server/routers/snapshot.py), prefix `/api/v1/snapshot`.
-- SDK namespace: [snapshot_namespace.py](file:///cloudide/workspace/OpenViking/openviking/snapshot_namespace.py), exposed as `client.snapshot.*`.
-- Underlying semantics: `commit` / `restore` / `show` / `log` in [viking_fs.py](file:///cloudide/workspace/OpenViking/openviking/storage/viking_fs.py).
-- CLI: the `SnapshotCmd` in [main.rs](file:///cloudide/workspace/OpenViking/crates/ov_cli/src/main.rs), subcommands in [snapshot.rs](file:///cloudide/workspace/OpenViking/crates/ov_cli/src/commands/snapshot.rs).
+- HTTP routes: [snapshot.py](https://github.com/volcengine/OpenViking/blob/main/openviking/server/routers/snapshot.py), prefix `/api/v1/snapshot`.
+- SDK namespace: [snapshot_namespace.py](https://github.com/volcengine/OpenViking/blob/main/openviking/snapshot_namespace.py), exposed as `client.snapshot.*`.
+- Underlying semantics: `commit` / `restore` / `show` / `log` in [viking_fs.py](https://github.com/volcengine/OpenViking/blob/main/openviking/storage/viking_fs.py).
+- CLI: the `SnapshotCmd` in [main.rs](https://github.com/volcengine/OpenViking/blob/main/crates/ov_cli/src/main.rs), subcommands in [snapshot.rs](https://github.com/volcengine/OpenViking/blob/main/crates/ov_cli/src/commands/snapshot.rs).
 
 ## API Reference
 
@@ -51,6 +53,12 @@ result = client.snapshot.commit(
     paths=["viking://resources/my_md.md"],
 )
 print(result["commit_oid"])
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.gitCommit({ message: "Update docs", paths: ["resources/docs"] }));
 ```
 
 **HTTP API**
@@ -85,19 +93,21 @@ When a new snapshot is created:
   "result": {
     "result": "created",
     "commit_oid": "3f2a1b9c4d5e6f70819293a4b5c6d7e8f9a0b1c2",
-    "changed": 3
+    "changed": 3,
+    "ignored": 1
   }
 }
 ```
 
-When the workspace is unchanged relative to the last commit, the result is `noop` and `commit_oid` is the current HEAD:
+`changed` is the number of paths added/updated/removed in this commit; `ignored` is the number of candidate paths skipped by the account `.ovgitignore` rules (built-in system pruning is not counted). When the workspace is unchanged relative to the last commit, the result is `noop` and `commit_oid` is the current HEAD (`noop` also returns `ignored` but has no `changed`):
 
 ```json
 {
   "status": "ok",
   "result": {
     "result": "noop",
-    "commit_oid": "3f2a1b9c4d5e6f70819293a4b5c6d7e8f9a0b1c2"
+    "commit_oid": "3f2a1b9c4d5e6f70819293a4b5c6d7e8f9a0b1c2",
+    "ignored": 0
   }
 }
 ```
@@ -113,31 +123,56 @@ Starting from a branch's HEAD, walk history along the first parent (`parents[0]`
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | branch | str | No | `main` | Branch to walk |
-| limit | int | No | 20 | Max commits to return. The HTTP endpoint clamps this to 1–500 |
+| limit | int | No | 20 | Max commits to return. The HTTP endpoint accepts values from 1 to 500 |
+| paths | List[str] | No | null | Return only commits that changed any specified `viking://` URI; files and directories are supported. At most 32 paths are accepted, and each account-relative path may contain at most 64 components. Pass multiple URIs to HTTP as repeated `paths` query parameters |
+
+Filtering happens before the result limit is applied, so `limit=10` with `paths=[X]` returns up to 10 commits related to X rather than filtering only the 10 newest commits.
+
+To bound storage work, a filtered request inspects at most 1,000 commits. If the requested number of matches has not been collected and older uninspected history remains, the request returns an `INVALID_ARGUMENT` error instead of a partial history list. Unfiltered history is not subject to this scan budget because every inspected commit advances the result limit.
 
 **Python SDK (Embedded / HTTP)**
 
 ```python
-history = client.snapshot.log(limit=10)
+history = client.snapshot.log(
+    limit=10,
+    paths=["viking://resources/a.md", "viking://resources/docs"],
+)
 for commit in history:
     print(commit["oid"], commit["message"])
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(
+  await client.gitLog("main", 20, [
+    "viking://resources/a.md",
+    "viking://resources/docs",
+  ]),
+);
 ```
 
 **HTTP API**
 
 ```
-GET /api/v1/snapshot/log?branch={branch}&limit={limit}
+GET /api/v1/snapshot/log?branch={branch}&limit={limit}&paths={uri1}&paths={uri2}
 ```
 
 ```bash
-curl -X GET "http://localhost:1933/api/v1/snapshot/log?branch=main&limit=10" \
+curl --get "http://localhost:1933/api/v1/snapshot/log" \
+  --data-urlencode "branch=main" \
+  --data-urlencode "limit=10" \
+  --data-urlencode "paths=viking://resources/a.md" \
+  --data-urlencode "paths=viking://resources/docs" \
   -H "X-API-Key: your-key"
 ```
 
 **CLI**
 
 ```bash
-ov snapshot log --limit 10 -o json
+ov snapshot log --limit 10 \
+  --paths viking://resources/a.md,viking://resources/docs \
+  -o json
 ```
 
 **Response**
@@ -194,6 +229,12 @@ print(meta["message"], meta["parents"])
 
 # Read a file's content from the commit
 blob = client.snapshot.show("3f2a1b9c", path="viking://resources/my_project/guide.md")
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.gitShow("main", "viking://resources/docs/api.md"));
 ```
 
 > Note: when reading a file (`path` given), the **Embedded (local) client** returns raw `bytes`, while the **HTTP client** returns a `{"oid": str, "size": int, "bytes": bytes}` dict.
@@ -294,6 +335,15 @@ plan = client.snapshot.restore(
 print(plan["diff"])
 ```
 
+**TypeScript SDK**
+
+```typescript
+console.log(await client.gitRestore({
+  projectDir: "viking://resources/docs",
+  sourceCommit: "3f2a1b9c",
+}));
+```
+
 **HTTP API**
 
 ```
@@ -380,6 +430,154 @@ With `dry_run=true`, only the planned diff is returned and nothing is written. D
 }
 ```
 
+---
+
+## Ignore management
+
+The `.ovgitignore` file at the account root is an account-level exclusion file. At `commit` time, files matching the rules are excluded from the snapshot; the rules file itself is never ignored by `.ovgitignore` rules (a rule matching `.ovgitignore` does not exclude it) and never enters vector indexing. Rules affect only `commit`, not `restore`/`show`/`log`.
+
+The syntax is a common glob subset: blank lines are ignored, `#`-prefixed lines are comments, leading/trailing whitespace is trimmed; `!` negation and backslash escaping are **unsupported**; the file is capped at 64 KiB (validated on write). Matching uses account-relative Git tree paths (`/`-separated).
+
+Three methods are provided: `get_gitignore` (read, empty string when absent), `set_gitignore` (write), and `delete_gitignore` (delete, missing is success and idempotent). All three only need the account from the request context and take no path argument.
+
+### get_gitignore()
+
+Reads the account `.ovgitignore` content; returns an empty string when the file is absent.
+
+**Python SDK (Embedded / HTTP)**
+
+```python
+content = client.snapshot.get_gitignore()
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.gitGetIgnore());
+```
+
+**HTTP API**
+
+```
+GET /api/v1/snapshot/ignore
+```
+
+```bash
+curl -X GET "http://localhost:1933/api/v1/snapshot/ignore" \
+  -H "X-API-Key: your-key"
+```
+
+**CLI**
+
+```bash
+ov snapshot ignore-get -o json
+```
+
+**Response**
+
+```json
+{
+  "status": "ok",
+  "result": "*.log\n"
+}
+```
+
+> Without `-o json`, the CLI prints the raw content to stdout (so it can be redirected to a file).
+
+### set_gitignore()
+
+Writes the account `.ovgitignore` content (overwrites). The size limit (64 KiB) is validated up front; syntax (negation, escaping) is validated at `commit` time by the Rust layer.
+
+**Parameters**
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| content | str | Yes | - | The `.ovgitignore` content (UTF-8) |
+
+**Python SDK (Embedded / HTTP)**
+
+```python
+client.snapshot.set_gitignore(content="*.log\n")
+```
+
+**TypeScript SDK**
+
+```typescript
+await client.gitSetIgnore("*.tmp\n.cache/\n");
+```
+
+**HTTP API**
+
+```
+PUT /api/v1/snapshot/ignore
+```
+
+```bash
+curl -X PUT "http://localhost:1933/api/v1/snapshot/ignore" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{"content": "*.log\n"}'
+```
+
+**CLI**
+
+```bash
+# Pass content inline with --content, or read from a file with --file
+ov snapshot ignore-set --content "*.log" -o json
+ov snapshot ignore-set --file ./my-rules -o json
+```
+
+**Response**
+
+```json
+{
+  "status": "ok",
+  "result": null
+}
+```
+
+### delete_gitignore()
+
+Deletes the account `.ovgitignore`. Missing is success (idempotent).
+
+**Python SDK (Embedded / HTTP)**
+
+```python
+client.snapshot.delete_gitignore()
+```
+
+**TypeScript SDK**
+
+```typescript
+await client.gitDeleteIgnore();
+```
+
+**HTTP API**
+
+```
+DELETE /api/v1/snapshot/ignore
+```
+
+```bash
+curl -X DELETE "http://localhost:1933/api/v1/snapshot/ignore" \
+  -H "X-API-Key: your-key"
+```
+
+**CLI**
+
+```bash
+ov snapshot ignore-delete -o json
+```
+
+**Response**
+
+```json
+{
+  "status": "ok",
+  "result": null
+}
+```
+
 ## A Typical Flow
 
 A complete "commit → modify → restore" flow (Python SDK):
@@ -410,7 +608,7 @@ client.snapshot.restore(project_dir=root, source_commit=v1["commit_oid"], messag
 client.close()
 ```
 
-For more end-to-end examples, see the [examples/snapshot/](file:///cloudide/workspace/OpenViking/examples/snapshot) directory in the repository, covering the SDK, HTTP, and CLI surfaces.
+For more end-to-end examples, see the [examples/snapshot/](https://github.com/volcengine/OpenViking/tree/main/examples/snapshot) directory in the repository, covering the SDK, HTTP, and CLI surfaces.
 
 ## Error Handling
 
@@ -418,6 +616,7 @@ For more end-to-end examples, see the [examples/snapshot/](file:///cloudide/work
 |----------|-------------|------------|
 | Branch/commit not found, or `show`'s `path` does not exist in that commit | 404 | `NOT_FOUND` |
 | Branch concurrently advanced during restore (CAS conflict) | 409 | `CONFLICT` |
+| `.ovgitignore` too large, non-UTF-8, or containing unsupported `!` negation/backslash escaping (validated at `commit` time) | 400 | `INVALID_ARGUMENT` |
 | Request body contains an unknown field (request model is `extra="forbid"`) | 400 | `INVALID_ARGUMENT` |
 
 ## Related Documentation

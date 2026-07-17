@@ -3,6 +3,8 @@ use serde_json::{Map, Value};
 use std::env;
 use std::path::Path;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+
 pub use crate::base_client::{BaseClient, FileUploader, TimeoutConfig};
 
 use crate::error::{Error, Result};
@@ -31,6 +33,32 @@ fn compact_request_body(body: &mut Value) {
         }
         true
     });
+}
+
+fn normalize_image_input(image: Option<String>) -> Result<Option<String>> {
+    let Some(value) = image else {
+        return Ok(None);
+    };
+    if value.starts_with("data:image/")
+        || value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.starts_with("viking://")
+    {
+        return Ok(Some(value));
+    }
+
+    let path = Path::new(&value);
+    if path.is_file() {
+        let bytes = std::fs::read(path)?;
+        let mime = mime_guess::from_path(path).first_or_octet_stream();
+        return Ok(Some(format!(
+            "data:{};base64,{}",
+            mime,
+            BASE64_STANDARD.encode(bytes)
+        )));
+    }
+
+    Ok(Some(value))
 }
 
 #[derive(serde::Serialize)]
@@ -62,7 +90,11 @@ pub struct SnapshotRestoreReq {
 
 pub enum SnapshotShowResult {
     Metadata(Value),
-    Blob { oid: String, size: u64, bytes: Vec<u8> },
+    Blob {
+        oid: String,
+        size: u64,
+        bytes: Vec<u8>,
+    },
 }
 
 // ============ HttpClient ============
@@ -71,7 +103,6 @@ pub enum SnapshotShowResult {
 #[derive(Clone)]
 pub struct HttpClient {
     base: BaseClient,
-    legacy_agent_id: Option<String>,
 }
 
 impl HttpClient {
@@ -81,7 +112,6 @@ impl HttpClient {
         account: Option<String>,
         user: Option<String>,
         actor_peer_id: Option<String>,
-        legacy_agent_id: Option<String>,
         timeout_secs: f64,
         profile_enabled: bool,
         extra_headers: Option<std::collections::HashMap<String, String>>,
@@ -97,8 +127,12 @@ impl HttpClient {
                 profile_enabled,
                 extra_headers,
             ),
-            legacy_agent_id,
         }
+    }
+
+    pub fn with_gateway_token(mut self, gateway_token: Option<String>) -> Self {
+        self.base = self.base.with_gateway_token(gateway_token);
+        self
     }
 
     pub fn user_id(&self) -> Option<&str> {
@@ -107,10 +141,6 @@ impl HttpClient {
 
     pub fn actor_peer_id(&self) -> Option<&str> {
         self.base.actor_peer_id()
-    }
-
-    pub fn legacy_agent_id(&self) -> Option<&str> {
-        self.legacy_agent_id.as_deref()
     }
 
     pub fn api_key(&self) -> Option<&str> {
@@ -286,7 +316,7 @@ impl HttpClient {
             "mode": mode,
             "recursive": recursive,
         });
-        self.post("/api/v1/content/set_tags", &body).await
+        self.post("/api/v1/fs/attrs/set_tags", &body).await
     }
 
     fn build_write_body(
@@ -305,11 +335,18 @@ impl HttpClient {
         })
     }
 
-    pub async fn reindex(&self, uri: &str, mode: &str, wait: bool) -> Result<serde_json::Value> {
+    pub async fn reindex(
+        &self,
+        uri: &str,
+        mode: &str,
+        wait: bool,
+        dry_run: bool,
+    ) -> Result<serde_json::Value> {
         let body = serde_json::json!({
             "uri": uri,
             "mode": mode,
             "wait": wait,
+            "dry_run": dry_run,
         });
         self.post("/api/v1/content/reindex", &body).await
     }
@@ -343,15 +380,16 @@ impl HttpClient {
             ("profile".to_string(), "0".to_string()),
         ];
 
-        let response = self
+        let request = self
             .base
             .http
             .get(&url)
             .headers(self.base.build_headers())
-            .query(&params)
-            .send()
-            .await
-            .map_err(|e| Error::Network(format!("HTTP request failed: {}", e)))?;
+            .query(&params);
+        let response = self
+            .base
+            .send_request(request, "HTTP request failed")
+            .await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -471,12 +509,18 @@ impl HttpClient {
         self.get("/api/v1/fs/stat", &params).await
     }
 
+    pub async fn attrs(&self, uri: &str) -> Result<serde_json::Value> {
+        let params = vec![("uri".to_string(), uri.to_string())];
+        self.get("/api/v1/fs/attrs", &params).await
+    }
+
     // ============ Search Methods ============
 
     pub async fn find(
         &self,
         query: String,
         uri: String,
+        image: Option<String>,
         node_limit: i32,
         threshold: Option<f64>,
         since: Option<String>,
@@ -486,8 +530,10 @@ impl HttpClient {
         context_type: Option<Vec<String>>,
         tags: Option<Vec<String>>,
     ) -> Result<serde_json::Value> {
+        let image_url = normalize_image_input(image)?;
         let mut body = serde_json::json!({
             "query": query,
+            "image_url": image_url,
             "target_uri": uri,
             "limit": node_limit,
             "score_threshold": threshold,
@@ -498,7 +544,6 @@ impl HttpClient {
             "context_type": context_type,
             "tags": tags,
         });
-        self.attach_legacy_agent_scope(&mut body);
         compact_request_body(&mut body);
         self.post("/api/v1/search/find", &body).await
     }
@@ -507,6 +552,7 @@ impl HttpClient {
         &self,
         query: String,
         uri: String,
+        image: Option<String>,
         session_id: Option<String>,
         node_limit: i32,
         threshold: Option<f64>,
@@ -517,8 +563,10 @@ impl HttpClient {
         context_type: Option<Vec<String>>,
         tags: Option<Vec<String>>,
     ) -> Result<serde_json::Value> {
+        let image_url = normalize_image_input(image)?;
         let mut body = serde_json::json!({
             "query": query,
+            "image_url": image_url,
             "target_uri": uri,
             "session_id": session_id,
             "limit": node_limit,
@@ -530,15 +578,8 @@ impl HttpClient {
             "context_type": context_type,
             "tags": tags,
         });
-        self.attach_legacy_agent_scope(&mut body);
         compact_request_body(&mut body);
         self.post("/api/v1/search/search", &body).await
-    }
-
-    fn attach_legacy_agent_scope(&self, body: &mut Value) {
-        if let Some(agent_id) = self.legacy_agent_id() {
-            body["agent_id"] = serde_json::json!(agent_id);
-        }
     }
 
     pub async fn grep(
@@ -1106,16 +1147,17 @@ impl HttpClient {
         default_name: &str,
     ) -> Result<String> {
         let url = format!("{}{}", self.base.base_url, endpoint);
-        let response = self
+        let request = self
             .base
             .http
             .post(&url)
             .headers(self.base.build_headers())
             .json(&body)
-            .query(&[("profile", "0")])
-            .send()
-            .await
-            .map_err(|e| Error::Network(format!("HTTP request failed: {}", e)))?;
+            .query(&[("profile", "0")]);
+        let response = self
+            .base
+            .send_request(request, "HTTP request failed")
+            .await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -1261,12 +1303,26 @@ impl HttpClient {
         &self,
         account_id: &str,
         admin_user_id: &str,
+        seed: Option<&str>,
+        user_config: Option<&Value>,
     ) -> Result<Value> {
-        let body = serde_json::json!({
-            "account_id": account_id,
-            "admin_user_id": admin_user_id,
-        });
-        self.post("/api/v1/admin/accounts", &body).await
+        let mut body = Map::new();
+        body.insert(
+            "account_id".to_string(),
+            Value::String(account_id.to_string()),
+        );
+        body.insert(
+            "admin_user_id".to_string(),
+            Value::String(admin_user_id.to_string()),
+        );
+        if let Some(config) = user_config {
+            body.insert("user_config".to_string(), config.clone());
+        }
+        if let Some(seed) = seed {
+            body.insert("seed".to_string(), Value::String(seed.to_string()));
+        }
+        self.post("/api/v1/admin/accounts", &Value::Object(body))
+            .await
     }
 
     pub async fn admin_list_accounts(&self) -> Result<Value> {
@@ -1283,13 +1339,20 @@ impl HttpClient {
         account_id: &str,
         user_id: &str,
         role: &str,
+        seed: Option<&str>,
+        user_config: Option<&Value>,
     ) -> Result<Value> {
         let path = format!("/api/v1/admin/accounts/{}/users", account_id);
-        let body = serde_json::json!({
-            "user_id": user_id,
-            "role": role,
-        });
-        self.post(&path, &body).await
+        let mut body = Map::new();
+        body.insert("user_id".to_string(), Value::String(user_id.to_string()));
+        body.insert("role".to_string(), Value::String(role.to_string()));
+        if let Some(config) = user_config {
+            body.insert("user_config".to_string(), config.clone());
+        }
+        if let Some(seed) = seed {
+            body.insert("seed".to_string(), Value::String(seed.to_string()));
+        }
+        self.post(&path, &Value::Object(body)).await
     }
 
     pub async fn admin_list_users(
@@ -1329,12 +1392,21 @@ impl HttpClient {
         self.put(&path, &body).await
     }
 
-    pub async fn admin_regenerate_key(&self, account_id: &str, user_id: &str) -> Result<Value> {
+    pub async fn admin_regenerate_key(
+        &self,
+        account_id: &str,
+        user_id: &str,
+        seed: Option<&str>,
+    ) -> Result<Value> {
         let path = format!(
             "/api/v1/admin/accounts/{}/users/{}/key",
             account_id, user_id
         );
-        self.post(&path, &serde_json::json!({})).await
+        let body = match seed {
+            Some(seed) => serde_json::json!({ "seed": seed }),
+            None => serde_json::json!({}),
+        };
+        self.post(&path, &body).await
     }
 
     pub async fn admin_migrate(&self, cleanup: bool) -> Result<Value> {
@@ -1538,12 +1610,38 @@ impl HttpClient {
         self.post("/api/v1/snapshot/restore", req).await
     }
 
-    pub async fn snapshot_log(&self, branch: &str, limit: u32) -> Result<Value> {
-        let params = vec![
+    pub async fn snapshot_log(
+        &self,
+        branch: &str,
+        limit: u32,
+        paths: Option<&[String]>,
+    ) -> Result<Value> {
+        let mut params = vec![
             ("branch".to_string(), branch.to_string()),
             ("limit".to_string(), limit.to_string()),
         ];
+        if let Some(paths) = paths {
+            for path in paths {
+                params.push(("paths".to_string(), path.to_string()));
+            }
+        }
         self.get("/api/v1/snapshot/log", &params).await
+    }
+
+    pub async fn snapshot_ignore_get(&self) -> Result<Value> {
+        self.get("/api/v1/snapshot/ignore", &[]).await
+    }
+
+    pub async fn snapshot_ignore_set(&self, content: &str) -> Result<Value> {
+        self.put(
+            "/api/v1/snapshot/ignore",
+            &serde_json::json!({ "content": content }),
+        )
+        .await
+    }
+
+    pub async fn snapshot_ignore_delete(&self) -> Result<Value> {
+        self.delete("/api/v1/snapshot/ignore", &[]).await
     }
 
     pub async fn snapshot_show(
@@ -1552,20 +1650,22 @@ impl HttpClient {
         path: Option<&str>,
     ) -> Result<SnapshotShowResult> {
         let url = format!("{}/api/v1/snapshot/show", self.base.base_url);
-        let mut query: Vec<(String, String)> = vec![("target_ref".to_string(), target_ref.to_string())];
+        let mut query: Vec<(String, String)> =
+            vec![("target_ref".to_string(), target_ref.to_string())];
         if let Some(p) = path {
             query.push(("path".to_string(), p.to_string()));
         }
 
-        let response = self
+        let request = self
             .base
             .http
             .get(&url)
             .headers(self.base.build_headers())
-            .query(&query)
-            .send()
-            .await
-            .map_err(|e| Error::Network(format!("HTTP request failed: {}", e)))?;
+            .query(&query);
+        let response = self
+            .base
+            .send_request(request, "HTTP request failed")
+            .await?;
 
         let status = response.status();
         let content_type = response
@@ -1575,7 +1675,10 @@ impl HttpClient {
             .unwrap_or("")
             .to_string();
 
-        if path.is_some() && status.is_success() && content_type.starts_with("application/octet-stream") {
+        if path.is_some()
+            && status.is_success()
+            && content_type.starts_with("application/octet-stream")
+        {
             let oid = response
                 .headers()
                 .get("x-snapshot-oid")
@@ -1766,7 +1869,7 @@ mod tests {
     #[tokio::test]
     async fn ls_does_not_send_display_time_query() {
         let (base_url, request_rx) = spawn_request_capture_server().await;
-        let client = HttpClient::new(base_url, None, None, None, None, None, 5.0, false, None);
+        let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
 
         client
             .ls("viking://resources", false, false, "agent", 256, false, 1)
@@ -1780,9 +1883,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gateway_token_is_not_sent_without_a_gateway_challenge() {
+        let (base_url, request_rx) = spawn_request_capture_server().await;
+        let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None)
+            .with_gateway_token(Some("gateway-secret".to_string()));
+
+        let _: serde_json::Value = client
+            .get("/health", &[])
+            .await
+            .expect("direct OpenViking request should succeed");
+
+        let request = request_rx.await.expect("request should be captured");
+        assert!(!request.to_ascii_lowercase().contains("x-gateway-token"));
+    }
+
+    #[tokio::test]
+    async fn gateway_token_is_retried_for_marked_gateway_challenge() {
+        let (base_url, requests_rx) = spawn_gateway_challenge_server().await;
+        let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None)
+            .with_gateway_token(Some("gateway-secret".to_string()));
+
+        let _: serde_json::Value = client
+            .get("/health", &[])
+            .await
+            .expect("gateway retry should succeed");
+
+        let requests = requests_rx.await.expect("requests should be captured");
+        assert_gateway_token_retry(&requests);
+    }
+
+    #[tokio::test]
+    async fn file_download_retries_marked_gateway_challenge() {
+        let (base_url, requests_rx) = spawn_gateway_challenge_server().await;
+        let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None)
+            .with_gateway_token(Some("gateway-secret".to_string()));
+
+        client
+            .get_bytes("viking://resources/file.bin")
+            .await
+            .expect("file download should retry through gateway");
+
+        let requests = requests_rx.await.expect("requests should be captured");
+        assert_gateway_token_retry(&requests);
+    }
+
+    #[tokio::test]
+    async fn pack_download_retries_marked_gateway_challenge() {
+        let (base_url, requests_rx) = spawn_gateway_challenge_server().await;
+        let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None)
+            .with_gateway_token(Some("gateway-secret".to_string()));
+        let output = tempfile::tempdir().expect("tempdir should be created");
+
+        client
+            .export_ovpack(
+                "viking://resources",
+                output
+                    .path()
+                    .to_str()
+                    .expect("tempdir path should be valid"),
+                false,
+            )
+            .await
+            .expect("pack export should retry through gateway");
+
+        let requests = requests_rx.await.expect("requests should be captured");
+        assert_gateway_token_retry(&requests);
+    }
+
+    #[tokio::test]
+    async fn snapshot_show_retries_marked_gateway_challenge() {
+        let (base_url, requests_rx) = spawn_gateway_challenge_server().await;
+        let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None)
+            .with_gateway_token(Some("gateway-secret".to_string()));
+
+        client
+            .snapshot_show("HEAD", None)
+            .await
+            .expect("snapshot show should retry through gateway");
+
+        let requests = requests_rx.await.expect("requests should be captured");
+        assert_gateway_token_retry(&requests);
+    }
+
+    fn assert_gateway_token_retry(requests: &[String]) {
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0].to_ascii_lowercase().contains("x-gateway-token"));
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("x-gateway-token: gateway-secret")
+        );
+    }
+
+    #[tokio::test]
     async fn tree_does_not_send_display_time_query() {
         let (base_url, request_rx) = spawn_request_capture_server().await;
-        let client = HttpClient::new(base_url, None, None, None, None, None, 5.0, false, None);
+        let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
 
         client
             .tree("viking://resources", "agent", 256, false, 1, 3)
@@ -1795,24 +1991,37 @@ mod tests {
         assert!(!request.contains("include_mod_time_iso="));
     }
 
-    #[test]
-    fn search_body_includes_legacy_agent_id() {
-        let client = HttpClient::new(
-            "http://localhost:1933",
-            None,
-            None,
-            None,
-            Some("legacy-agent".to_string()),
-            Some("legacy-agent".to_string()),
-            5.0,
-            false,
-            None,
-        );
-        let mut body = json!({"query": "invoice"});
+    #[tokio::test]
+    async fn admin_seed_payloads_are_sent() {
+        let (base_url, request_rx) = spawn_request_capture_server().await;
+        let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
+        client
+            .admin_create_account("acct", "admin", Some("admin-seed"), None)
+            .await
+            .expect("create account should succeed");
+        let request = request_rx.await.expect("request should be captured");
+        assert!(request.starts_with("POST /api/v1/admin/accounts "));
+        assert!(request.contains(r#""seed":"admin-seed""#));
 
-        client.attach_legacy_agent_scope(&mut body);
+        let (base_url, request_rx) = spawn_request_capture_server().await;
+        let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
+        client
+            .admin_register_user("acct", "alice", "admin", Some("alice-seed"), None)
+            .await
+            .expect("register user should succeed");
+        let request = request_rx.await.expect("request should be captured");
+        assert!(request.starts_with("POST /api/v1/admin/accounts/acct/users "));
+        assert!(request.contains(r#""seed":"alice-seed""#));
 
-        assert_eq!(body["agent_id"], json!("legacy-agent"));
+        let (base_url, request_rx) = spawn_request_capture_server().await;
+        let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
+        client
+            .admin_regenerate_key("acct", "alice", Some("new-seed"))
+            .await
+            .expect("regenerate key should succeed");
+        let request = request_rx.await.expect("request should be captured");
+        assert!(request.starts_with("POST /api/v1/admin/accounts/acct/users/alice/key "));
+        assert!(request.contains(r#""seed":"new-seed""#));
     }
 
     #[test]
@@ -1900,6 +2109,46 @@ mod tests {
                 body
             );
             let _ = stream.write_all(response.as_bytes()).await;
+        });
+
+        (format!("http://{addr}"), request_rx)
+    }
+
+    async fn spawn_gateway_challenge_server() -> (String, oneshot::Receiver<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let addr = listener.local_addr().expect("test server should have addr");
+        let (request_tx, request_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for attempt in 0..2 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = vec![0; 4096];
+                let Ok(read) = stream.read(&mut buffer).await else {
+                    return;
+                };
+                requests.push(String::from_utf8_lossy(&buffer[..read]).to_string());
+
+                let (status, marker, body) = if attempt == 0 {
+                    (
+                        "401 Unauthorized",
+                        "X-VikingBot-Gateway: true\r\n",
+                        r#"{"detail":"X-Gateway-Token header required"}"#,
+                    )
+                } else {
+                    ("200 OK", "", r#"{"status":"ok","result":{"ok":true}}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{marker}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+            let _ = request_tx.send(requests);
         });
 
         (format!("http://{addr}"), request_rx)

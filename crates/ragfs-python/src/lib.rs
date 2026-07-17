@@ -20,7 +20,7 @@ use ragfs::cache::{
 use ragfs::core::builder::EncryptionConfig;
 use ragfs::core::{
     build_default_stack, register_builtin_plugins, ConfigValue, FileInfo, FileSystem,
-    FilesystemStats, FsContext, FsContextInner, FsOperation, GrepResult, MountableFS,
+    FilesystemStats, FsContext, FsContextInner, FsOperation, GlobPage, GrepResult, MountableFS,
     OperationStats, PluginConfig, RagfsConfig, StatsWrappedFS, TreeEntry, WriteFlag, FS_CTX,
 };
 
@@ -1060,6 +1060,24 @@ impl RAGFSBindingClient {
         git::show_response_to_pydict(py, resp)
     }
 
+    /// Walk snapshot history, optionally filtered to commits touching paths.
+    #[pyo3(signature = (**kwargs))]
+    fn git_log(
+        &self,
+        py: Python<'_>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
+        let svc = self.git_service.clone().ok_or_else(|| {
+            git::new_py_err_pub(py, "AGFSNotSupportedError", "git feature disabled".into())
+        })?;
+        let empty = PyDict::new(py);
+        let kw = kwargs.unwrap_or(&empty);
+        let req = git::parse_log_request(kw)?;
+        let resp = py_detach_blocking(py, move || self.rt.block_on(svc.log(req)))
+            .map_err(|e| git::map_git_error(py, e))?;
+        git::log_entries_to_pylist(py, resp)
+    }
+
     /// Get client capabilities.
     fn get_capabilities(&self) -> PyResult<HashMap<String, Py<PyAny>>> {
         Python::attach(|py| {
@@ -1615,6 +1633,57 @@ impl RAGFSBindingClient {
                 list.append(dict)?;
             }
             Ok(list.into())
+        })
+    }
+
+    /// Return one page of flat glob results.
+    ///
+    /// Args:
+    ///     path: The root path of the traversal
+    ///     pattern: Glob pattern matched against query-root-relative paths
+    ///     show_hidden: Whether to include hidden files (default: False)
+    ///     page_size: Maximum number of matched entries returned in this page
+    ///     level_limit: Maximum depth relative to query root (default: None)
+    ///     continuation_token: Opaque token returned by the previous page
+    ///     ctx: Optional FsContext dict (e.g. {"account_id": ...})
+    ///
+    /// Returns:
+    ///     A dict with keys: entries (list[GlobEntry]), next_token (str | None)
+    #[pyo3(signature = (path, pattern, show_hidden=false, page_size=None, level_limit=None, continuation_token=None, ctx=None))]
+    fn glob_directory(
+        &self,
+        py: Python<'_>,
+        path: String,
+        pattern: String,
+        show_hidden: bool,
+        page_size: Option<i32>,
+        level_limit: Option<i32>,
+        continuation_token: Option<String>,
+        ctx: Option<HashMap<String, String>>,
+    ) -> PyResult<Py<PyAny>> {
+        let fs_ctx = build_fs_context(ctx);
+        let top = self.top.clone();
+        let page_size = page_size.map(|n| if n < 0 { 0 } else { n as usize });
+        let level_limit_usize = level_limit.map(|n| if n < 0 { 0 } else { n as usize });
+
+        let page: GlobPage = self
+            .run_scoped(py, fs_ctx, move || async move {
+                top.glob_directory(
+                    &path,
+                    &pattern,
+                    show_hidden,
+                    page_size,
+                    level_limit_usize,
+                    continuation_token,
+                )
+                .await
+            })
+            .map_err(to_py_err)?;
+
+        Python::attach(|py| {
+            let value = serde_json::to_value(&page)
+                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+            serde_json_to_py(py, &value)
         })
     }
 

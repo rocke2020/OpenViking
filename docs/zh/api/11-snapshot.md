@@ -13,6 +13,8 @@ OpenViking 在 VikingFS 之上提供了一套基于 Git 的多版本管理能力
 | `show` | 查看某个提交的元数据，或读取该提交中某个文件的内容 |
 | `restore` | 把目录（或整棵账号树）恢复到某个历史快照的状态 |
 
+此外还提供账号级 `.ovgitignore` 排除规则的管理命令（`get`/`set`/`delete`），用于在 `commit` 时按规则排除匹配的文件。详见 [ignore 管理](#ignore-管理)。
+
 ## 核心概念
 
 - **提交（commit）**：一个快照对应一个提交，由 40 位十六进制的 SHA-1 `commit_oid` 唯一标识。多数命令也接受 OID 的缩写前缀，或分支名（如 `main`）。
@@ -22,10 +24,10 @@ OpenViking 在 VikingFS 之上提供了一套基于 Git 的多版本管理能力
 
 ## API 实现介绍
 
-- HTTP 路由：[snapshot.py](file:///cloudide/workspace/OpenViking/openviking/server/routers/snapshot.py)，前缀 `/api/v1/snapshot`。
-- 命名空间（SDK）：[snapshot_namespace.py](file:///cloudide/workspace/OpenViking/openviking/snapshot_namespace.py)，暴露为 `client.snapshot.*`。
-- 底层语义实现：[viking_fs.py](file:///cloudide/workspace/OpenViking/openviking/storage/viking_fs.py) 的 `commit` / `restore` / `show` / `log`。
-- CLI 命令：[main.rs](file:///cloudide/workspace/OpenViking/crates/ov_cli/src/main.rs) 的 `SnapshotCmd`，子命令 [snapshot.rs](file:///cloudide/workspace/OpenViking/crates/ov_cli/src/commands/snapshot.rs)。
+- HTTP 路由：[snapshot.py](https://github.com/volcengine/OpenViking/blob/main/openviking/server/routers/snapshot.py)，前缀 `/api/v1/snapshot`。
+- 命名空间（SDK）：[snapshot_namespace.py](https://github.com/volcengine/OpenViking/blob/main/openviking/snapshot_namespace.py)，暴露为 `client.snapshot.*`。
+- 底层语义实现：[viking_fs.py](https://github.com/volcengine/OpenViking/blob/main/openviking/storage/viking_fs.py) 的 `commit` / `restore` / `show` / `log`。
+- CLI 命令：[main.rs](https://github.com/volcengine/OpenViking/blob/main/crates/ov_cli/src/main.rs) 的 `SnapshotCmd`，子命令 [snapshot.rs](https://github.com/volcengine/OpenViking/blob/main/crates/ov_cli/src/commands/snapshot.rs)。
 
 ## API 参考
 
@@ -51,6 +53,12 @@ result = client.snapshot.commit(
     paths=["viking://resources/my_md.md"],
 )
 print(result["commit_oid"])
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.gitCommit({ message: "Update docs", paths: ["resources/docs"] }));
 ```
 
 **HTTP API**
@@ -85,19 +93,21 @@ ov snapshot commit -m "v1 initial import" --paths viking://resources/my_md.md -o
   "result": {
     "result": "created",
     "commit_oid": "3f2a1b9c4d5e6f70819293a4b5c6d7e8f9a0b1c2",
-    "changed": 3
+    "changed": 3,
+    "ignored": 1
   }
 }
 ```
 
-当工作区相对上一次提交没有任何变化时返回 `noop`，`commit_oid` 为当前 HEAD：
+`changed` 为本次提交中新增/修改/删除的路径数；`ignored` 为本次被账号 `.ovgitignore` 规则排除的候选路径数（系统内置剪枝不计入）。当工作区相对上一次提交没有任何变化时返回 `noop`，`commit_oid` 为当前 HEAD（`noop` 同样返回 `ignored`，但不含 `changed`）：
 
 ```json
 {
   "status": "ok",
   "result": {
     "result": "noop",
-    "commit_oid": "3f2a1b9c4d5e6f70819293a4b5c6d7e8f9a0b1c2"
+    "commit_oid": "3f2a1b9c4d5e6f70819293a4b5c6d7e8f9a0b1c2",
+    "ignored": 0
   }
 }
 ```
@@ -114,30 +124,55 @@ ov snapshot commit -m "v1 initial import" --paths viking://resources/my_md.md -o
 |------|------|------|--------|------|
 | branch | str | 否 | `main` | 要回溯的分支 |
 | limit | int | 否 | 20 | 最多返回的提交数量。HTTP 接口限制范围为 1–500 |
+| paths | List[str] | 否 | null | 只返回修改了任一指定 `viking://` URI 的提交；支持文件和目录。最多接受 32 条路径，每条 account-relative 路径最多包含 64 个层级。HTTP 接口通过重复 `paths` 查询参数传入多个 URI |
+
+过滤发生在限制返回数量之前，因此 `limit=10` 和 `paths=[X]` 表示最多返回 10 条与 X 有关的提交，而不是先取最近 10 条提交再过滤。
+
+为限制存储开销，过滤请求最多检查 1,000 条提交。如果尚未收集到请求数量的匹配结果，并且仍存在未检查的更早历史，接口将返回 `INVALID_ARGUMENT` 错误，而不是返回不完整的历史列表。非过滤请求不受该扫描预算限制，因为每检查一条提交都会推进返回数量限制。
 
 **Python SDK (Embedded / HTTP)**
 
 ```python
-history = client.snapshot.log(limit=10)
+history = client.snapshot.log(
+    limit=10,
+    paths=["viking://resources/a.md", "viking://resources/docs"],
+)
 for commit in history:
     print(commit["oid"], commit["message"])
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(
+  await client.gitLog("main", 20, [
+    "viking://resources/a.md",
+    "viking://resources/docs",
+  ]),
+);
 ```
 
 **HTTP API**
 
 ```
-GET /api/v1/snapshot/log?branch={branch}&limit={limit}
+GET /api/v1/snapshot/log?branch={branch}&limit={limit}&paths={uri1}&paths={uri2}
 ```
 
 ```bash
-curl -X GET "http://localhost:1933/api/v1/snapshot/log?branch=main&limit=10" \
+curl --get "http://localhost:1933/api/v1/snapshot/log" \
+  --data-urlencode "branch=main" \
+  --data-urlencode "limit=10" \
+  --data-urlencode "paths=viking://resources/a.md" \
+  --data-urlencode "paths=viking://resources/docs" \
   -H "X-API-Key: your-key"
 ```
 
 **CLI**
 
 ```bash
-ov snapshot log --limit 10 -o json
+ov snapshot log --limit 10 \
+  --paths viking://resources/a.md,viking://resources/docs \
+  -o json
 ```
 
 **响应**
@@ -194,6 +229,12 @@ print(meta["message"], meta["parents"])
 
 # 读取该提交中某个文件的内容
 blob = client.snapshot.show("3f2a1b9c", path="viking://resources/my_project/guide.md")
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.gitShow("main", "viking://resources/docs/api.md"));
 ```
 
 > 注意：带 `path` 读取文件内容时，**Embedded（本地）客户端**直接返回原始 `bytes`；**HTTP 客户端**返回 `{"oid": str, "size": int, "bytes": bytes}` 字典。
@@ -294,6 +335,15 @@ plan = client.snapshot.restore(
 print(plan["diff"])
 ```
 
+**TypeScript SDK**
+
+```typescript
+console.log(await client.gitRestore({
+  projectDir: "viking://resources/docs",
+  sourceCommit: "3f2a1b9c",
+}));
+```
+
 **HTTP API**
 
 ```
@@ -380,6 +430,154 @@ ov snapshot restore 3f2a1b9c viking://resources/my_project --dry-run -o json
 }
 ```
 
+---
+
+## ignore 管理
+
+账号根目录下的 `.ovgitignore` 是账号级排除规则文件。在 `commit` 时，匹配规则的文件被排除出快照；规则文件本身不会被 `.ovgitignore` 规则忽略（即使规则匹配 `.ovgitignore` 也不会被排除），且不进入向量索引。规则只影响 `commit`，不影响 `restore`/`show`/`log`。
+
+语法为常见 glob 子集：空行被忽略、`#` 开头为注释、行首尾空白被裁剪；**不支持** `!` 取反与反斜杠转义；文件大小上限 64 KiB（写入时即校验）。匹配路径为账号相对 Git 树路径（`/` 分隔）。
+
+提供三个方法：`get_gitignore`（读取，缺失返回空串）、`set_gitignore`（写入）、`delete_gitignore`（删除，缺失即成功、幂等）。三者都只需请求上下文中的账号，无路径参数。
+
+### get_gitignore()
+
+读取账号 `.ovgitignore` 内容；文件不存在时返回空字符串。
+
+**Python SDK (Embedded / HTTP)**
+
+```python
+content = client.snapshot.get_gitignore()
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.gitGetIgnore());
+```
+
+**HTTP API**
+
+```
+GET /api/v1/snapshot/ignore
+```
+
+```bash
+curl -X GET "http://localhost:1933/api/v1/snapshot/ignore" \
+  -H "X-API-Key: your-key"
+```
+
+**CLI**
+
+```bash
+ov snapshot ignore-get -o json
+```
+
+**响应**
+
+```json
+{
+  "status": "ok",
+  "result": "*.log\n"
+}
+```
+
+> 不带 `-o json` 时，CLI 直接把原始内容打到 stdout（可重定向到文件）。
+
+### set_gitignore()
+
+写入账号 `.ovgitignore` 内容（覆盖）。写入前校验大小上限（64 KiB）；语法（取反、转义等）在 `commit` 时由 Rust 层校验。
+
+**参数**
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| content | str | 是 | - | `.ovgitignore` 文件内容（UTF-8） |
+
+**Python SDK (Embedded / HTTP)**
+
+```python
+client.snapshot.set_gitignore(content="*.log\n")
+```
+
+**TypeScript SDK**
+
+```typescript
+await client.gitSetIgnore("*.tmp\n.cache/\n");
+```
+
+**HTTP API**
+
+```
+PUT /api/v1/snapshot/ignore
+```
+
+```bash
+curl -X PUT "http://localhost:1933/api/v1/snapshot/ignore" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{"content": "*.log\n"}'
+```
+
+**CLI**
+
+```bash
+# 用 --content 直接传内容，或用 --file 从文件读取
+ov snapshot ignore-set --content "*.log" -o json
+ov snapshot ignore-set --file ./my-rules -o json
+```
+
+**响应**
+
+```json
+{
+  "status": "ok",
+  "result": null
+}
+```
+
+### delete_gitignore()
+
+删除账号 `.ovgitignore`。文件不存在也视为成功（幂等）。
+
+**Python SDK (Embedded / HTTP)**
+
+```python
+client.snapshot.delete_gitignore()
+```
+
+**TypeScript SDK**
+
+```typescript
+await client.gitDeleteIgnore();
+```
+
+**HTTP API**
+
+```
+DELETE /api/v1/snapshot/ignore
+```
+
+```bash
+curl -X DELETE "http://localhost:1933/api/v1/snapshot/ignore" \
+  -H "X-API-Key: your-key"
+```
+
+**CLI**
+
+```bash
+ov snapshot ignore-delete -o json
+```
+
+**响应**
+
+```json
+{
+  "status": "ok",
+  "result": null
+}
+```
+
 ## 典型流程
 
 下面演示一个"提交 → 修改 → 恢复"的完整流程（Python SDK）：
@@ -410,7 +608,7 @@ client.snapshot.restore(project_dir=root, source_commit=v1["commit_oid"], messag
 client.close()
 ```
 
-更多端到端示例参见仓库中的 [examples/snapshot/](file:///cloudide/workspace/OpenViking/examples/snapshot) 目录，涵盖 SDK、HTTP、CLI 三种调用方式。
+更多端到端示例参见仓库中的 [examples/snapshot/](https://github.com/volcengine/OpenViking/tree/main/examples/snapshot) 目录，涵盖 SDK、HTTP、CLI 三种调用方式。
 
 ## 错误处理
 
@@ -418,6 +616,7 @@ client.close()
 |------|-------------|--------|
 | 分支/提交不存在，或 `show` 的 `path` 在该提交中不存在 | 404 | `NOT_FOUND` |
 | 恢复期间分支被并发提交改写（CAS 冲突） | 409 | `CONFLICT` |
+| `.ovgitignore` 过大、非 UTF-8，或包含不支持的 `!` 取反/反斜杠转义语法（`commit` 时校验） | 400 | `INVALID_ARGUMENT` |
 | 请求体包含未知字段（请求模型为 `extra="forbid"`） | 400 | `INVALID_ARGUMENT` |
 
 ## 相关文档

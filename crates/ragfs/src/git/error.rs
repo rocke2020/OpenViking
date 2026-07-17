@@ -134,6 +134,49 @@ pub enum GitError {
     #[error("too many files: {count} exceeds limit {limit}")]
     TooManyFiles { count: usize, limit: usize },
 
+    /// Too many unique paths in a filtered log request.
+    #[error("too many log filter paths: {count} exceeds limit {limit}")]
+    TooManyLogPaths { count: usize, limit: usize },
+
+    /// A filtered log path has too many tree components.
+    #[error("log filter path {path:?} has depth {depth}, exceeds limit {limit}")]
+    LogPathTooDeep {
+        path: String,
+        depth: usize,
+        limit: usize,
+    },
+
+    /// Filtered history still has uninspected commits after its scan budget.
+    #[error(
+        "snapshot log scan limit exceeded: scanned {scanned}/{max_scanned} commits, matched {matched}/{requested}"
+    )]
+    LogScanLimitExceeded {
+        scanned: usize,
+        max_scanned: usize,
+        matched: usize,
+        requested: usize,
+    },
+
+    /// `.ovgitignore` exceeds the configured size limit.
+    #[error("ignore file too large: {path} is {size} bytes, limit {max} bytes")]
+    IgnoreFileTooLarge {
+        /// Account-relative path of the offending file.
+        path: String,
+        /// Observed size in bytes.
+        size: u64,
+        /// Configured maximum size in bytes.
+        max: u64,
+    },
+
+    /// `.ovgitignore` is syntactically invalid or cannot be decoded.
+    #[error("invalid ignore file {path}: {reason}")]
+    InvalidIgnoreFile {
+        /// Account-relative path of the offending file.
+        path: String,
+        /// Human-readable explanation of why parsing failed.
+        reason: String,
+    },
+
     /// Feature not enabled
     #[error("git feature not enabled")]
     FeatureDisabled,

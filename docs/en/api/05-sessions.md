@@ -42,7 +42,7 @@ Create a new session. Sessions are containers for conversations, storing message
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | session_id | str | No | None | Session ID. Creates new session with auto-generated ID if None |
-| memory_policy | object | No | None | Default memory extraction policy for the session. Optional `self` and `peer` switches control write targets, and optional top-level `memory_types` limits extraction to specific enabled memory schemas. When `memory_types` is omitted or `null`, all enabled memory schemas are allowed. Invalid shapes or unknown memory types are rejected with `InvalidArgumentError`. |
+| memory_policy | object | No | None | Default memory extraction policy for the session. Optional `self` and `peer` switches control write targets, optional `working_memory.enabled=false` skips archive summaries, and optional top-level `memory_types` limits extraction to specific enabled memory schemas. When `memory_types` is omitted or `null`, all enabled memory schemas are allowed. Invalid shapes or unknown memory types are rejected with `InvalidArgumentError`. |
 
 #### 3. Usage Examples
 
@@ -80,6 +80,13 @@ print(f"Session ID: {result['session_id']}")
 # Create new session with specified ID
 result = await client.create_session(session_id="my-custom-session-id")
 print(f"Session ID: {result['session_id']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+const session = await client.createSession();
+console.log(session);
 ```
 
 **Go SDK**
@@ -159,6 +166,12 @@ client = ov.Client(base_url="http://localhost:1933", api_key="your-key")
 sessions = await client.list_sessions()
 for s in sessions:
     print(f"{s['session_id']} -> {s['uri']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.listSessions());
 ```
 
 **Go SDK**
@@ -258,6 +271,12 @@ print(f"Commits: {info['commit_count']}")
 
 # Get or create session
 info = await client.get_session("a1b2c3d4", auto_create=True)
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.getSession("session-id"));
 ```
 
 **Go SDK**
@@ -386,6 +405,12 @@ print(context["latest_archive_overview"])
 print(len(context["messages"]))
 ```
 
+**TypeScript SDK**
+
+```typescript
+console.log(await client.getSessionContext("session-id"));
+```
+
 **Go SDK**
 
 ```go
@@ -488,6 +513,12 @@ archive = await client.get_session_archive("a1b2c3d4", "archive_002")
 print(archive["archive_id"])
 print(archive["overview"])
 print(len(archive["messages"]))
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.getSessionArchive("session-id", "archive-id"));
 ```
 
 **Go SDK**
@@ -594,6 +625,12 @@ client = ov.Client(base_url="http://localhost:1933", api_key="your-key")
 
 # Delete session
 await client.delete_session("a1b2c3d4")
+```
+
+**TypeScript SDK**
+
+```typescript
+await client.deleteSession("session-id");
 ```
 
 **Go SDK**
@@ -791,6 +828,12 @@ await client.add_message(
 )
 ```
 
+**TypeScript SDK**
+
+```typescript
+await client.addMessage("session-id", { role: "user", content: "Hello" });
+```
+
 **Go SDK**
 
 ```go
@@ -892,6 +935,15 @@ result = await client.batch_add_messages(
     ],
 )
 print(f"Added: {result['added']}, Total: {result['message_count']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+await client.batchAddMessages("session-id", [
+  { role: "user", content: "Hello" },
+  { role: "assistant", content: "Hi" },
+]);
 ```
 
 **Go SDK**
@@ -996,7 +1048,7 @@ curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/used \
 
 #### 1. API Implementation Introduction
 
-Commit a session. Message archiving (Phase 1) completes immediately. Summary generation and memory extraction (Phase 2) run asynchronously in the background. Returns a `task_id` for polling status.
+Commit a session. Message archiving (Phase 1) completes immediately. Summary generation and memory extraction (Phase 2) run asynchronously in the background when messages are archived. Archived commits return `status: "accepted"` with a `task_id`; no-op commits return `status: "skipped"` with `task_id: null`.
 
 **Two-Phase Commit Flow:**
 - **Phase 1 (Synchronous)**: Snapshot current messages, clear live session, create archive directory, write original messages
@@ -1004,6 +1056,7 @@ Commit a session. Message archiving (Phase 1) completes immediately. Summary gen
 
 **Notes:**
 - Rapid consecutive commits on the same session are accepted; each request gets its own `task_id`.
+- Empty sessions, or commits where all messages remain inside `keep_recent_count`, complete synchronously with `archived: false`.
 - Background Phase 2 work is serialized by archive order: archive `N+1` waits until archive `N` writes `.done`.
 - If an earlier archive failed and left no `.done`, later commit requests fail with `FAILED_PRECONDITION` until that failure is resolved.
 - If committed messages contain durable facts, judgments, preferences, or events that mention `viking://resources/...`, memory extraction preserves the resource as a markdown link and records it in `MEMORY_FIELDS.resource_refs`.
@@ -1062,6 +1115,12 @@ if task["status"] == "completed":
     print(f"Memories extracted: {total}")
 ```
 
+**TypeScript SDK**
+
+```typescript
+console.log(await client.commitSession("session-id"));
+```
+
 **Go SDK**
 
 ```go
@@ -1098,6 +1157,22 @@ ov session commit a1b2c3d4
     "task_id": "uuid-xxx",
     "archive_uri": "viking://user/alice/sessions/a1b2c3d4/history/archive_001",
     "archived": true
+  }
+}
+```
+
+**No-op Response Example**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "session_id": "a1b2c3d4",
+    "status": "skipped",
+    "task_id": null,
+    "archive_uri": null,
+    "archived": false,
+    "reason": "no_messages"
   }
 }
 ```
@@ -1188,6 +1263,12 @@ client = ov.Client(base_url="http://localhost:1933", api_key="your-key")
 
 task = await client.get_task(task_id="uuid-xxx")
 print(f"Status: {task['status']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.getTask("task-id"));
 ```
 
 **Go SDK**
@@ -1309,6 +1390,12 @@ tasks = await client.list_tasks(
 )
 for task in tasks:
     print(task["task_id"], task["status"])
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.listTasks());
 ```
 
 **Go SDK**

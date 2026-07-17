@@ -31,6 +31,7 @@ pub mod commit;
 pub mod config;
 pub mod enumerate;
 pub mod error;
+pub mod ignore;
 pub mod index_store;
 pub mod object_store;
 pub mod ref_store;
@@ -41,14 +42,15 @@ pub mod util;
 
 pub use config::{GitConfig, GitLocalConfig, GitS3ConfigPy, GitTuningConfig};
 pub use error::{GitError, ObjectStoreError, RefStoreError};
+pub use ignore::{should_track_path, IgnoreMatcher, OVGITIGNORE_MAX_BYTES, OVGITIGNORE_PATH};
 pub use index_store::{CommitIndex, IndexStore, IndexStoreError};
 pub use object_store::ObjectStore;
 pub use ref_store::RefStore;
 pub use service::GitService;
 pub use tree_builder::{flatten, lookup, TreeEditor};
 pub use types::{
-    Actor, CommitRequest, CommitResponse, IndexEntry, RestoreDiff, RestoreRequest,
-    RestoreResponse, RestoreWritebackPartial, ShowRequest, ShowResponse,
+    Actor, CommitRequest, CommitResponse, IndexEntry, LogEntry, LogRequest, RestoreDiff,
+    RestoreRequest, RestoreResponse, RestoreWritebackPartial, ShowRequest, ShowResponse,
 };
 
 // Re-exports from backends

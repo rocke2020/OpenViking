@@ -21,8 +21,9 @@ from .consts import (
 )
 from .embedding_config import EmbeddingConfig
 from .encryption_config import EncryptionConfig
-from .grep_config import GrepConfig
 from .git_config import GitConfig
+from .grep_config import GrepConfig
+from .ingest_config import IngestConfig
 from .log_config import LogConfig
 from .memory_config import MemoryConfig
 from .oauth_config import OAuthConfig
@@ -38,6 +39,7 @@ from .parser_config import (
     SemanticConfig,
     TextConfig,
     VideoConfig,
+    WebFeedConfig,
 )
 from .prompts_config import PromptsConfig
 from .rerank_config import RerankConfig
@@ -50,6 +52,38 @@ from .vlm_config import VLMConfig
 def _get_config_warning_logger():
     """Use stdlib logging during config bootstrap to avoid early logger side effects."""
     return logging.getLogger(__name__)
+
+
+class ConnectorConfig(BaseModel):
+    """Configuration for external Connector service."""
+
+    enable: bool = False
+    connector: str = ""
+    tracker: str = ""
+    timeout_seconds: int = 3600
+    poll_interval_ms: int = 5000
+    allowed_add_types: List[str] = Field(
+        default_factory=lambda: ["tos"]
+    )
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _validate(self) -> "ConnectorConfig":
+        if self.enable:
+            for name, url in (("connector", self.connector), ("tracker", self.tracker)):
+                if not url.strip():
+                    raise ValueError(f"connector.{name} is required when connector.enable=true")
+                if "://" not in url:
+                    raise ValueError(
+                        f"connector.{name} must be a full endpoint URL including scheme "
+                        "(e.g., http://...)"
+                    )
+        if self.timeout_seconds <= 0:
+            raise ValueError("connector.timeout_seconds must be > 0")
+        if self.poll_interval_ms <= 0:
+            raise ValueError("connector.poll_interval_ms must be > 0")
+        return self
 
 
 class ParserApiConfig(BaseModel):
@@ -185,6 +219,11 @@ class OpenVikingConfig(BaseModel):
         description="Feishu/Lark document parsing configuration",
     )
 
+    webfeed: WebFeedConfig = Field(
+        default_factory=WebFeedConfig,
+        description="Whole-site ingestion via sitemap / RSS / Atom feeds",
+    )
+
     semantic: SemanticConfig = Field(
         default_factory=SemanticConfig,
         description="Semantic processing configuration (overview/abstract limits)",
@@ -193,6 +232,11 @@ class OpenVikingConfig(BaseModel):
     parser_api: ParserApiConfig = Field(
         default_factory=ParserApiConfig,
         description="Third-party parser API configuration (files/responses)",
+    )
+
+    connector: ConnectorConfig = Field(
+        default_factory=ConnectorConfig,
+        description="External Connector service configuration for data import",
     )
 
     auto_generate_l0: bool = Field(
@@ -315,6 +359,11 @@ class OpenVikingConfig(BaseModel):
         description="Prompt template configuration",
     )
 
+    ingest: IngestConfig = Field(
+        default_factory=IngestConfig,
+        description="Conversation-log ingest (openviking-server ingest) configuration",
+    )
+
     model_config = {"arbitrary_types_allowed": True, "extra": "forbid"}
 
     @classmethod
@@ -335,6 +384,7 @@ class OpenVikingConfig(BaseModel):
                 "text",
                 "directory",
                 "feishu",
+                "webfeed",
             ]
             raise_unknown_config_fields(
                 data=config_copy,

@@ -68,7 +68,7 @@ For `provider: "openai-codex"`, `vlm.api_key` is optional when Codex OAuth is al
     "api_base" : "https://ark.cn-beijing.volces.com/api/v3",
     "api_key"  : "your-volcengine-api-key",
     "provider" : "volcengine",
-    "model"    : "doubao-seed-2-0-pro-260215"
+    "model"    : "doubao-seed-2-0-lite-260428"
   }
 }
 ```
@@ -253,7 +253,7 @@ When the embedding provider experiences consecutive transient failures (e.g. `42
 | `doubao-embedding-vision-251215` | 1024 | multimodal | Recommended |
 | `doubao-embedding-250615` | 1024 | text | Text only |
 
-With `input: "multimodal"`, OpenViking can embed text, images (PNG, JPG, etc.), and mixed content.
+With `input: "multimodal"`, OpenViking can embed text, images (PNG, JPG, etc.), and mixed content. Image-to-image search requires this mode; text-only embedding models continue to index image summaries but cannot accept image queries.
 
 **Supported providers:**
 - `openai`: OpenAI Embedding API
@@ -522,6 +522,21 @@ Supported task types: `RETRIEVAL_QUERY`, `RETRIEVAL_DOCUMENT`, `SEMANTIC_SIMILAR
 }
 ```
 
+Sparse output is a provider capability, not an endpoint inferred from
+`storage.vectordb.sparse_weight`. OpenViking currently implements `sparse` and
+`hybrid` embedding providers for `volcengine` and `vikingdb`. The
+OpenAI-compatible, Ollama, and built-in `local` providers are dense-only; a
+self-hosted `/v1/embeddings` endpoint is therefore not treated as a sparse
+endpoint, and OpenViking does not probe a separate
+`/v1/embeddings/sparse` route.
+
+There is no automatic BM25 or other sparse-vector fallback when the configured
+embedder returns only dense vectors. To use hybrid retrieval, configure a
+supported sparse/hybrid provider and set `storage.vectordb.sparse_weight > 0`.
+Model memory requirements are provider/model-specific and are not controlled by
+OpenViking; size self-hosted models against their provider documentation before
+enabling them in production.
+
 #### Hybrid Embedding
 
 Two approaches are supported:
@@ -569,7 +584,7 @@ Vision Language Model for semantic extraction (L0/L1 generation).
 {
   "vlm": {
     "api_key": "your-api-key",
-    "model": "doubao-seed-2-0-pro-260215",
+    "model": "doubao-seed-2-0-lite-260428",
     "api_base": "https://ark.cn-beijing.volces.com/api/v3",
     "max_retries": 3
   }
@@ -588,7 +603,7 @@ Vision Language Model for semantic extraction (L0/L1 generation).
 | `max_concurrent` | int | Maximum concurrent semantic LLM calls (default: `64`) |
 | `max_retries` | int | Maximum retry attempts for transient VLM provider errors (default: `3`; `0` disables retry) |
 | `backup` | object | Optional backup VLM configuration (same shape as `vlm`) for automatic failover when the primary fails with retryable errors such as rate limits, `5xx` responses, or connection/timeout failures. Only one level of failover is supported &mdash; the backup itself cannot define a nested `backup` |
-| `timeout` | float | Per-request HTTP timeout in seconds passed to the underlying OpenAI/LiteLLM client. Increase for slow endpoints (e.g., DashScope, local inference). Must be `> 0` (default: `60.0`) |
+| `timeout` | float | Per-request HTTP timeout in seconds passed to the underlying OpenAI/LiteLLM client. Increase for slow endpoints (e.g., DashScope, local inference). Must be `> 0` (default: `600.0`) |
 | `extra_headers` | object | Custom HTTP headers for compatible HTTP providers. `kimi` also accepts header overrides, but already injects the required subscription headers by default |
 | `extra_request_body` | object | Extra JSON body fields for OpenAI-compatible completion requests, useful for provider-specific options such as Ollama `{"think": false}` |
 | `stream` | bool | Enable streaming mode (for OpenAI-compatible providers, default: `false`) |
@@ -599,7 +614,7 @@ Vision Language Model for semantic extraction (L0/L1 generation).
 
 | Model | Notes |
 |-------|-------|
-| `doubao-seed-2-0-pro-260215` | Recommended for semantic extraction |
+| `doubao-seed-2-0-lite-260428` | Recommended for semantic extraction |
 | `doubao-pro-32k` | For longer context |
 
 When resources are added, VLM generates:
@@ -745,7 +760,7 @@ Configuration for Feishu/Lark cloud document parsing. See [Resources](../api/02-
 | `max_rows_per_sheet` | int | Maximum rows to import per spreadsheet sheet (default: `1000`) |
 | `max_records_per_table` | int | Maximum records to import per bitable table (default: `1000`) |
 
-**Dependency**: `pip install 'openviking[bot-feishu]'`
+**Dependency**: Included by default in `openviking[bot]` installation
 
 **Lark international**: For Lark URLs (`*.larksuite.com`), set `domain` to `https://open.larksuite.com`.
 
@@ -835,6 +850,7 @@ Reranking model for search result refinement. Supports VikingDB (Volcengine), Co
     "api_base": "https://dashscope.aliyuncs.com/compatible-api/v1/reranks",
     "model": "qwen3-vl-rerank",
     "timeout": 120,
+    "max_input_tokens": 2048,
     "threshold": 0.1
   }
 }
@@ -852,6 +868,7 @@ Reranking model for search result refinement. Supports VikingDB (Volcengine), Co
 | `api_base` | str | Endpoint URL (for `openai` provider) |
 | `model` | str | Model name (for `openai` providers) |
 | `timeout` | float | HTTP request timeout in seconds for OpenAI-compatible providers. Increase for slow or cold-starting local rerank servers. Default: `30.0` |
+| `max_input_tokens` | int | Maximum estimated raw-text tokens in each query-document pair sent to the reranker. Oversized inputs retain their beginning and end. `0` disables truncation. Default: `0` |
 | `threshold` | float | Score threshold between `0.0` and `1.0`; results below this are filtered out. Default: `0.1` |
 | `extra_headers` | object | Custom HTTP headers (for OpenAI-compatible providers, optional) |
 
@@ -900,7 +917,7 @@ Grep engine configuration for content pattern search. These settings are server-
 | `engine` | str | Search engine mode: `"auto"` uses VikingDB BM25 recall when available and falls back to local filesystem search; `"fs"` forces local filesystem search only. | `"auto"` |
 | `switch_to_remote_threshold` | int | L2 record count threshold to switch to VikingDB BM25 recall. When the number of L2 files under the search scope reaches this threshold, VikingDB BM25 is used for phase-1 recall; otherwise local filesystem search is used. Set to `0` to always use VikingDB BM25. Must be ≥ 0. | `10000` |
 
-For VikingDB / Volcengine FullText grep, OpenViking writes a `content` text field for BM25 recall. The source context keeps the full content, while the vector-store write payload truncates this field to **1 MB** at the final adapter boundary to stay within backend payload limits.
+For VikingDB / Volcengine FullText grep, OpenViking writes a `content` text field for BM25 recall. The source context keeps the full content, while the vector-store write payload truncates this field to **1 MB** at the final adapter boundary to stay within backend payload limits. Only VikingDB-backed backends use `content`; on all other backends (`local`, `cuvs`, `qdrant`, `opengauss`, `http`) the field is not written.
 
 ### storage
 
@@ -1209,7 +1226,7 @@ Vector database storage configuration
 
 | Parameter | Type | Description | Default |
 |-----------|------|-------------|---------|
-| `backend` | str | VectorDB backend type: 'local' (file-based), 'http' (remote service), 'volcengine' (cloud VikingDB), 'vikingdb' (private deployment), 'qdrant', or 'opengauss' | "local" |
+| `backend` | str | VectorDB backend type: 'local' (file-based), 'http' (remote service), 'volcengine' (cloud VikingDB), 'vikingdb' (private deployment), 'cuvs' (local storage + GPU dense search), 'qdrant', or 'opengauss' | "local" |
 | `name` | str | VectorDB collection name | "context" |
 | `url` | str | Remote service URL for 'http' type (e.g., 'http://localhost:5000') | null |
 | `project_name` | str | Project name (alias project) | "default" |
@@ -1218,6 +1235,7 @@ Vector database storage configuration
 | `sparse_weight` | float | Sparse weight for hybrid vector search, only effective when using hybrid index | 0.0 |
 | `volcengine` | object | 'volcengine' type VikingDB configuration | - |
 | `vikingdb` | object | 'vikingdb' type private deployment configuration | - |
+| `cuvs` | object | NVIDIA cuVS configuration for the 'cuvs' backend and the opt-in memory-aware auto mode on 'local'; see the [cuVS guide](./16-cuvs.md) | - |
 | `qdrant` | object | 'qdrant' type Qdrant configuration | - |
 | `opengauss` | object | 'opengauss' native vector backend configuration | - |
 
@@ -1298,6 +1316,26 @@ OpenViking uses two config files:
 
 When config files are at the default path, OpenViking loads them automatically — no additional setup needed.
 
+> **Root-key two-file rule:** `server.root_api_key` in `ov.conf` is the
+> credential accepted by the server. `root_api_key` in `ovcli.conf` is the
+> client-side copy used by `ov --sudo`. If that CLI manages this server, keep
+> the two values identical and rotate both files together. The normal
+> tenant-scoped `api_key` remains a separate user/admin credential.
+
+### Reload boundary
+
+The server reads `ov.conf` during process startup and does not watch the file
+for changes. Editing `embedding`, `vlm`, `rerank`, `retrieval`, `storage`, or
+`server` settings requires restarting the OpenViking server. Queue work that is
+already running is not migrated to the new configuration, so use the normal
+service-manager restart procedure and verify with `openviking-server doctor`
+after the process comes back.
+
+`ovcli.conf` is client-side configuration. A new `ov` command or newly created
+HTTP client reads the current file; an already-running client or plugin may keep
+the values it loaded at construction time and should be restarted when its
+connection or credential settings change.
+
 If config files are at a different location, there are two ways to specify:
 
 ```bash
@@ -1318,14 +1356,18 @@ For memory-related settings, add a `memory` section in `ov.conf`:
 ```json
 {
   "memory": {
-    "version": "v2"
+    "custom_templates_dir": "/path/to/custom-memory"
   }
 }
 ```
 
 | Field | Description | Default |
 |-------|-------------|---------|
-| `version` | Memory implementation version. Only `"v2"` is supported (legacy `"v1"` removed in #2264 — passing `"v1"` now raises a `ValueError` at config load). | `"v2"` |
+| `version` | Deprecated and ignored. OpenViking always uses the v3 memory extraction pipeline; existing configs that set this field still load without error. | `"v3"` |
+| `custom_templates_dir` | Custom memory templates directory. If set, templates from this directory are loaded in addition to built-in templates. | `""` |
+| `extraction_enabled` | Whether session commit runs long-term memory extraction. | `true` |
+| `session_skill_extraction_enabled` | Whether session commit also extracts reusable skills into the current user's skill directory. | `false` |
+| `link_enabled` | Whether memory extraction writes and resolves memory links. | `false` |
 
 ### ovcli.conf
 
@@ -1398,6 +1440,12 @@ When running OpenViking as an HTTP service, add a `server` section to `ov.conf`:
       "default_mode": "local",
       "shared_max_size_bytes": 536870912,
       "shared_prefix": "viking://upload"
+    },
+    "user_config_defaults": {
+      "add_targets": {
+        "resource_uri": "viking://user/resources",
+        "skill_uri": "viking://user/skills"
+      }
     }
   }
 }
@@ -1412,14 +1460,23 @@ When running OpenViking as an HTTP service, add a `server` section to `ov.conf`:
 | `profile_enabled` | bool | Whether to allow request-scoped cProfile via `profile=1` on HTTP requests. When disabled, the server ignores that query parameter. When enabled, the CLI can display the returned `profile`, while the Python HTTP client currently triggers profiling but does not automatically attach the top-level `profile` field to most SDK return values. | `false` |
 | `cors_origins` | list | Allowed CORS origins | `["*"]` |
 | `public_base_url` | str | Public-facing base URL emitted in MCP-issued upload instructions. Resolution order: env var `OPENVIKING_PUBLIC_BASE_URL` → this field → `X-Forwarded-Host`/`X-Forwarded-Proto` request headers → `Host` request header → listen-address fallback. Set this (or the env var) when the server runs behind a reverse proxy that does not forward `X-Forwarded-*` headers. | `null` |
-| `upload_signed_ttl_seconds` | int | TTL in seconds for one-shot tokens minted by the MCP `add_resource` tool for local-file uploads via the signed `POST /api/v1/resources/temp_upload_signed` endpoint. | `600` (10 minutes) |
+| `upload_signed_ttl_seconds` | int | TTL in seconds for the one-shot tokens minted by the MCP `add_resource` tool for local-file uploads via `POST /api/v1/resources/temp_upload?token=...`. | `600` (10 minutes) |
 | `temp_upload.default_mode` | str | Server-side default for `POST /api/v1/resources/temp_upload` when the client does not send `upload_mode`: `"local"` (per-instance disk, current single-node behavior) or `"shared"` (distributed shared store usable across replicas). | `"local"` |
 | `temp_upload.shared_max_size_bytes` | int | Maximum size accepted in `shared` mode, in bytes. Requests above this size are rejected before object-store write. | `536870912` (512 MiB) |
 | `temp_upload.shared_prefix` | str | URI prefix used when allocating shared `temp_file_id` objects. | `"viking://upload"` |
+| `user_config_defaults.add_targets.resource_uri` | str | Deployment default resource add directory used when `add_resource` omits both `to` and `parent`. `viking://user/...` resolves per request user. | `null` |
+| `user_config_defaults.add_targets.skill_uri` | str | Deployment default skill add root used when `add_skill` omits `target_uri`. Only `viking://user/skills` and `viking://agent/skills` are accepted. | `null` |
 
 `api_key` mode uses API keys and is the default. `trusted` mode trusts `X-OpenViking-Account` / `X-OpenViking-User` headers from a trusted gateway or internal caller.
 
 When `root_api_key` is configured in `api_key` mode, the server enables multi-tenant authentication. Use the Admin API to create accounts and user keys. In `trusted` mode, ordinary requests do not require user registration first; each request is resolved as `USER` from the injected identity headers. However, skipping `root_api_key` in `trusted` mode is allowed only on localhost. Development mode only applies when `auth_mode = "api_key"` and `root_api_key` is not set.
+
+`user_config_defaults` sets defaults for new and existing users when they have no per-user override. For add operations, explicit request targets still win: `add_resource.to` / `add_resource.parent` take precedence over user defaults, and `add_skill.target_uri` takes precedence over user defaults. Per-user overrides are stored in `viking://user/{user_id}/settings/user_config.json`.
+
+Supported add target URIs:
+
+- `resource_uri` is used as the default `add_resource` parent directory, equivalent to `parent=<uri>, create_parent=true`. It must be a writable resource directory URI for the request user. Supported forms are `viking://resources` or `viking://resources/...`, `viking://user/resources` or `viking://user/resources/...`, `viking://user/{user_id}/resources` or `viking://user/{user_id}/resources/...`, and `viking://user/{user_id}/peers/{peer_id}/resources` or `viking://user/{user_id}/peers/{peer_id}/resources/...`. The `viking://user/...` shorthand resolves per request user.
+- `skill_uri` is used as the default `add_skill` target root. In v1, only `viking://user/skills` and `viking://agent/skills` are accepted; explicit `viking://user/{user_id}/skills` is not accepted.
 
 For startup and deployment details see [Deployment](./03-deployment.md), for authentication see [Authentication](./04-authentication.md).
 
@@ -1585,6 +1642,7 @@ For detailed encryption explanations, see [Data Encryption](../concepts/10-encry
     "api_key": "string",
     "model": "string",
     "api_base": "string",
+    "max_input_tokens": 0,
     "threshold": 0.1,
     "extra_headers": {}
   },

@@ -100,11 +100,11 @@ impl CliContext {
             auth.account,
             auth.user,
             self.config.effective_actor_peer_id(),
-            self.config.agent_id.clone(),
             timeout_secs.unwrap_or(self.config.timeout),
             self.profile.unwrap_or(self.config.profile),
-            self.config.extra_headers.clone(),
+            self.config.effective_extra_headers(),
         )
+        .with_gateway_token(self.config.effective_gateway_token())
     }
 }
 
@@ -236,6 +236,33 @@ impl CliContext {
     }
 }
 
+#[derive(Subcommand)]
+enum AttrsCommands {
+    /// Get logical extended attributes
+    Get {
+        /// Viking URI to get attributes for
+        #[arg(value_name = "uri")]
+        uri: String,
+        /// Optional attrs key, for example tags, memory, or memory.tags
+        #[arg(value_name = "key")]
+        key: Option<String>,
+    },
+    /// Update explicit retrieval tags metadata for a file or directory
+    SetTags {
+        /// Viking URI
+        uri: String,
+        /// Comma-separated k=v tags, e.g. env=prod,team=search
+        #[arg(long = "tags", value_delimiter = ',')]
+        tags: Vec<String>,
+        /// Tag update mode: replace or append (append replaces existing values by key)
+        #[arg(long, default_value = "replace")]
+        mode: String,
+        /// Recursively update descendant files and semantic nodes when target is a directory
+        #[arg(long, default_value = "false")]
+        recursive: bool,
+    },
+}
+
 // Commands are organized with category tags in their doc comments.
 //
 // # Command Tagging System
@@ -341,7 +368,12 @@ enum Commands {
         #[arg(long, value_name = "seconds", help_heading = "Common options")]
         timeout: Option<f64>,
         /// Parent skill root URI (e.g. viking://agent/skills); defaults to user-private skills
-        #[arg(short = 'p', long = "parent-auto-create", value_name = "uri", help_heading = "Skill options")]
+        #[arg(
+            short = 'p',
+            long = "parent-auto-create",
+            value_name = "uri",
+            help_heading = "Skill options"
+        )]
         parent: Option<String>,
         #[command(flatten)]
         upload_options: UploadCliOptions,
@@ -464,6 +496,11 @@ enum Commands {
         #[arg(value_name = "uri")]
         uri: String,
     },
+    /// [Data] Get logical extended attributes
+    Attrs {
+        #[command(subcommand)]
+        action: AttrsCommands,
+    },
     /// [Data] Read file content (Level 2)
     Read {
         /// Viking URI
@@ -522,6 +559,7 @@ enum Commands {
         timeout: Option<f64>,
     },
     /// [Data] Update explicit retrieval tags metadata for a file or directory
+    #[command(hide = true)]
     SetTags {
         /// Viking URI
         uri: String,
@@ -548,7 +586,14 @@ enum Commands {
     Find {
         /// Search query
         #[arg(value_name = "query")]
-        query: String,
+        query: Option<String>,
+        /// Image query: local path, data URI, HTTP URL, or viking:// URI
+        #[arg(
+            long = "image",
+            value_name = "path|uri",
+            help_heading = "Common options"
+        )]
+        image: Option<String>,
         /// Target URI
         #[arg(
             short,
@@ -606,7 +651,14 @@ enum Commands {
     Search {
         /// Search query
         #[arg(value_name = "query")]
-        query: String,
+        query: Option<String>,
+        /// Image query: local path, data URI, HTTP URL, or viking:// URI
+        #[arg(
+            long = "image",
+            value_name = "path|uri",
+            help_heading = "Common options"
+        )]
+        image: Option<String>,
         /// Target URI
         #[arg(
             short,
@@ -951,10 +1003,11 @@ enum Commands {
         /// Viking URI
         #[arg(value_name = "uri")]
         uri: String,
-        /// Reindex mode
+        /// Reindex mode: vectors_only rebuilds vectors; semantic_and_vectors regenerates semantic artifacts, then vectors; prune_orphans deletes orphan vector records
         #[arg(
             long,
             default_value = "vectors_only",
+            value_parser = ["vectors_only", "semantic_and_vectors", "prune_orphans"],
             value_name = "mode",
             help_heading = "Common options"
         )]
@@ -968,6 +1021,9 @@ enum Commands {
             help_heading = "Common options"
         )]
         wait: bool,
+        /// Preview prune_orphans deletions without mutating vectors
+        #[arg(long, help_heading = "Common options")]
+        dry_run: bool,
     },
 }
 
@@ -1075,7 +1131,23 @@ pub(crate) enum SnapshotCmd {
         branch: String,
         #[arg(long, default_value_t = 20)]
         limit: u32,
+        /// Show only commits touching any of these viking:// URIs (comma-separated); accepts files and directories.
+        #[arg(long, value_delimiter = ',')]
+        paths: Option<Vec<String>>,
     },
+    /// Get the account .ovgitignore content
+    IgnoreGet,
+    /// Set the account .ovgitignore content
+    IgnoreSet {
+        /// .ovgitignore content passed inline
+        #[arg(long = "content")]
+        content: Option<String>,
+        /// File to read the content from; takes precedence over --content
+        #[arg(long = "file")]
+        file: Option<std::path::PathBuf>,
+    },
+    /// Delete the account .ovgitignore
+    IgnoreDelete,
 }
 
 #[derive(Subcommand)]
@@ -1500,6 +1572,12 @@ enum AdminCommands {
         /// First admin user ID
         #[arg(long = "admin", value_name = "user-id")]
         admin_user_id: String,
+        /// Deterministic API key seed
+        #[arg(long, value_name = "seed")]
+        seed: Option<String>,
+        /// Initial config for the first admin user as JSON
+        #[arg(long = "user-config-json", value_name = "json")]
+        user_config_json: Option<String>,
     },
     /// List all accounts (ROOT only)
     ListAccounts,
@@ -1526,6 +1604,12 @@ enum AdminCommands {
         /// Role: admin or user
         #[arg(long, default_value = "user", value_name = "role")]
         role: String,
+        /// Deterministic API key seed
+        #[arg(long, value_name = "seed")]
+        seed: Option<String>,
+        /// Initial config for the new user as JSON
+        #[arg(long = "user-config-json", value_name = "json")]
+        user_config_json: Option<String>,
     },
     /// List all users in an account
     ListUsers {
@@ -1571,6 +1655,9 @@ enum AdminCommands {
         /// User ID
         #[arg(value_name = "user-id")]
         user_id: String,
+        /// Deterministic API key seed
+        #[arg(long, value_name = "seed")]
+        seed: Option<String>,
     },
 }
 
@@ -2932,6 +3019,15 @@ async fn main() {
         } => handlers::handle_rm(uri, recursive, wait, timeout, ctx).await,
         Commands::Mv { from_uri, to_uri } => handlers::handle_mv(from_uri, to_uri, ctx).await,
         Commands::Stat { uri } => handlers::handle_stat(uri, ctx).await,
+        Commands::Attrs { action } => match action {
+            AttrsCommands::Get { uri, key } => handlers::handle_attrs(uri, key, ctx).await,
+            AttrsCommands::SetTags {
+                uri,
+                tags,
+                mode,
+                recursive,
+            } => handlers::handle_set_tags(uri, tags, mode, recursive, ctx).await,
+        },
         Commands::AddMemory { content } => handlers::handle_add_memory(content, ctx).await,
         Commands::Tui { uri } => handlers::handle_tui(uri, ctx).await,
         Commands::Chat {
@@ -2944,11 +3040,11 @@ async fn main() {
         } => {
             let session_id = session.or_else(|| config::get_or_create_machine_id().ok());
             let endpoint = if let Ok(env_endpoint) = std::env::var("VIKINGBOT_ENDPOINT") {
-                env_endpoint
+                Some(env_endpoint)
             } else if let Ok(config_url) = std::env::var("OPENVIKING_URL") {
-                format!("{}/bot/v1", config_url)
+                Some(format!("{}/bot/v1", config_url))
             } else {
-                format!("{}/bot/v1", ctx.config.url)
+                None
             };
             let api_key = std::env::var("VIKINGBOT_API_KEY").ok();
             let cmd = commands::chat::ChatCommand {
@@ -2956,6 +3052,7 @@ async fn main() {
                 api_key,
                 account: ctx.config.account.clone(),
                 user: ctx.config.user.clone(),
+                actor_peer_id: ctx.config.effective_actor_peer_id(),
                 session: session_id,
                 sender,
                 message,
@@ -3020,12 +3117,16 @@ async fn main() {
             mode,
             recursive,
         } => handlers::handle_set_tags(uri, tags, mode, recursive, ctx).await,
-        Commands::Reindex { uri, mode, wait } => {
-            handlers::handle_reindex(uri, mode, wait, ctx).await
-        }
+        Commands::Reindex {
+            uri,
+            mode,
+            wait,
+            dry_run,
+        } => handlers::handle_reindex(uri, mode, wait, dry_run, ctx).await,
         Commands::Get { uri, local_path } => handlers::handle_get(uri, local_path, ctx).await,
         Commands::Find {
             query,
+            image,
             uri,
             node_limit,
             threshold,
@@ -3038,6 +3139,7 @@ async fn main() {
             handlers::handle_find(
                 query,
                 uri,
+                image,
                 node_limit,
                 threshold,
                 after,
@@ -3051,6 +3153,7 @@ async fn main() {
         }
         Commands::Search {
             query,
+            image,
             uri,
             session_id,
             node_limit,
@@ -3064,6 +3167,7 @@ async fn main() {
             handlers::handle_search(
                 query,
                 uri,
+                image,
                 session_id,
                 node_limit,
                 threshold,
@@ -3168,6 +3272,20 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_find_image_without_query() {
+        let cli = Cli::try_parse_from(["ov", "find", "--image", "cat.png"])
+            .expect("find image should parse");
+
+        match cli.command {
+            Commands::Find { query, image, .. } => {
+                assert_eq!(query, None);
+                assert_eq!(image.as_deref(), Some("cat.png"));
+            }
+            _ => panic!("expected find command"),
+        }
+    }
+
+    #[test]
     fn cli_parses_admin_migrate_cleanup_flag() {
         let migrate = Cli::try_parse_from(["ov", "--sudo", "admin", "migrate"])
             .expect("admin migrate should parse");
@@ -3200,6 +3318,20 @@ mod tests {
         match cli.command {
             Commands::Search { context_type, .. } => {
                 assert_eq!(context_type, Some(vec!["skill".to_string()]));
+            }
+            _ => panic!("expected search command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_search_image_with_query() {
+        let cli = Cli::try_parse_from(["ov", "search", "poster", "--image", "viking://x.png"])
+            .expect("search image should parse");
+
+        match cli.command {
+            Commands::Search { query, image, .. } => {
+                assert_eq!(query.as_deref(), Some("poster"));
+                assert_eq!(image.as_deref(), Some("viking://x.png"));
             }
             _ => panic!("expected search command"),
         }
@@ -3667,7 +3799,7 @@ mod tests {
             .expect("skills list should parse");
         match list.command {
             Commands::Skills {
-                action: SkillCommands::List { node_limit },
+                action: SkillCommands::List { node_limit, .. },
             } => assert_eq!(node_limit, 25),
             _ => panic!("expected skills list"),
         }
@@ -3789,7 +3921,10 @@ mod tests {
             .expect("skills remove --yes should parse");
         match remove.command {
             Commands::Skills {
-                action: SkillCommands::Remove { skills, yes, all },
+                action:
+                    SkillCommands::Remove {
+                        skills, yes, all, ..
+                    },
             } => {
                 assert_eq!(skills, vec!["foo", "bar"]);
                 assert!(yes);
@@ -4202,6 +4337,7 @@ mod tests {
             upload: Default::default(),
             extra_headers: None,
             profile: false,
+            gateway_token: None,
         };
 
         let ctx = CliContext::from_config(
@@ -4224,7 +4360,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_context_maps_legacy_agent_id_to_actor_peer_scope() {
+    fn cli_context_maps_agent_id_to_actor_peer_scope() {
         let config = Config {
             url: DEFAULT_CUSTOM_URL.to_string(),
             api_key: Some("test-key".to_string()),
@@ -4241,6 +4377,7 @@ mod tests {
             upload: Default::default(),
             extra_headers: None,
             profile: false,
+            gateway_token: None,
         };
 
         let ctx = CliContext::from_config(
@@ -4258,7 +4395,6 @@ mod tests {
         let client = ctx.get_client();
 
         assert_eq!(client.actor_peer_id(), Some("legacy-agent"));
-        assert_eq!(client.legacy_agent_id(), Some("legacy-agent"));
     }
 
     #[test]
@@ -4279,6 +4415,7 @@ mod tests {
             profile: false,
             upload: Default::default(),
             extra_headers: None,
+            gateway_token: None,
         };
 
         // Without sudo: use api_key
@@ -4369,11 +4506,25 @@ mod tests {
             "reindex",
             "viking://resources/demo",
             "--mode",
-            "semantic_and_vectors",
+            "prune_orphans",
             "--wait=false",
+            "--dry-run",
         ]);
 
         assert!(result.is_ok(), "reindex command should parse");
+    }
+
+    #[test]
+    fn cli_rejects_unknown_reindex_mode() {
+        let result = Cli::try_parse_from([
+            "ov",
+            "reindex",
+            "viking://resources/demo",
+            "--mode",
+            "semantic",
+        ]);
+
+        assert!(result.is_err(), "unknown reindex mode should not parse");
     }
 
     #[test]

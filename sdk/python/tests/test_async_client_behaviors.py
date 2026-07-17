@@ -1,6 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from openviking_sdk import AsyncHTTPClient, SyncHTTPClient
@@ -70,8 +70,9 @@ async def test_async_http_client_reindex_posts_content_reindex():
 
     result = await client.reindex(
         "viking://resources/demo",
-        mode="vectors_only",
+        mode="prune_orphans",
         wait=False,
+        dry_run=True,
     )
 
     assert result == {"status": "completed"}
@@ -79,8 +80,9 @@ async def test_async_http_client_reindex_posts_content_reindex():
         "/api/v1/content/reindex",
         json={
             "uri": "viking://resources/demo",
-            "mode": "vectors_only",
+            "mode": "prune_orphans",
             "wait": False,
+            "dry_run": True,
         },
     )
 
@@ -90,6 +92,7 @@ def test_sync_http_client_reindex_forwards_to_async_client():
     with patch.object(
         client._async_client,
         "reindex",
+        new_callable=Mock,
         return_value={"status": "accepted"},
     ) as mock_reindex:
         with patch(
@@ -98,13 +101,19 @@ def test_sync_http_client_reindex_forwards_to_async_client():
         ) as mock_run:
             result = client.reindex(
                 "viking://resources/demo",
-                mode="vectors_only",
+                mode="prune_orphans",
                 wait=False,
+                dry_run=True,
             )
 
     assert result == {"status": "accepted"}
     assert mock_run.called
-    assert mock_reindex.called
+    mock_reindex.assert_called_once_with(
+        uri="viking://resources/demo",
+        mode="prune_orphans",
+        wait=False,
+        dry_run=True,
+    )
 
 
 def test_sync_http_client_batch_add_messages_forwards_to_async_client():
@@ -364,6 +373,53 @@ async def test_add_resource_uploads_local_file_even_when_url_is_localhost(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_admin_create_paths_accept_initial_user_config():
+    client = AsyncHTTPClient(url="http://localhost:1933")
+    fake_http = SimpleNamespace(post=AsyncMock(return_value=object()))
+    client._http = fake_http
+    client._handle_response = lambda _response: {"status": "ok"}
+
+    user_config = {"add_targets": {"resource_uri": "viking://user/resources/project-a"}}
+    await client.admin_create_account("acct", "admin", user_config=user_config)
+    await client.admin_register_user("acct", "alice", "admin", user_config=user_config)
+
+    assert fake_http.post.await_args_list[0].kwargs["json"] == {
+        "account_id": "acct",
+        "admin_user_id": "admin",
+        "user_config": user_config,
+    }
+    assert fake_http.post.await_args_list[1].kwargs["json"] == {
+        "user_id": "alice",
+        "role": "admin",
+        "user_config": user_config,
+    }
+
+
+@pytest.mark.asyncio
+async def test_admin_seed_payloads_are_sent():
+    client = AsyncHTTPClient(url="http://localhost:1933")
+    fake_http = SimpleNamespace(post=AsyncMock(return_value=object()))
+    client._http = fake_http
+    client._handle_response = lambda _response: {"status": "ok"}
+
+    await client.admin_create_account("acct", "admin", seed="admin-seed")
+    await client.admin_register_user("acct", "alice", "admin", seed="alice-seed")
+    await client.admin_regenerate_key("acct", "alice", seed="new-seed")
+
+    assert fake_http.post.await_args_list[0].kwargs["json"] == {
+        "account_id": "acct",
+        "admin_user_id": "admin",
+        "seed": "admin-seed",
+    }
+    assert fake_http.post.await_args_list[1].kwargs["json"] == {
+        "user_id": "alice",
+        "role": "admin",
+        "seed": "alice-seed",
+    }
+    assert fake_http.post.await_args_list[2].kwargs["json"] == {"seed": "new-seed"}
+
+
+@pytest.mark.asyncio
 async def test_import_ovpack_uploads_local_file_even_when_url_is_localhost(tmp_path):
     pack_file = tmp_path / "demo.ovpack"
     pack_file.write_bytes(b"ovpack")
@@ -445,10 +501,6 @@ async def test_search_uses_session_wrapper_session_id_in_payload():
             "target_uri": "viking://resources/demo",
             "session_id": "thread-123",
             "limit": 5,
-            "score_threshold": None,
-            "filter": None,
-            "context_type": None,
-            "tags": None,
             "telemetry": False,
         },
     )
@@ -491,11 +543,11 @@ async def test_glob_normalizes_scope_uri():
         "matches": ["viking://resources/demo.md"],
     }
 
-    await client.glob("*.md", uri="/resources/")
+    await client.glob("**/*.md", uri="/resources/")
 
     fake_http.post.assert_awaited_once_with(
         "/api/v1/search/glob",
-        json={"pattern": "*.md", "uri": "viking://resources/"},
+        json={"pattern": "**/*.md", "uri": "viking://resources/"},
     )
 
 
@@ -514,6 +566,8 @@ async def test_ls_passes_full_query_params():
         abs_limit=32,
         show_all_hidden=True,
         node_limit=44,
+        sort_by="mtime",
+        sort_order="desc",
     )
 
     fake_http.get.assert_awaited_once_with(
@@ -526,6 +580,8 @@ async def test_ls_passes_full_query_params():
             "abs_limit": 32,
             "show_all_hidden": True,
             "node_limit": 44,
+            "sort_by": "mtime",
+            "sort_order": "desc",
         },
     )
 
@@ -664,6 +720,9 @@ async def test_export_and_backup_ovpack_append_default_suffixes(tmp_path):
     backup_response = SimpleNamespace(is_success=True, content=b"backup")
     fake_http = SimpleNamespace(post=AsyncMock(side_effect=[export_response, backup_response]))
     client._http = fake_http
+    existing_export = tmp_path / "exports" / "demo.ovpack"
+    existing_export.parent.mkdir()
+    existing_export.write_bytes(b"old-backup")
 
     export_path = await client.export_ovpack("/resources/demo/", str(tmp_path / "exports" / "demo"))
     backup_path = await client.backup_ovpack(str(tmp_path / "backup-dir"))
@@ -672,6 +731,27 @@ async def test_export_and_backup_ovpack_append_default_suffixes(tmp_path):
     assert Path(export_path).read_bytes() == b"exported"
     assert backup_path.endswith("backup-dir.ovpack")
     assert Path(backup_path).read_bytes() == b"backup"
+
+
+@pytest.mark.asyncio
+async def test_backup_ovpack_preserves_existing_file_when_replace_fails(tmp_path):
+    client = AsyncHTTPClient(url="http://localhost:1933")
+    client._http = SimpleNamespace(
+        post=AsyncMock(
+            return_value=SimpleNamespace(is_success=True, content=b"new-backup")
+        )
+    )
+    output = tmp_path / "backup.ovpack"
+    output.write_bytes(b"known-good-backup")
+
+    with patch(
+        "openviking_sdk.client.os.replace", side_effect=OSError("replace failed")
+    ):
+        with pytest.raises(OSError, match="replace failed"):
+            await client.backup_ovpack(str(output))
+
+    assert output.read_bytes() == b"known-good-backup"
+    assert list(tmp_path.iterdir()) == [output]
 
 
 @pytest.mark.asyncio

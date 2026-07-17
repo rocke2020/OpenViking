@@ -67,7 +67,7 @@ class VLMBase(ABC):
         self.api_base = config.get("api_base")
         self.temperature = config.get("temperature", 0.0)
         self.max_retries = config.get("max_retries", 3)
-        self.timeout = config.get("timeout", 60.0)
+        self.timeout = config.get("timeout", 600.0)
         self.max_tokens = config.get("max_tokens")
         self.extra_headers = config.get("extra_headers")
         self.extra_request_body = dict(config.get("extra_request_body") or {})
@@ -330,14 +330,6 @@ class VLMFactory:
             from .backends.litellm_vlm import LiteLLMVLMProvider
 
             return LiteLLMVLMProvider(config)
-
-    @staticmethod
-    def get_available_providers() -> List[str]:
-        """Get list of available providers"""
-        from .registry import get_all_provider_names
-
-        return get_all_provider_names()
-
 
 def _annotate_vlm_error(exc: Exception, vlm_instance: "VLMBase") -> None:
     """Attach model and api_base info to an exception for better error diagnostics.
@@ -824,11 +816,6 @@ class MultiCredentialVLM(VLMBase):
             tool_choice=tool_choice,
             messages=messages,
         )
-
-    @property
-    def active_credential_index(self) -> int:
-        """Get the index of the currently active credential."""
-        return self._switcher.get_active_index()
 
     @property
     def active_credential_id(self) -> str:

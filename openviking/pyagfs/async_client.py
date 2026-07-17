@@ -66,10 +66,6 @@ class AsyncAGFSClient:
     def __init__(self, client: AGFSSyncClientProtocol):
         self._client = client
 
-    @property
-    def sync_client(self) -> AGFSSyncClientProtocol:
-        return self._client
-
     async def run(self, method_name: str, /, *args: Any, **kwargs: Any) -> Any:
         """Run a sync client method in a worker thread, preserving ctx when supported."""
         try:
@@ -221,6 +217,28 @@ class AsyncAGFSClient:
             show_hidden=show_hidden,
             node_limit=node_limit,
             level_limit=level_limit,
+            ctx=_fs_ctx_or_default(path, fs_ctx),
+        )
+
+    async def glob_directory(
+        self,
+        path: str,
+        pattern: str,
+        show_hidden: bool = False,
+        page_size: int | None = None,
+        level_limit: int | None = None,
+        continuation_token: str | None = None,
+        *,
+        fs_ctx: Dict[str, str] | None = None,
+    ) -> Dict[str, Any]:
+        return await self.run(
+            "glob_directory",
+            path,
+            pattern,
+            show_hidden=show_hidden,
+            page_size=page_size,
+            level_limit=level_limit,
+            continuation_token=continuation_token,
             ctx=_fs_ctx_or_default(path, fs_ctx),
         )
 

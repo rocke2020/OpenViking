@@ -3,6 +3,55 @@
 OpenViking 的所有重要变更都将记录在此文件中。
 此更新日志从 [GitHub Releases](https://github.com/volcengine/OpenViking/releases) 自动生成。
 
+## v0.4.9 (2026-07-10)
+
+### 重点更新
+
+- **Agent 工作区隔离**：Codex、Claude Code、OpenCode 和 Pi 集成支持从工作区派生 peer identity，实现项目级记忆隔离，并扩展共享安装器与混合 MCP 支持。
+- **检索与记忆正确性**：新增图片搜索，正确处理 agent-only / peer-only 记忆范围，并避免生成嵌套的记忆链接。
+- **存储与安全加固**：串行化本地 collection 懒加载，按后端约束 VikingDB content 写入，并阻止 Git submodule SSRF。
+- **VikingBot 与平台修复**：新增统一 gateway 路由和 OpenViking 鉴权，并修复渠道 sender metadata、仅 VLM 配置、Windows 向量后端和 benchmark 并发问题。
+
+[完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.4.8...v0.4.9)
+
+## v0.4.8 (2026-07-08)
+
+### 重点更新
+
+- **NVIDIA cuVS 向量后端**：支持 opt-in 的 GPU 精确/近似检索，以及本地后端的显存感知回退。
+- **递归网页导入**：基于 Scrapy 和 trafilatura，支持深度、页数、路径和下载链接限制的同站爬取。
+- **记忆 v3 与训练**：启用 v3 抽取链路、流式 patch-merge 更新和 session train/eval。
+- **Agent 插件安装**：Codex / Claude Code 支持远程 marketplace，stdio MCP 代理与 hooks 共享 `ovcli.conf` 凭据。
+- **文件系统与 RAGFS**：支持后端分页 glob、稳定的目录优先排序和标准相对路径匹配。
+
+[完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.4.7...v0.4.8)
+
+## v0.4.7 (2026-07-02)
+
+### 重点更新
+
+- **MCP 本地文件链路**：compact 工具描述降低上下文开销，签名 `temp_upload` token 支持本地文件自动入库。
+- **文件系统与版本管理**：新增 filesystem attrs 和账号级 `.ovgitignore` 规则。
+- **SDK 与鉴权**：Go SDK 新增 skill scope 和 grep 深度控制，OAuth client scope 持久化，并支持 seeded API key。
+- **Studio 与初始化体验**：重做 Connection & Identity 页面，修正 assumed account，并新增 TUI 风格初始化向导。
+
+[完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.4.6...v0.4.7)
+
+## v0.4.6 (2026-06-29)
+
+### 重点更新
+
+- **VikingFS 快照版本管理**：HTTP、Python SDK 和 CLI 支持 Git-backed `commit`、`log`、`show`、`restore`。
+- **整站导入**：支持 sitemap、sitemap index、RSS 和 Atom，并可生成持续刷新的资源树。
+- **共享 Agent Skills**：恢复 `viking://agent/skills` 账号级共享根，用户私有 skill 仍为默认目标。
+- **VikingDB BM25 grep 与 Studio 指标**：增强关键词检索与用户可见的使用指标。
+
+### 升级说明
+
+- 从 0.3.x 升级且仍有 legacy agent/session 数据时，应先在 v0.4.5 完成迁移和 cleanup，再升级到 v0.4.6 或更高版本。
+
+[完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.4.5...v0.4.6)
+
 ## v0.4.5 (2026-06-24)
 
 ### 重点更新
@@ -98,7 +147,7 @@ OpenViking 的所有重要变更都将记录在此文件中。
 
 - **原生 `ov` CLI 体验重构**：`ov config` 现在是配置管理入口，可交互式添加、编辑、删除、切换配置；`ov config show`、`ov config validate`、`ov config switch` 保留为显式子命令。新增 `ov language` / `ov lang` 选择显示语言，`ov status [--verbose]` 提供聚合诊断视图，`ov health` 与错误提示改为更可读的渲染。
 - **Web Studio Playground 与身份管理**：Studio 侧边栏新增 Playground，可查看上下文树、运行 Terminal 操作并与 Agent 面板交互；Connection & Identity 页面支持保存连接、选择 account/user 身份、创建 account/user、复制或重新生成 API key。
-- **VikingBot 经验召回配置化**：新增 `bot.ov_server.recall_exp_first_round_only`、`exp_recall_limit`、`exp_recall_max_chars`，用于在单任务/评测场景中只在第一轮注入 agent experience；本地与远端模式都按传入 `agent_id` 做经验命名空间隔离。
+- **VikingBot 经验召回配置化**：新增 `bot.ov_server.exp_recall_limit`、`exp_recall_max_chars`，用于调整 agent experience 召回；本地与远端模式都按传入 `agent_id` 做经验命名空间隔离。
 - **资源 Watch 更易用**：`add_resource` 设置 `watch_interval > 0` 时不再强制要求显式 `to`；如果导入结果返回稳定 `root_uri`，watch task 会自动绑定到该 URI，CLI/MCP/文档示例同步更新。
 - **插件结构化工具结果与 CJK token 估算**：Claude Code / OpenClaw 插件改为向 OpenViking 写入结构化 tool parts，工具调用与结果不再只能内联到文本；CJK-aware token 估算覆盖 Python 与插件侧，降低中文、日文、韩文会话的预算低估风险。
 

@@ -7,6 +7,7 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import AsyncGenerator
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -59,24 +60,6 @@ async def temp_storage(tmp_path: Path) -> AsyncGenerator[Path, None]:
 async def mock_viking_fs(temp_storage: Path) -> MockVikingFS:
     """Create mock VikingFS instance."""
     return MockVikingFS(root_path=str(temp_storage))
-
-
-@pytest_asyncio.fixture
-async def watch_manager(mock_viking_fs: MockVikingFS) -> AsyncGenerator[WatchManager, None]:
-    """Create WatchManager instance with mock VikingFS."""
-    manager = WatchManager(viking_fs=mock_viking_fs)
-    await manager.initialize()
-    yield manager
-    await manager.clear_all_tasks()
-
-
-@pytest_asyncio.fixture
-async def watch_manager_no_fs() -> AsyncGenerator[WatchManager, None]:
-    """Create WatchManager instance without VikingFS."""
-    manager = WatchManager(viking_fs=None)
-    await manager.initialize()
-    yield manager
-    await manager.clear_all_tasks()
 
 
 class TestWatchTask:
@@ -228,6 +211,64 @@ class TestWatchManager:
         assert task.watch_interval == 30.0
         assert task.is_active is True
         assert task.next_execution_time is not None
+
+    @pytest.mark.asyncio
+    async def test_deactivate_tasks_under_uri_internal_matches_subtree(
+        self, watch_manager_no_fs: WatchManager
+    ):
+        root = await watch_manager_no_fs.create_task(
+            path="/test/root",
+            to_uri="viking://resources/codeask/wiki",
+            watch_interval=30.0,
+        )
+        child = await watch_manager_no_fs.create_task(
+            path="/test/child",
+            to_uri="viking://resources/codeask/wiki/page",
+            watch_interval=30.0,
+        )
+        sibling = await watch_manager_no_fs.create_task(
+            path="/test/sibling",
+            to_uri="viking://resources/codeask/wiki-renamed",
+            watch_interval=30.0,
+        )
+
+        deactivated = await watch_manager_no_fs.deactivate_tasks_under_uri_internal(
+            "viking://resources/codeask/wiki"
+        )
+
+        assert {task.task_id for task in deactivated} == {root.task_id, child.task_id}
+        assert (await watch_manager_no_fs.get_task(root.task_id)).is_active is False
+        assert (await watch_manager_no_fs.get_task(child.task_id)).is_active is False
+        assert (await watch_manager_no_fs.get_task(sibling.task_id)).is_active is True
+
+    @pytest.mark.asyncio
+    async def test_sync_tasks_with_resource_move_internal_rolls_back_task_state_on_save_failure(
+        self, watch_manager_no_fs: WatchManager
+    ):
+        root = await watch_manager_no_fs.create_task(
+            path="/test/root",
+            to_uri="viking://resources/codeask/wiki",
+            parent_uri=None,
+            watch_interval=30.0,
+        )
+        watch_manager_no_fs._save_tasks = AsyncMock(side_effect=RuntimeError("save failed"))
+        move_resource = AsyncMock()
+        rollback_resource = AsyncMock()
+
+        with pytest.raises(RuntimeError, match="save failed"):
+            await watch_manager_no_fs.sync_tasks_with_resource_move_internal(
+                "viking://resources/codeask/wiki",
+                "viking://resources/codeask/wiki-renamed",
+                move_resource=move_resource,
+                rollback_resource=rollback_resource,
+            )
+
+        move_resource.assert_awaited_once()
+        rollback_resource.assert_awaited_once()
+        restored = await watch_manager_no_fs.get_task(root.task_id)
+        assert restored is not None
+        assert restored.to_uri == "viking://resources/codeask/wiki"
+        assert restored.parent_uri is None
 
     @pytest.mark.asyncio
     async def test_auth_state_persisted_and_hidden_from_public_dict(
@@ -491,23 +532,6 @@ class TestWatchManager:
 
         assert len(due_tasks) == 1
         assert due_tasks[0].task_id == task1.task_id
-
-    @pytest.mark.asyncio
-    async def test_clear_all_tasks(self, watch_manager: WatchManager):
-        """Test clearing all tasks."""
-        await watch_manager.create_task(path="/test/path1")
-        await watch_manager.create_task(path="/test/path2")
-
-        count = await watch_manager.clear_all_tasks()
-
-        assert count == 2
-
-        tasks = await watch_manager.get_all_tasks(
-            account_id=TEST_ACCOUNT_ID,
-            user_id=TEST_USER_ID,
-            role=TEST_ROLE,
-        )
-        assert len(tasks) == 0
 
     @pytest.mark.asyncio
     async def test_create_task_with_non_positive_interval_raises(self, watch_manager: WatchManager):

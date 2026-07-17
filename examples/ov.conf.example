@@ -98,7 +98,7 @@
         },
     },
     "vlm": {
-        "model": "doubao-seed-2-0-pro-260215",
+        "model": "doubao-seed-2-0-lite-260428",
         "api_key": "{your-api-key}",
         "api_base": "https://ark.cn-beijing.volces.com/api/v3",
         "temperature": 0.0,
@@ -162,6 +162,32 @@
         "extraction_enabled": true,
         "session_skill_extraction_enabled": false,
     },
+    "ingest": {
+        "enabled": false,
+        "server_url": "$OPENVIKING_URL",
+        "api_key": "$OPENVIKING_API_KEY",
+        "account": "default",
+        "user": "default",
+        "harnesses": {
+            "claude_code": {"enabled": false, "mode": "both"},
+            "codex": {"enabled": false, "mode": "backfill"},
+            "opencode": {"enabled": false, "mode": "watch", "experimental": true},
+            "hermes": {"enabled": false, "mode": "both", "user_field": "sender"},
+            "openclaw": {"enabled": false, "mode": "both", "user_field": "sender"},
+        },
+    },
+    "bot": {
+        "gateway": {
+            "host": "127.0.0.1",
+            "port": 18790,
+            "token": null,
+        },
+        "ov_server": {
+            "server_url": null,
+            "api_key_type": "user",
+            "api_key": null,
+        },
+    },
     "log": {
         "level": "INFO",
         "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -201,7 +227,11 @@
             "enable_vlm": true,
             "ocr_lang": "eng",
             "vlm_model": "gpt-4-vision",
-            "max_dimension": 2048,
+            "preview_max_dimension": 2048,
+            "max_file_size_mb": 10.0,
+            "max_tile_dimension_px": 2048,
+            "tile_overlap_px": 2,
+            "large_image_threshold_dimension": 4096
         },
         "audio": {
             "enable_transcription": true,
@@ -233,6 +263,16 @@
             "split_by_paragraphs": true,
             "max_paragraph_length": 1000,
             "preserve_line_breaks": false,
+        },
+        "webfeed": {
+            "max_pages": 200,
+            "max_concurrency": 5,
+            "request_timeout": 30.0,
+            "politeness_delay": 0.2,
+            "same_host_only": true,
+            "respect_robots": true,
+            "max_depth": 2,
+            "suggest_feed": true,
         },
     },
     "encryption": {

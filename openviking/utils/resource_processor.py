@@ -17,13 +17,14 @@ from openviking.parse.tree_builder import TreeBuilder
 from openviking.server.identity import RequestContext
 from openviking.storage import VikingDBManager
 from openviking.storage.errors import LockAcquisitionError
+from openviking.storage.internal_names import STORAGE_INTERNAL_ENTRY_NAMES
 from openviking.storage.transaction import (
     LOCK_TIMEOUT_DEFAULT,
     NO_LOCK,
     LockLease,
     OwnedLockLease,
 )
-from openviking.storage.viking_fs import get_viking_fs
+from openviking.storage.viking_fs import LS_ALL_NODES, get_viking_fs
 from openviking.telemetry import get_current_telemetry
 from openviking.utils.embedding_utils import index_resource
 from openviking.utils.summarizer import Summarizer
@@ -296,8 +297,33 @@ class ResourceProcessor:
                                 ctx=ctx,
                             )
                             result["root_uri"] = root_uri
+                            if root_uri != candidate_uri:
+                                result.setdefault("warnings", []).append(
+                                    f"'{candidate_uri}' already exists. Creating '{root_uri}'. "
+                                    f"Tip: Use --to <path> to specify exact target."
+                                )
                     else:
                         target_preexisting = await viking_fs.exists(root_uri, ctx=ctx)
+                        if target_preexisting:
+                            try:
+                                stat = await viking_fs.stat(root_uri, ctx=ctx)
+                                if isinstance(stat, dict) and stat.get("isDir"):
+                                    entries = await viking_fs.ls(
+                                        root_uri,
+                                        show_all_hidden=True,
+                                        node_limit=LS_ALL_NODES,
+                                        ctx=ctx,
+                                    )
+                                    names: list[str] = []
+                                    for entry in entries:
+                                        name = entry.get("name", "")
+                                        if not name or name in {".", ".."}:
+                                            continue
+                                        names.append(str(name))
+                                    if all(name in STORAGE_INTERNAL_ENTRY_NAMES for name in names):
+                                        target_preexisting = False
+                            except Exception:
+                                pass
                         if not resource_lock.active:
                             dst_path = viking_fs._uri_to_path(root_uri, ctx=ctx)
                             resource_lock = await self.acquire_resource_lock(
@@ -404,6 +430,7 @@ class ResourceProcessor:
 
         viking_fs = get_viking_fs()
         lock_manager = get_lock_manager()
+        last_busy_error: Optional[ResourceBusyError] = None
 
         for attempt in range(max_attempts + 1):
             root_uri = candidate_uri if attempt == 0 else f"{candidate_uri}_{attempt}"
@@ -416,8 +443,18 @@ class ResourceProcessor:
                     lock_manager, dst_path, uri=root_uri, timeout=0.0
                 )
                 return root_uri, resource_lock
-            except ResourceBusyError:
+            except ResourceBusyError as exc:
+                last_busy_error = exc
                 continue
+
+        if last_busy_error is not None:
+            raise ResourceBusyError(
+                f"All auto-named candidates are temporarily busy for {candidate_uri} "
+                f"after checking {max_attempts + 1} candidates",
+                uri=candidate_uri,
+                conflict_type="auto_name_reservation_busy",
+                retryable=True,
+            ) from last_busy_error
 
         raise FileExistsError(
             f"Cannot resolve unique name for {candidate_uri} after {max_attempts} attempts"

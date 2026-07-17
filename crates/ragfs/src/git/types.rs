@@ -16,10 +16,20 @@ pub struct CommitRequest {
 
 #[derive(Debug, Clone)]
 pub enum CommitResponse {
-    Created { commit_oid: ObjectId, changed: usize },
+    Created {
+        commit_oid: ObjectId,
+        changed: usize,
+        /// Number of candidate paths skipped by user `.ovgitignore` rules.
+        /// Existing hardcoded system pruning is not included.
+        ignored: usize,
+    },
     /// No path produced an editor change; ref untouched. `commit_oid` is the
     /// existing HEAD (or `ObjectId::null` if the branch did not exist).
-    Noop { commit_oid: ObjectId },
+    Noop {
+        commit_oid: ObjectId,
+        /// Number of candidate paths skipped by user `.ovgitignore` rules.
+        ignored: usize,
+    },
 }
 
 /// Per-path stat cache entry. Not persisted yet (Fast Path 1 is deferred),
@@ -41,6 +51,37 @@ pub struct ShowRequest {
     /// If `None`, return the commit's metadata.
     /// `path` is account-relative tree path, e.g. "resources/a.md".
     pub path: Option<String>,
+}
+
+/// Input for walking commit history, optionally restricted to paths.
+#[derive(Debug, Clone)]
+pub struct LogRequest {
+    /// Account whose branch history should be read.
+    pub account: String,
+    /// Branch or ref to start from, usually "main".
+    pub branch: String,
+    /// Maximum number of matching commits to return.
+    pub limit: usize,
+    /// Optional account-relative paths. File paths match exactly; directory
+    /// paths match commits whose subtree changed.
+    pub paths: Option<Vec<String>>,
+}
+
+/// One commit returned by `GitService::log`.
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    /// Commit object id.
+    pub oid: ObjectId,
+    /// Root tree object id.
+    pub tree: ObjectId,
+    /// Parent commit ids.
+    pub parents: Vec<ObjectId>,
+    /// Commit author.
+    pub author: Actor,
+    /// Commit committer.
+    pub committer: Actor,
+    /// Full commit message.
+    pub message: String,
 }
 
 #[derive(Debug, Clone)]

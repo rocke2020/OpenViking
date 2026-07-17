@@ -22,6 +22,11 @@ from openviking.storage.errors import EmbeddingRebuildRequiredError
 from openviking.storage.expr import Eq
 from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
 from openviking.storage.vectordb import engine as vectordb_engine
+from openviking.storage.vectordb.collection.volcengine_api_key_collection import (
+    VolcengineApiKeyCollection,
+)
+from openviking.storage.vectordb.collection.vikingdb_collection import VikingDBCollection
+from openviking.storage.vectordb.collection.volcengine_collection import VolcengineCollection
 from openviking.storage.vectordb.collection.result import UpsertDataResult
 from openviking.storage.vectordb_adapters.base import (
     VIKINGDB_TEXT_FIELD_BYTE_LIMIT,
@@ -251,6 +256,7 @@ def test_build_embedding_metadata_hashes_resolved_local_model_path(tmp_path):
     assert payload["provider"] == "local"
     assert payload["model"] == "bge-small-zh-v1.5-f16"
     assert payload["model_identity"] == hashlib.sha256(expected.encode("utf-8")).hexdigest()
+    assert "schema_version" not in payload
 
 
 @pytest.mark.asyncio
@@ -334,6 +340,48 @@ async def test_embedding_handler_open_breaker_logs_summary_instead_of_per_item_w
     warnings = [record.message for record in caplog.records if record.levelno == logging.WARNING]
     assert warnings.count("Embedding circuit breaker is open; re-enqueueing messages") == 1
     assert status == {"success": 2, "requeue": 2, "error": 0}
+
+
+@pytest.mark.asyncio
+async def test_embedding_auth_error_fails_terminally_without_reenqueue(monkeypatch):
+    """A credential (401/403) failure must fail terminally, not re-enqueue: an
+    infinite re-enqueue holds the resource's tree lock and add-resource --wait
+    open, and must not trip the circuit breaker (which re-enqueues too). #2916."""
+
+    class _QueueingVikingDB:
+        is_closing = False
+        has_queue_manager = True
+
+        def __init__(self):
+            self.enqueued = []
+
+        async def enqueue_embedding_msg(self, msg):
+            self.enqueued.append(msg.id)
+            return None
+
+    class _AuthErrorEmbedder(_DummyEmbedder):
+        async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
+            raise RuntimeError("Error code: 401 - {'code': 'AuthenticationError'} Unauthorized")
+
+    vikingdb = _QueueingVikingDB()
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: _DummyConfig(_AuthErrorEmbedder()),
+    )
+    handler = TextEmbeddingHandler(vikingdb)
+    status = {"success": 0, "requeue": 0, "error": 0}
+    handler.set_callbacks(
+        on_success=lambda: status.__setitem__("success", status["success"] + 1),
+        on_requeue=lambda: status.__setitem__("requeue", status["requeue"] + 1),
+        on_error=lambda *_: status.__setitem__("error", status["error"] + 1),
+    )
+
+    result = await handler.on_dequeue(_build_queue_payload_for_account("acct"))
+
+    assert result is None
+    assert vikingdb.enqueued == []  # terminal: not re-enqueued
+    assert status == {"success": 0, "requeue": 0, "error": 1}
+    handler._circuit_breaker.check()  # breaker not tripped (would raise if open)
 
 
 @pytest.mark.asyncio
@@ -627,6 +675,177 @@ def test_context_collection_signature_has_no_include_parent_uri():
     assert "include_parent_uri" not in signature.parameters
 
 
+def test_volcengine_api_key_collection_reports_trusted_openviking_schema():
+    collection = VolcengineApiKeyCollection(
+        api_key="vk-test-token",
+        host="https://vikingdb.example.com",
+        meta_data={"ProjectName": "default", "CollectionName": "context", "IndexName": "default"},
+    )
+
+    meta = collection.get_meta_data()
+
+    field_names = {field["FieldName"] for field in meta["Fields"]}
+    assert "content" in field_names
+    assert "search_tags" in field_names
+    assert any(item.get("Field") == "content" for item in meta["FullText"])
+
+
+def test_volcengine_api_key_collection_ignores_unknown_fields_on_writes():
+    calls = []
+
+    class _Collection(VolcengineApiKeyCollection):
+        def _data_post(self, path, data):
+            calls.append((path, data))
+            return {"updated": 1}
+
+    collection = _Collection(
+        api_key="vk-test-token",
+        host="https://vikingdb.example.com",
+        meta_data={"ProjectName": "default", "CollectionName": "context", "IndexName": "default"},
+    )
+
+    collection.upsert_data([{"id": "rec-1", "content": "hello"}])
+    collection.update_data([{"id": "rec-1", "search_tags": ["tag"]}])
+
+    assert calls[0] == (
+        "/api/vikingdb/data/upsert",
+        {
+            "project": "default",
+            "collection_name": "context",
+            "data": [{"id": "rec-1", "content": "hello"}],
+            "ttl": 0,
+            "ignore_unknown_fields": True,
+        },
+    )
+    assert calls[1] == (
+        "/api/vikingdb/data/update",
+        {
+            "project": "default",
+            "collection_name": "context",
+            "data": [{"id": "rec-1", "search_tags": ["tag"]}],
+            "ignore_unknown_fields": True,
+        },
+    )
+
+
+def test_volcengine_aksk_collection_ignores_unknown_fields_on_writes():
+    calls = []
+
+    class _Collection(VolcengineCollection):
+        def _data_post(self, path, data):
+            calls.append((path, data))
+            return {"updated": 1}
+
+    collection = _Collection(
+        ak="ak",
+        sk="sk",
+        region="cn-beijing",
+        meta_data={"ProjectName": "default", "CollectionName": "context"},
+    )
+
+    collection.upsert_data([{"id": "rec-1", "content": "hello"}])
+    collection.update_data([{"id": "rec-1", "search_tags": ["tag"]}])
+
+    assert calls[0][1]["ignore_unknown_fields"] is True
+    assert calls[1][1]["ignore_unknown_fields"] is True
+
+
+def test_private_vikingdb_collection_ignores_unknown_fields_on_writes():
+    calls = []
+
+    class _Collection(VikingDBCollection):
+        def _data_post(self, path, data):
+            calls.append((path, data))
+            return {"updated": 1}
+
+    collection = _Collection(
+        host="https://vikingdb.example.com",
+        meta_data={"ProjectName": "default", "CollectionName": "context"},
+    )
+
+    collection.upsert_data([{"id": "rec-1", "content": "hello"}])
+    collection.update_data([{"id": "rec-1", "search_tags": ["tag"]}])
+
+    assert calls[0][1]["ignore_unknown_fields"] is True
+    assert calls[1][1]["ignore_unknown_fields"] is True
+
+
+def _exercise_fetch_and_search_apis(collection):
+    collection.fetch_data(["rec-1"])
+    collection.search_by_vector("default", dense_vector=[0.1, 0.2])
+    collection.search_by_id("default", "rec-1")
+    collection.search_by_multimodal("default", text="hello")
+    collection.search_by_random("default")
+    collection.search_by_keywords("default", query="hello")
+    collection.search_by_scalar("default", field="updated_at")
+
+
+def test_volcengine_api_key_collection_ignores_unknown_fields_on_fetch_and_search():
+    calls = []
+
+    class _Collection(VolcengineApiKeyCollection):
+        def _data_post(self, path, data):
+            calls.append((path, data))
+            return {}
+
+    collection = _Collection(
+        api_key="vk-test-token",
+        host="https://vikingdb.example.com",
+        meta_data={"ProjectName": "default", "CollectionName": "context", "IndexName": "default"},
+    )
+
+    _exercise_fetch_and_search_apis(collection)
+
+    assert [path for path, _ in calls] == [
+        "/api/vikingdb/data/fetch_in_collection",
+        "/api/vikingdb/data/search/vector",
+        "/api/vikingdb/data/search/id",
+        "/api/vikingdb/data/search/multi_modal",
+        "/api/vikingdb/data/search/random",
+        "/api/vikingdb/data/search/keywords",
+        "/api/vikingdb/data/search/scalar",
+    ]
+    assert all(data["ignore_unknown_fields"] is True for _, data in calls)
+
+
+def test_volcengine_aksk_collection_ignores_unknown_fields_on_fetch_and_search():
+    calls = []
+
+    class _Collection(VolcengineCollection):
+        def _data_post(self, path, data):
+            calls.append((path, data))
+            return {}
+
+    collection = _Collection(
+        ak="ak",
+        sk="sk",
+        region="cn-beijing",
+        meta_data={"ProjectName": "default", "CollectionName": "context"},
+    )
+
+    _exercise_fetch_and_search_apis(collection)
+
+    assert all(data["ignore_unknown_fields"] is True for _, data in calls)
+
+
+def test_private_vikingdb_collection_ignores_unknown_fields_on_fetch_and_search():
+    calls = []
+
+    class _Collection(VikingDBCollection):
+        def _data_post(self, path, data):
+            calls.append((path, data))
+            return {}
+
+    collection = _Collection(
+        host="https://vikingdb.example.com",
+        meta_data={"ProjectName": "default", "CollectionName": "context"},
+    )
+
+    _exercise_fetch_and_search_apis(collection)
+
+    assert all(data["ignore_unknown_fields"] is True for _, data in calls)
+
+
 @pytest.mark.asyncio
 async def test_init_context_collection_uses_backend_specific_schema(monkeypatch):
     captured = {}
@@ -722,6 +941,7 @@ def test_single_account_backend_filters_parent_uri_against_current_schema():
 
     class _Adapter:
         mode = "local"
+        USE_CONTENT_FIELD = False
 
         def get_collection(self):
             return _Collection()
@@ -768,6 +988,7 @@ async def test_single_account_backend_upsert_drops_legacy_parent_uri_before_writ
 
     class _Adapter:
         mode = "local"
+        USE_CONTENT_FIELD = False
 
         def get_collection(self):
             return _Collection()
@@ -821,7 +1042,8 @@ async def test_single_account_backend_truncates_content_only_at_vector_write():
             }
 
     class _Adapter:
-        mode = "local"
+        mode = "volcengine"
+        USE_CONTENT_FIELD = True
 
         def get_collection(self):
             return _Collection()
@@ -831,7 +1053,12 @@ async def test_single_account_backend_truncates_content_only_at_vector_write():
             return [data["id"]]
 
     backend = _SingleAccountBackend(
-        config=VectorDBBackendConfig(backend="local", name="context", dimension=2),
+        config=VectorDBBackendConfig(
+            backend="volcengine",
+            name="context",
+            dimension=2,
+            volcengine=VolcengineConfig(ak="ak", sk="sk", region="cn-beijing"),
+        ),
         bound_account_id="acc1",
         shared_adapter=_Adapter(),
     )
@@ -851,6 +1078,63 @@ async def test_single_account_backend_truncates_content_only_at_vector_write():
     assert captured["data"]["content"] == full_content[:VIKINGDB_CONTENT_MAX_SIZE]
 
 
+@pytest.mark.asyncio
+async def test_single_account_backend_drops_content_for_non_vikingdb_backend():
+    """Non-VikingDB backends (USE_CONTENT_FIELD=False) must not receive ``content``.
+
+    The schema still declares ``content`` for cross-backend compatibility, but only
+    VikingDB uses it. For every other backend the (potentially huge) content payload is
+    dropped on write, and the schema-required text field is not re-added as an empty
+    placeholder either.
+    """
+    captured = {}
+    full_content = "x" * (1024 * 1024 + 17)
+
+    class _Collection:
+        def get_meta_data(self):
+            return {
+                "Fields": [
+                    {"FieldName": "id"},
+                    {"FieldName": "uri"},
+                    {"FieldName": "abstract", "FieldType": "text"},
+                    {"FieldName": "content", "FieldType": "text"},
+                    {"FieldName": "account_id"},
+                ]
+            }
+
+    class _Adapter:
+        mode = "local"
+        USE_CONTENT_FIELD = False
+
+        def get_collection(self):
+            return _Collection()
+
+        def upsert(self, data):
+            captured["data"] = dict(data)
+            return [data["id"]]
+
+    backend = _SingleAccountBackend(
+        config=VectorDBBackendConfig(backend="local", name="context", dimension=2),
+        bound_account_id="acc1",
+        shared_adapter=_Adapter(),
+    )
+
+    record_id = await backend.upsert(
+        {
+            "id": "rec-1",
+            "uri": "viking://resources/large.txt",
+            "content": full_content,
+            "account_id": "acc1",
+        }
+    )
+
+    assert record_id == "rec-1"
+    # ``content`` is neither written nor re-added as an empty placeholder.
+    assert "content" not in captured["data"]
+    # Other schema-required text fields (e.g. abstract) are still backfilled empty.
+    assert captured["data"]["abstract"] == ""
+
+
 def test_vikingdb_text_field_byte_limit_is_one_mb_and_utf8_safe():
     text = "a" * (1024 * 1024) + "😀"
 
@@ -867,6 +1151,7 @@ async def test_single_account_backend_collection_exists_runs_in_threadpool(monke
 
     class _Adapter:
         mode = "local"
+        USE_CONTENT_FIELD = False
 
         def collection_exists(self):
             return True
@@ -911,6 +1196,7 @@ async def test_single_account_backend_upsert_runs_adapter_in_threadpool(monkeypa
 
     class _Adapter:
         mode = "local"
+        USE_CONTENT_FIELD = False
 
         def get_collection(self):
             return _Collection()
@@ -971,6 +1257,7 @@ async def test_single_account_backend_update_runs_adapter_in_threadpool(monkeypa
 
     class _Adapter:
         mode = "local"
+        USE_CONTENT_FIELD = False
 
         def get_collection(self):
             return _Collection()
@@ -1165,6 +1452,7 @@ async def test_single_account_backend_update_injects_bound_account_id(monkeypatc
 
     class _Adapter:
         mode = "local"
+        USE_CONTENT_FIELD = False
 
         def get_collection(self):
             return _Collection()
@@ -1200,6 +1488,7 @@ async def test_single_account_backend_update_requires_id_before_adapter_call():
 
     class _Adapter:
         mode = "local"
+        USE_CONTENT_FIELD = False
 
         def get_collection(self):
             return _Collection()
@@ -1239,6 +1528,7 @@ async def test_single_account_backend_update_rejects_invalid_context_type_withou
 
     class _Adapter:
         mode = "local"
+        USE_CONTENT_FIELD = False
 
         def get_collection(self):
             return _Collection()
@@ -1283,6 +1573,7 @@ async def test_single_account_backend_update_returns_structured_error_when_adapt
 
     class _Adapter:
         mode = "local"
+        USE_CONTENT_FIELD = False
 
         def get_collection(self):
             return _Collection()
@@ -1320,6 +1611,7 @@ async def test_single_account_backend_update_returns_not_found_when_adapter_repo
 
     class _Adapter:
         mode = "local"
+        USE_CONTENT_FIELD = False
 
         def get_collection(self):
             return _Collection()
@@ -1360,6 +1652,7 @@ async def test_single_account_backend_upsert_partial_update_reads_then_upserts_e
 
     class _Adapter:
         mode = "local"
+        USE_CONTENT_FIELD = False
 
         def get_collection(self):
             return _Collection()
@@ -1425,6 +1718,7 @@ async def test_single_account_backend_upsert_partial_update_creates_when_record_
 
     class _Adapter:
         mode = "local"
+        USE_CONTENT_FIELD = False
 
         def get_collection(self):
             return _Collection()
@@ -1473,6 +1767,7 @@ async def test_single_account_backend_upsert_partial_update_creates_when_record_
 async def test_single_account_backend_upsert_partial_update_returns_empty_when_get_fails():
     class _Adapter:
         mode = "local"
+        USE_CONTENT_FIELD = False
 
         def get(self, ids):
             del ids
@@ -1501,6 +1796,7 @@ async def test_single_account_backend_upsert_without_partial_update_keeps_legacy
 
     class _Adapter:
         mode = "local"
+        USE_CONTENT_FIELD = False
 
         def upsert(self, data):
             calls.append(data)
@@ -1595,6 +1891,7 @@ async def test_qdrant_backend_upsert_partial_update_reads_then_upserts_existing_
 
     class _Adapter:
         mode = "qdrant"
+        USE_CONTENT_FIELD = False
 
         def get(self, ids):
             calls.append(("get", ids))
@@ -1665,6 +1962,7 @@ async def test_qdrant_backend_upsert_partial_update_creates_when_record_does_not
 
     class _Adapter:
         mode = "qdrant"
+        USE_CONTENT_FIELD = False
 
         def get(self, ids):
             calls.append(("get", ids))
@@ -1723,6 +2021,7 @@ async def test_volcengine_backend_upsert_partial_update_reads_then_upserts_exist
 
     class _Adapter:
         mode = "volcengine"
+        USE_CONTENT_FIELD = True
 
         def get(self, ids):
             calls.append(("get", ids))
@@ -1793,6 +2092,7 @@ async def test_volcengine_backend_upsert_partial_update_creates_when_record_does
 
     class _Adapter:
         mode = "volcengine"
+        USE_CONTENT_FIELD = True
 
         def get(self, ids):
             calls.append(("get", ids))
@@ -1838,7 +2138,7 @@ async def test_volcengine_backend_upsert_partial_update_creates_when_record_does
 async def test_viking_vector_index_backend_update_search_tags_updates_exact_uri_only():
     ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
     backend = object.__new__(VikingVectorIndexBackend)
-    calls = {"fetch_by_uri": [], "upsert": []}
+    calls = {"fetch_by_uri": [], "get": [], "upsert": []}
 
     resource_uri = "viking://resources/demo/doc.md"
 
@@ -1846,12 +2146,17 @@ async def test_viking_vector_index_backend_update_search_tags_updates_exact_uri_
         calls["fetch_by_uri"].append((uri, ctx.account_id))
         return {"id": "root-id", "uri": resource_uri, "search_tags": ["old=root"]}
 
+    async def _fake_get(ids, *, ctx):
+        calls["get"].append((list(ids), ctx.account_id))
+        return [{"id": "root-id", "uri": resource_uri, "search_tags": ["old=root"]}]
+
     async def _fake_upsert(data, *, ctx, partial_update=False):
         del ctx, partial_update
         calls["upsert"].append(dict(data))
         return data["id"]
 
     backend.fetch_by_uri = _fake_fetch_by_uri
+    backend.get = _fake_get
     backend.upsert = _fake_upsert
 
     updated = await backend.update_search_tags(
@@ -1865,6 +2170,7 @@ async def test_viking_vector_index_backend_update_search_tags_updates_exact_uri_
         {"id": "root-id", "uri": resource_uri, "search_tags": ["old=root", "team=search"]}
     ]
     assert calls["fetch_by_uri"] == [(resource_uri, ctx.account_id)]
+    assert calls["get"] == [(["root-id"], ctx.account_id)]
     assert calls["upsert"] == [
         {"id": "root-id", "uri": resource_uri, "search_tags": ["old=root", "team=search"]}
     ]
@@ -1874,7 +2180,7 @@ async def test_viking_vector_index_backend_update_search_tags_updates_exact_uri_
 async def test_update_search_tags_for_leaf_uri_queries_exact_uri_only(monkeypatch):
     ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
     overview_uri = "viking://resources/demo/doc.md/.overview.md"
-    calls = {"fetch_by_uri": [], "upsert": []}
+    calls = {"fetch_by_uri": [], "get": [], "upsert": []}
 
     backend = VikingVectorIndexBackend.__new__(VikingVectorIndexBackend)
 
@@ -1883,12 +2189,17 @@ async def test_update_search_tags_for_leaf_uri_queries_exact_uri_only(monkeypatc
         assert uri == overview_uri
         return {"id": "overview-id", "uri": overview_uri, "search_tags": ["existing=1"]}
 
+    async def _fake_get(ids, *, ctx):
+        calls["get"].append((list(ids), ctx.account_id))
+        return [{"id": "overview-id", "uri": overview_uri, "search_tags": ["existing=1"]}]
+
     async def _fake_upsert(data, *, ctx, partial_update=False):
         del ctx, partial_update
         calls["upsert"].append(dict(data))
         return data["id"]
 
     backend.fetch_by_uri = _fake_fetch_by_uri
+    backend.get = _fake_get
     backend.upsert = _fake_upsert
 
     updated = await backend.update_search_tags(
@@ -1902,6 +2213,7 @@ async def test_update_search_tags_for_leaf_uri_queries_exact_uri_only(monkeypatc
         {"id": "overview-id", "uri": overview_uri, "search_tags": ["existing=1", "team=search"]}
     ]
     assert calls["fetch_by_uri"] == [(overview_uri, ctx.account_id)]
+    assert calls["get"] == [(["overview-id"], ctx.account_id)]
     assert calls["upsert"] == [
         {"id": "overview-id", "uri": overview_uri, "search_tags": ["existing=1", "team=search"]}
     ]
@@ -1911,7 +2223,7 @@ async def test_update_search_tags_for_leaf_uri_queries_exact_uri_only(monkeypatc
 async def test_update_search_tags_with_levels_queries_directory_uri_only():
     ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
     directory_uri = "viking://resources/demo/doc.md"
-    calls = {"filter": [], "upsert": []}
+    calls = {"filter": [], "get": [], "upsert": []}
 
     backend = VikingVectorIndexBackend.__new__(VikingVectorIndexBackend)
 
@@ -1934,7 +2246,15 @@ async def test_update_search_tags_with_levels_queries_directory_uri_only():
         calls["upsert"].append(dict(data))
         return data["id"]
 
+    async def _fake_get(ids, *, ctx):
+        calls["get"].append((list(ids), ctx.account_id))
+        return [
+            {"id": "dir-l0", "uri": directory_uri, "level": 0, "search_tags": ["old=0"]},
+            {"id": "dir-l1", "uri": directory_uri, "level": 1, "search_tags": ["old=1"]},
+        ]
+
     backend.filter = _fake_filter
+    backend.get = _fake_get
     backend.upsert = _fake_upsert
 
     updated = await backend.update_search_tags(
@@ -1947,6 +2267,7 @@ async def test_update_search_tags_with_levels_queries_directory_uri_only():
 
     assert len(updated) == 2
     assert len(calls["filter"]) == 1
+    assert calls["get"] == [(["dir-l0", "dir-l1"], ctx.account_id)]
     assert calls["filter"][0]["limit"] == 2
     assert "id" in calls["filter"][0]["output_fields"]
     assert calls["upsert"] == [
@@ -1968,7 +2289,7 @@ async def test_update_search_tags_with_levels_queries_directory_uri_only():
 @pytest.mark.asyncio
 async def test_update_search_tags_with_levels_skips_records_without_id_and_private_helper_is_removed():
     ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
-    calls = {"filter": [], "upsert": []}
+    calls = {"filter": [], "get": [], "upsert": []}
 
     backend = VikingVectorIndexBackend.__new__(VikingVectorIndexBackend)
 
@@ -1991,7 +2312,20 @@ async def test_update_search_tags_with_levels_skips_records_without_id_and_priva
         calls["upsert"].append(dict(data))
         return data["id"]
 
+    async def _fake_get(ids, *, ctx):
+        calls["get"].append((list(ids), ctx.account_id))
+        return [
+            {
+                "id": "r1",
+                "uri": "viking://resources/demo/doc.md",
+                "level": 0,
+                "search_tags": ["old=1"],
+            },
+            {"id": "r2", "uri": "viking://resources/demo/doc.md", "level": 2, "search_tags": None},
+        ]
+
     backend.filter = _fake_filter
+    backend.get = _fake_get
     backend.upsert = _fake_upsert
 
     updated = await backend.update_search_tags(
@@ -2004,6 +2338,7 @@ async def test_update_search_tags_with_levels_skips_records_without_id_and_priva
 
     assert not hasattr(VikingVectorIndexBackend, "_apply_search_tags_to_records")
     assert calls["filter"] == [True]
+    assert calls["get"] == [(["r1", "r2"], ctx.account_id)]
     assert updated == [
         {
             "id": "r1",
@@ -2076,6 +2411,7 @@ async def test_single_account_backend_mutations_run_adapter_in_threadpool(monkey
 
     class _Adapter:
         mode = "local"
+        USE_CONTENT_FIELD = False
 
         def drop_collection(self):
             return True
@@ -2143,6 +2479,7 @@ async def test_single_account_backend_query_runs_adapter_in_threadpool(monkeypat
 
     class _Adapter:
         mode = "local"
+        USE_CONTENT_FIELD = False
 
         def get_collection(self):
             return _Collection()

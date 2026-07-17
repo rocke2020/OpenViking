@@ -252,7 +252,7 @@ transformContext auto recall 流程：
 | `POST /api/v1/system/wait` | 等待 semantic/vector 队列处理完成 | 暂未单独封装；`/add-resource`、opt-in `add_resource`、`add_skill` 可用 `wait=true` | 导入后马上检索时建议等待 |
 | `GET /api/v1/observer/queue` | 队列指标 | 暂未封装 | 排查资源/skill 处理积压 |
 | `GET /api/v1/observer/vikingdb` | VikingDB collection/vector 状态 | 暂未封装 | 排查向量库连接和索引数量 |
-| `GET /api/v1/observer/vlm` | VLM token 用量 | 暂未封装 | 观测摘要、抽取、视觉处理成本 |
+| `GET /api/v1/observer/models` | 模型状态 | 暂未封装 | 观测 VLM、Embedding 和 Rerank 模型状态 |
 | `GET /api/v1/observer/system` | 汇总 observer 状态 | 暂未封装 | 生产监控推荐项 |
 | `GET /api/v1/debug/health` | 认证版健康检查 | 暂未封装 | 返回 `{ healthy: true/false }` |
 
@@ -393,7 +393,7 @@ bash install.sh --source tos --channel prod --version 2026.6.2
 | 组件 | 要求 |
 | --- | --- |
 | Node.js | >= 22 |
-| OpenClaw | >= 2026.4.8 |
+| OpenClaw | >= 2026.5.27 |
 | OpenViking Server | >= 0.4.1 |
 
 兼容性声明在 `install-manifest.json` 的 `compatibility` 字段。
@@ -468,7 +468,7 @@ OpenViking 服务端配置与 OpenClaw 插件配置是两层配置，位置不�
     "provider": "volcengine",
     "api_base": "https://ark.cn-beijing.volces.com/api/v3",
     "api_key": "$ARK_API_KEY",
-    "model": "doubao-seed-2-0-pro-260215",
+    "model": "doubao-seed-2-0-lite-260428",
     "max_concurrent": 20
   }
 }

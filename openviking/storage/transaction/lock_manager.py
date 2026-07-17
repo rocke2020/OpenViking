@@ -54,10 +54,6 @@ class LockManager:
         self._running = False
 
     @property
-    def redo_log(self) -> RedoLog:
-        return self._redo_log
-
-    @property
     def redo_recovery_enabled(self) -> bool:
         return self._redo_recovery_enabled
 
@@ -512,6 +508,10 @@ class LockManager:
                     ),
                     timeout=60.0,
                 )
+                # extract_long_term_memories may return either a list[Context]
+                # (v2) or a {"contexts": [...], "session_skills": [...]} dict (v3).
+                if isinstance(memories, dict):
+                    memories = memories.get("contexts", [])
                 logger.info(f"Redo: extracted {len(memories)} memories from {archive_uri}")
             except Exception as e:
                 logger.warning(f"Redo: memory extraction failed ({e}), falling back to queue")

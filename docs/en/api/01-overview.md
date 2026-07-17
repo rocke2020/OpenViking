@@ -110,6 +110,32 @@ deployments or gateways that explicitly forward tenant identity.
 It does not implement Python embedded mode or legacy `agent_id` compatibility.
 See [`sdk/go/README.md`](../../../sdk/go/README.md) for package-level examples.
 
+#### JavaScript/TypeScript SDK Client
+
+The JavaScript/TypeScript SDK is an HTTP-only client for Node.js 18+. It ships
+ESM, CommonJS and TypeScript declarations.
+
+```bash
+npm install @openviking/sdk
+```
+
+```ts
+import { OpenVikingClient } from "@openviking/sdk";
+
+const client = new OpenVikingClient({
+  baseUrl: "http://localhost:1933",
+  apiKey: "your-key",
+});
+
+const results = await client.search("deployment guide", {
+  targetUri: "viking://resources",
+});
+```
+
+It uses the same identity headers and response envelope as the Python and Go
+HTTP clients. See [`sdk/typescript/README.md`](../../../sdk/typescript/README.md)
+for package-level examples.
+
 When `url` is not explicitly provided, the HTTP client automatically reads connection information from `ovcli.conf`. `ovcli.conf` is a configuration file shared between the HTTP client and CLI. Default path: `~/.openviking/ovcli.conf`. You can also specify the path via environment variable:
 
 ```bash
@@ -135,7 +161,7 @@ Configuration field description:
 | `api_key` | API Key | `null` (no auth) |
 | `account` | Default account header for tenant-scoped requests | `null` |
 | `user` | Default user header for tenant-scoped requests | `null` |
-| `timeout` | HTTP request timeout in seconds | `60.0` |
+| `timeout` | HTTP request timeout in seconds | `600.0` |
 | `output` | Default output format: `"table"` or `"json"` | `"table"` |
 
 See the [Configuration Guide](../guides/01-configuration.md#ovcliconf) for details.
@@ -150,7 +176,7 @@ import openviking as ov
 client = ov.SyncHTTPClient(
     url="http://localhost:1933",          # Explicitly provided
     api_key="your-key",                    # Explicitly provided (api_key usually identifies user identity)
-    timeout=30.0,                          # Don't use default 60.0
+    timeout=30.0,                          # Don't use default 600.0
     extra_headers={}                       # Pass empty dict instead of None, useful for gateway auth in some scenarios
 )
 client.initialize()
@@ -159,7 +185,7 @@ client.initialize()
 ⚠️ **Note**: The client will attempt to load the configuration file if any of the following conditions are met:
 - `url` is `None`
 - `api_key` is `None`
-- `timeout` equals `60.0` (default value)
+- `timeout` equals `600.0` (default value)
 - `extra_headers` is `None`
 
 #### HTTP Call Examples
@@ -419,8 +445,8 @@ Below are all HTTP API endpoints provided by OpenViking, grouped by functional m
 
 | Method | Path | Description | Permission |
 |--------|------|-------------|------------|
-| POST | `/api/v1/pack/export` | Export .ovpack | ROOT/ADMIN |
-| POST | `/api/v1/pack/import` | Import .ovpack | ROOT/ADMIN |
+| POST | `/api/v1/pack/export` | Export .ovpack | ROOT/ADMIN/USER, subject to normal URI ACL |
+| POST | `/api/v1/pack/import` | Import .ovpack | ROOT/ADMIN/USER, subject to normal URI ACL |
 | POST | `/api/v1/pack/backup` | Back up public scopes | ROOT/ADMIN |
 | POST | `/api/v1/pack/restore` | Restore backup package | ROOT/ADMIN |
 
@@ -431,6 +457,8 @@ Below are all HTTP API endpoints provided by OpenViking, grouped by functional m
 | GET | `/api/v1/fs/ls` | List directory |
 | GET | `/api/v1/fs/tree` | Directory tree |
 | GET | `/api/v1/fs/stat` | Resource status |
+| GET | `/api/v1/fs/attrs` | Logical extended attributes |
+| POST | `/api/v1/fs/attrs/set_tags` | Set retrieval tags |
 | POST | `/api/v1/fs/mkdir` | Create directory |
 | DELETE | `/api/v1/fs` | Delete resource |
 | POST | `/api/v1/fs/mv` | Move/rename resource |

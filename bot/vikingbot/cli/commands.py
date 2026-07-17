@@ -14,13 +14,12 @@ from typing import Any, Optional
 import typer
 from loguru import logger
 from prompt_toolkit import PromptSession
-from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.styles import Style as PromptStyle
 from rich.console import Console
-from rich.markdown import Markdown
 from rich.table import Table
-from rich.text import Text
 
 from vikingbot import __logo__, __version__
 from vikingbot.agent.loop import AgentLoop
@@ -71,6 +70,13 @@ app = typer.Typer(
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
+_CHAT_PROMPT_MESSAGE = FormattedText([("class:user-label", "You: ")])
+_CHAT_PROMPT_STYLE = PromptStyle.from_dict(
+    {
+        "": "fg:ansidefault",
+        "user-label": "bold fg:ansicyan",
+    }
+)
 
 
 def _warn_deprecated_memory_user(memory_user: list[str] | None) -> None:
@@ -82,6 +88,40 @@ def _warn_deprecated_memory_user(memory_user: list[str] | None) -> None:
         fg=typer.colors.YELLOW,
         err=True,
     )
+
+
+def _redirect_openviking_logs_to_stderr() -> None:
+    """Redirect openviking/openviking_cli standard-library loggers to stderr.
+
+    This prevents log output (e.g. deprecation warnings from memory_config)
+    from polluting stdout when vikingbot chat is used in --eval mode or piped.
+    """
+    import logging
+
+    for root_name in ("openviking", "openviking_cli"):
+        root_logger = logging.getLogger(root_name)
+        # If the logger has no handlers yet, add a stderr handler now.
+        # If it already has handlers, swap any stdout StreamHandlers to stderr.
+        if not root_logger.handlers:
+            handler = logging.StreamHandler(sys.stderr)
+            formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+            handler.setFormatter(formatter)
+            root_logger.addHandler(handler)
+            root_logger.propagate = False
+        else:
+            for handler in root_logger.handlers:
+                if isinstance(handler, logging.StreamHandler) and handler.stream is sys.stdout:
+                    handler.setStream(sys.stderr)
+
+    # Also redirect Python warnings to stderr
+    warnings.simplefilter("default")
+    if not any(
+        isinstance(h, logging.StreamHandler) and h.stream is sys.stderr
+        for h in logging.getLogger("py.warnings").handlers
+    ):
+        logging.captureWarnings(True)
+        py_warnings_logger = logging.getLogger("py.warnings")
+        py_warnings_logger.addHandler(logging.StreamHandler(sys.stderr))
 
 
 def get_or_create_machine_id() -> str:
@@ -139,6 +179,19 @@ def _get_gateway_token(config) -> str:
     if gateway is None:
         return ""
     return getattr(gateway, "token", "") or ""
+
+
+def _gateway_startup_mode(config, host: str) -> str:
+    ov_server = getattr(config, "ov_server", None)
+    server_url = str(getattr(ov_server, "server_url", "") or "").strip()
+    source_getter = getattr(ov_server, "get_config_source", None)
+    source = source_getter() if callable(source_getter) else getattr(ov_server, "_source", "none")
+    source = str(source or "none").strip().lower()
+    if server_url:
+        if source == "explicit":
+            return "openviking_explicit"
+        return "openviking_inherited"
+    return "standalone_public" if requires_gateway_token(host, "") else "standalone_local"
 
 
 # ---------------------------------------------------------------------------
@@ -211,15 +264,6 @@ def _init_prompt_session() -> None:
     )
 
 
-def _print_agent_response(response: str, render_markdown: bool) -> None:
-    """Render assistant response with consistent terminal styling."""
-    content = response or ""
-    body = Markdown(content) if render_markdown else Text(content)
-    console.print()
-    console.print(f"[cyan]{__logo__} vikingbot[/cyan]")
-    console.print(body)
-    console.print()
-
 
 def _is_exit_command(command: str) -> bool:
     """Return True when input should end interactive chat."""
@@ -239,7 +283,8 @@ async def _read_interactive_input_async() -> str:
     try:
         with patch_stdout():
             return await _PROMPT_SESSION.prompt_async(
-                HTML("<b fg='ansiblack'>You:</b> "),
+                _CHAT_PROMPT_MESSAGE,
+                style=_CHAT_PROMPT_STYLE,
             )
     except EOFError as exc:
         raise KeyboardInterrupt from exc
@@ -271,10 +316,12 @@ def _make_provider(config, langfuse_client: None = None):
     p = config.agents
     model = p.model if p else None
     temperature = p.temperature if p else 0.7
+    thinking = p.thinking if p else True
     api_key = p.api_key if p else None
     api_base = p.api_base if p else None
     provider_name = p.provider if p else None
     extra_headers = p.extra_headers if p else {}
+    timeout = p.timeout if p else None
 
     if not model:
         raise RuntimeError("No LLM model configured. Please set it in ~/.openviking/ov.conf")
@@ -291,7 +338,10 @@ def _make_provider(config, langfuse_client: None = None):
             "provider": provider_name,
             "model": model,
             "temperature": temperature,
+            "thinking": thinking,
         }
+        if timeout is not None:
+            vlm_config["timeout"] = timeout
         if api_key:
             vlm_config["api_key"] = api_key
         if api_base:
@@ -317,6 +367,8 @@ def _make_provider(config, langfuse_client: None = None):
         default_model=model,
         extra_headers=extra_headers,
         provider_name=provider_name,
+        timeout=timeout,
+        thinking=thinking,
         langfuse_client=langfuse_client,
     )
 
@@ -343,9 +395,10 @@ def gateway(
     bus = MessageBus()
     path = Path(config_path).expanduser() if config_path is not None else None
     config = ensure_config(path)
-    validate_openviking_auth(config)
     effective_host = host if host is not None else config.gateway.host
     effective_port = port if port is not None else config.gateway.port
+    config.gateway.host = effective_host
+    config.gateway.port = effective_port
     gateway_token = _get_gateway_token(config)
     if requires_gateway_token(effective_host, gateway_token):
         print(
@@ -354,8 +407,8 @@ def gateway(
             file=sys.stderr,
         )
         sys.exit(1)
-    config.gateway.host = effective_host
-    config.gateway.port = effective_port
+    validate_openviking_auth(config)
+    console.print(f"[green]✓[/green] Gateway mode: {_gateway_startup_mode(config, effective_host)}")
     _abort_if_port_in_use(effective_port, "vikingbot gateway")
     _init_bot_data(config)
     session_manager = SessionManager(config.bot_data_path)
@@ -399,9 +452,6 @@ def gateway(
             agent_loop.run(),
             server.serve(),
         ]
-        # if enable_console:
-        #     tasks.append(start_console(console_port))
-
         try:
             await asyncio.gather(*tasks)
         finally:
@@ -478,6 +528,7 @@ def prepare_cron(bus, quiet: bool = False) -> CronService:
         """Execute a cron job through the agent."""
         session_key = SessionKey(**json.loads(job.payload.session_key_str))
         message = job.payload.message
+        channel_metadata = dict(job.payload.channel_metadata or {})
 
         if agent_holder["agent"] is None:
             raise RuntimeError("Agent not initialized yet")
@@ -500,6 +551,7 @@ Reminder message to deliver:
         response = await agent_holder["agent"].process_direct(
             cron_instruction,
             session_key=session_key,
+            metadata=channel_metadata,
         )
         if job.payload.deliver:
             from vikingbot.bus.events import OutboundMessage
@@ -508,6 +560,7 @@ Reminder message to deliver:
                 OutboundMessage(
                     session_key=session_key,
                     content=response or "",
+                    metadata=channel_metadata,
                 )
             )
         return response
@@ -590,25 +643,6 @@ def prepare_heartbeat(config, agent_loop, session_manager) -> HeartbeatService:
     return heartbeat
 
 
-async def start_console(console_port):
-    """Start the console web UI in a separate thread within the same process."""
-    try:
-        import threading
-
-        from vikingbot.console.console_gradio_simple import run_console_server
-
-        def run_in_thread():
-            try:
-                run_console_server(console_port)
-            except Exception as e:
-                console.print(f"[yellow]Console server error: {e}[/yellow]")
-
-        thread = threading.Thread(target=run_in_thread, daemon=True)
-        thread.start()
-        console.print(f"[green]✓[/green] Console: http://localhost:{console_port}")
-    except Exception as e:
-        console.print(f"[yellow]Warning: Console not available ({e})[/yellow]")
-
 
 # ============================================================================
 # Agent Commands
@@ -616,14 +650,6 @@ async def start_console(console_port):
 
 
 # Helper for thinking spinner context
-def _thinking_ctx(logs: bool):
-    """Return a context manager for showing thinking spinner."""
-    if logs:
-        from contextlib import nullcontext
-
-        return nullcontext()
-    return console.status("[dim]vikingbot is thinking...[/dim]", spinner="dots")
-
 
 def prepare_agent_channel(
     config,
@@ -712,6 +738,11 @@ def chat(
 
     bus = MessageBus()
     config = ensure_config(path)
+
+    # Redirect openviking/openviking_cli standard-library logs to stderr so they
+    # don't pollute stdout JSON output (important for --eval mode and piping).
+    _redirect_openviking_logs_to_stderr()
+
     validate_openviking_auth(config)
     _warn_deprecated_memory_user(memory_user)
     _init_bot_data(config)

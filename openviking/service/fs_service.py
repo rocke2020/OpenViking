@@ -15,6 +15,7 @@ from openviking.privacy import (
     get_skill_name_from_uri,
     restore_skill_content,
 )
+from openviking.resource.watch_storage import is_watch_task_control_uri
 from openviking.server.identity import RequestContext
 from openviking.session.memory.memory_updater import MemoryUpdater
 from openviking.storage.content_write import ContentWriteCoordinator
@@ -31,6 +32,8 @@ from openviking_cli.utils import VikingURI, get_logger
 logger = get_logger(__name__)
 
 if TYPE_CHECKING:
+    from openviking.resource.watch_manager import WatchManager
+    from openviking.resource.watch_scheduler import WatchScheduler
     from openviking.service.resource_memory_link_service import ResourceMemoryLinkService
     from openviking.storage import VikingDBManager
 
@@ -44,11 +47,13 @@ class FSService:
         vikingdb: Optional["VikingDBManager"] = None,
         privacy_config_service: Optional[UserPrivacyConfigService] = None,
         resource_memory_link_service: Optional["ResourceMemoryLinkService"] = None,
+        watch_scheduler: Optional["WatchScheduler"] = None,
     ):
         self._viking_fs = viking_fs
         self._vikingdb = vikingdb
         self._privacy_config_service = privacy_config_service
         self._resource_memory_link_service = resource_memory_link_service
+        self._watch_scheduler = watch_scheduler
 
     def set_dependencies(
         self,
@@ -56,18 +61,25 @@ class FSService:
         vikingdb: Optional["VikingDBManager"] = None,
         privacy_config_service: Optional[UserPrivacyConfigService] = None,
         resource_memory_link_service: Optional["ResourceMemoryLinkService"] = None,
+        watch_scheduler: Optional["WatchScheduler"] = None,
     ) -> None:
         """Set service dependencies (for deferred initialization)."""
         self._viking_fs = viking_fs
         self._vikingdb = vikingdb
         self._privacy_config_service = privacy_config_service
         self._resource_memory_link_service = resource_memory_link_service
+        self._watch_scheduler = watch_scheduler
 
     def _ensure_initialized(self) -> VikingFS:
         """Ensure VikingFS is initialized."""
         if not self._viking_fs:
             raise NotInitializedError("VikingFS")
         return self._viking_fs
+
+    def _get_watch_manager(self) -> Optional["WatchManager"]:
+        if not self._watch_scheduler:
+            return None
+        return self._watch_scheduler.watch_manager
 
     async def ls(
         self,
@@ -80,6 +92,8 @@ class FSService:
         show_all_hidden: bool = False,
         node_limit: int = 1000,
         level_limit: int = 3,
+        sort_by: Optional[str] = None,
+        sort_order: str = "asc",
     ) -> List[Any]:
         """List directory contents.
 
@@ -91,6 +105,8 @@ class FSService:
             abs_limit: int = 256 if output == "agent" else ignore
             show_all_hidden: bool = False (list all hidden files, like -a)
             node_limit: int = 1000 (maximum number of nodes to list)
+            sort_by: Optional sort field for non-recursive listings
+            sort_order: Sort direction, "asc" or "desc"
         """
         viking_fs = self._ensure_initialized()
         uri = validate_viking_uri(uri)
@@ -113,6 +129,8 @@ class FSService:
                     output="original",
                     show_all_hidden=show_all_hidden,
                     node_limit=node_limit,
+                    sort_by=sort_by,
+                    sort_order=sort_order,
                 )
             return [e.get("uri", "") for e in entries]
 
@@ -134,6 +152,8 @@ class FSService:
                 abs_limit=abs_limit,
                 show_all_hidden=show_all_hidden,
                 node_limit=node_limit,
+                sort_by=sort_by,
+                sort_order=sort_order,
             )
         return entries
 
@@ -191,6 +211,7 @@ class FSService:
         refresh_parent_uri = self._semantic_refresh_parent_uri(uri, context_type)
         memory_overview_uri = self._memory_overview_parent_uri(uri, context_type)
         result = await viking_fs.rm(uri, recursive=recursive, ctx=ctx)
+        await self._sync_watch_after_rm(uri, context_type=context_type)
         queue_status = None
         request_registered = False
         telemetry_id = get_current_telemetry().telemetry_id
@@ -328,6 +349,7 @@ class FSService:
         msg = SemanticMsg(
             uri=root_uri,
             context_type=context_type,
+            recursive=False,
             account_id=ctx.account_id,
             user_id=ctx.user.user_id,
             peer_id=ctx.user.user_id,
@@ -372,7 +394,39 @@ class FSService:
         from_uri = validate_viking_uri(from_uri, field_name="from_uri")
         to_uri = validate_viking_uri(to_uri, field_name="to_uri")
         viking_fs = self._ensure_initialized()
-        await viking_fs.mv(from_uri, to_uri, ctx=ctx)
+        watch_manager = self._get_watch_manager()
+        if not watch_manager or context_type_for_uri(from_uri) != "resource":
+            await viking_fs.mv(from_uri, to_uri, ctx=ctx)
+            return
+        if context_type_for_uri(to_uri) != "resource":
+            await viking_fs.mv(from_uri, to_uri, ctx=ctx)
+            return
+        if is_watch_task_control_uri(from_uri) or is_watch_task_control_uri(to_uri):
+            await viking_fs.mv(from_uri, to_uri, ctx=ctx)
+            return
+
+        await watch_manager.sync_tasks_with_resource_move_internal(
+            from_uri,
+            to_uri,
+            move_resource=lambda: viking_fs.mv(from_uri, to_uri, ctx=ctx),
+            rollback_resource=lambda: viking_fs.mv(to_uri, from_uri, ctx=ctx),
+        )
+
+    async def _sync_watch_after_rm(self, uri: str, *, context_type: str) -> None:
+        if context_type != "resource":
+            return
+        if is_watch_task_control_uri(uri):
+            return
+        watch_manager = self._get_watch_manager()
+        if not watch_manager:
+            return
+        deactivated = await watch_manager.deactivate_tasks_under_uri_internal(uri)
+        if deactivated:
+            logger.info(
+                "Deactivated %d watch task(s) after deleting %s",
+                len(deactivated),
+                uri,
+            )
 
     async def tree(
         self,
@@ -614,7 +668,32 @@ class FSService:
         *,
         branch: str = "main",
         limit: int = 20,
+        paths: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Forward to VikingFS.log. Walks parents[0] up to limit commits."""
         viking_fs = self._ensure_initialized()
-        return await viking_fs.log(branch=branch, limit=limit, ctx=ctx)
+        if paths is not None:
+            paths = [validate_viking_uri(path, field_name="paths") for path in paths]
+            if not paths:
+                paths = None
+        return await viking_fs.log(branch=branch, limit=limit, paths=paths, ctx=ctx)
+
+    async def get_gitignore(self, *, ctx: RequestContext) -> str:
+        """Forward to VikingFS.get_gitignore. Returns the account .ovgitignore
+        content, or an empty string if absent."""
+        viking_fs = self._ensure_initialized()
+        return await viking_fs.get_gitignore(ctx=ctx)
+
+    async def set_gitignore(
+        self, *, content: str, ctx: RequestContext
+    ) -> None:
+        """Forward to VikingFS.set_gitignore. Writes the account .ovgitignore
+        control file (validates the size limit)."""
+        viking_fs = self._ensure_initialized()
+        await viking_fs.set_gitignore(content, ctx=ctx)
+
+    async def delete_gitignore(self, *, ctx: RequestContext) -> None:
+        """Forward to VikingFS.delete_gitignore. Removes the account
+        .ovgitignore; missing is success."""
+        viking_fs = self._ensure_initialized()
+        await viking_fs.delete_gitignore(ctx=ctx)

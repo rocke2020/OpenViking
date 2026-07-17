@@ -19,7 +19,7 @@ ragfs_python = pytest.importorskip("ragfs_python")
 
 from openviking.async_client import AsyncOpenViking
 from openviking.client.local import LocalClient
-from openviking.pyagfs.exceptions import AGFSNotSupportedError
+from openviking.pyagfs.exceptions import AGFSNotFoundError, AGFSNotSupportedError
 from openviking.server.identity import RequestContext, Role
 from openviking_cli.exceptions import InvalidURIError
 from openviking.service.fs_service import FSService
@@ -219,6 +219,41 @@ async def test_log_walks_parents(git_harness):
     ]
 
 
+async def test_log_filters_multiple_paths_end_to_end(git_harness):
+    target_uri = "viking://resources/log_paths/a.md"
+    directory_uri = "viking://resources/log_paths/docs"
+    child_uri = f"{directory_uri}/guide.md"
+    unrelated_uri = "viking://resources/log_paths_other.md"
+
+    await git_harness.vfs.write_file(target_uri, b"target", ctx=git_harness.ctx)
+    target_commit = git_harness.client.snapshot.commit(
+        message="add target",
+        paths=[target_uri],
+    )
+
+    await git_harness.vfs.write_file(unrelated_uri, b"unrelated", ctx=git_harness.ctx)
+    git_harness.client.snapshot.commit(
+        message="add unrelated",
+        paths=[unrelated_uri],
+    )
+
+    await git_harness.vfs.write_file(child_uri, b"guide", ctx=git_harness.ctx)
+    directory_commit = git_harness.client.snapshot.commit(
+        message="add directory child",
+        paths=[child_uri],
+    )
+
+    history = git_harness.client.snapshot.log(
+        limit=2,
+        paths=[target_uri, directory_uri],
+    )
+
+    assert [item["oid"] for item in history] == [
+        directory_commit["commit_oid"],
+        target_commit["commit_oid"],
+    ]
+
+
 async def test_restore_reverts_file_and_advances_head(git_harness):
     await git_harness.vfs.write_file(
         "viking://resources/proj/a.md",
@@ -345,3 +380,41 @@ async def test_async_api_parity(git_harness):
     assert commit["result"] == "created"
     assert OID_RE.match(commit["commit_oid"])
     assert body == b"async hello"
+
+
+async def test_snapshot_namespace_gitignore_roundtrip(git_harness):
+    """End-to-end: snapshot namespace -> LocalClient -> FSService -> VikingFS.
+
+    get/set/delete_gitignore must flow through the full local-mode stack and
+    the written rules must take effect at commit time (ignored count).
+    """
+    client = git_harness.async_client
+
+    # Absent -> empty string.
+    assert await client.snapshot.get_gitignore() == ""
+
+    # Set via the namespace, then read back.
+    await client.snapshot.set_gitignore(content="*.log\n")
+    assert await client.snapshot.get_gitignore() == "*.log\n"
+
+    # The rule must affect commits: a .log file is skipped, a .md file kept.
+    await git_harness.vfs.write_file(
+        "viking://resources/keep.md", b"keep", ctx=git_harness.ctx
+    )
+    await git_harness.vfs.write_file(
+        "viking://resources/skip.log", b"skip", ctx=git_harness.ctx
+    )
+
+    commit = await client.snapshot.commit(message="with ignore")
+    assert commit["result"] == "created"
+    assert commit["ignored"] == 1
+    assert await client.snapshot.show(
+        "main", path="viking://resources/keep.md"
+    ) == b"keep"
+    with pytest.raises(AGFSNotFoundError):
+        await client.snapshot.show("main", path="viking://resources/skip.log")
+
+    # Delete is idempotent and makes the rule vanish.
+    await client.snapshot.delete_gitignore()
+    await client.snapshot.delete_gitignore()
+    assert await client.snapshot.get_gitignore() == ""

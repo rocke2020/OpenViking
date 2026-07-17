@@ -26,6 +26,8 @@ from openviking_cli.exceptions import InternalError, NotFoundError, OpenVikingEr
 
 router = APIRouter(prefix="/api/v1/snapshot", tags=["snapshot"])
 
+MAX_LOG_FILTER_PATHS = 32
+
 
 class CommitRequest(BaseModel):
     """Request body for ``POST /api/v1/snapshot/commit``."""
@@ -55,7 +57,7 @@ async def commit(
             author_email=request.author_email,
             ctx=_ctx,
         )
-    except AGFSClientError as e:
+    except (AGFSClientError, ValueError) as e:
         mapped = map_exception(e)
         if mapped is not None:
             raise mapped from e
@@ -67,15 +69,23 @@ async def commit(
 async def log(
     branch: str = Query("main", description="Branch ref name"),
     limit: int = Query(20, ge=1, le=500, description="Max commits to return"),
+    paths: Optional[List[str]] = Query(
+        None,
+        max_length=MAX_LOG_FILTER_PATHS,
+        description=(
+            "Optional viking:// paths; repeat up to 32 values to filter history "
+            "to commits touching any path"
+        ),
+    ),
     _ctx: RequestContext = Depends(get_request_context),
 ):
     """Walk commit history newest-first along parents[0]."""
     service = get_service()
     try:
-        result = await service.fs.log(branch=branch, limit=limit, ctx=_ctx)
+        result = await service.fs.log(branch=branch, limit=limit, paths=paths, ctx=_ctx)
     except AGFSNotFoundError:
         raise NotFoundError(branch, "git_ref")
-    except AGFSClientError as e:
+    except (AGFSClientError, ValueError) as e:
         mapped = map_exception(e)
         if mapped is not None:
             raise mapped from e
@@ -127,7 +137,7 @@ async def restore(
             code="RESTORE_WRITEBACK_PARTIAL",
             details=exc.to_dict(),
         ) from exc
-    except AGFSClientError as e:
+    except (AGFSClientError, ValueError) as e:
         mapped = map_exception(e)
         if mapped is not None:
             raise mapped from e
@@ -161,7 +171,7 @@ async def show(
     except AGFSNotFoundError as e:
         resource = path if path is not None else target_ref
         raise NotFoundError(resource, "git_blob" if path is not None else "git_ref") from e
-    except AGFSClientError as e:
+    except (AGFSClientError, ValueError) as e:
         mapped = map_exception(e)
         if mapped is not None:
             raise mapped from e
@@ -175,3 +185,60 @@ async def show(
             "X-Snapshot-Size": str(blob["size"]),
         },
     )
+
+
+@router.get("/ignore")
+async def get_ignore(
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Return the account ``.ovgitignore`` content (empty string if absent)."""
+    service = get_service()
+    try:
+        result = await service.fs.get_gitignore(ctx=_ctx)
+    except AGFSClientError as e:
+        mapped = map_exception(e)
+        if mapped is not None:
+            raise mapped from e
+        raise
+    return Response(status="ok", result=result)
+
+
+class SetIgnoreRequest(BaseModel):
+    """Request body for ``PUT /api/v1/snapshot/ignore``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: str
+
+
+@router.put("/ignore")
+async def set_ignore(
+    request: SetIgnoreRequest = Body(...),
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Write the account ``.ovgitignore`` control file."""
+    service = get_service()
+    try:
+        await service.fs.set_gitignore(content=request.content, ctx=_ctx)
+    except AGFSClientError as e:
+        mapped = map_exception(e)
+        if mapped is not None:
+            raise mapped from e
+        raise
+    return Response(status="ok", result=None)
+
+
+@router.delete("/ignore")
+async def delete_ignore(
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Delete the account ``.ovgitignore`` control file (missing is success)."""
+    service = get_service()
+    try:
+        await service.fs.delete_gitignore(ctx=_ctx)
+    except AGFSClientError as e:
+        mapped = map_exception(e)
+        if mapped is not None:
+            raise mapped from e
+        raise
+    return Response(status="ok", result=None)

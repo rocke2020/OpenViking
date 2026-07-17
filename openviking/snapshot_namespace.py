@@ -81,9 +81,25 @@ class AsyncSnapshotNamespace:
         *,
         branch: str = "main",
         limit: int = 20,
+        paths: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         await self._client._ensure_initialized()
-        return await self._client._client.git_log(branch=branch, limit=limit)
+        return await self._client._client.git_log(branch=branch, limit=limit, paths=paths)
+
+    async def get_gitignore(self) -> str:
+        """Return the account .ovgitignore content (empty string if absent)."""
+        await self._client._ensure_initialized()
+        return await self._client._client.git_get_ignore()
+
+    async def set_gitignore(self, *, content: str) -> None:
+        """Write the account .ovgitignore control file."""
+        await self._client._ensure_initialized()
+        await self._client._client.git_set_ignore(content=content)
+
+    async def delete_gitignore(self) -> None:
+        """Delete the account .ovgitignore control file (missing is success)."""
+        await self._client._ensure_initialized()
+        await self._client._client.git_delete_ignore()
 
 
 class SyncSnapshotNamespace:
@@ -154,5 +170,15 @@ class SyncSnapshotNamespace:
         *,
         branch: str = "main",
         limit: int = 20,
+        paths: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
-        return run_async(self._ns().log(branch=branch, limit=limit))
+        return run_async(self._ns().log(branch=branch, limit=limit, paths=paths))
+
+    def get_gitignore(self) -> str:
+        return run_async(self._ns().get_gitignore())
+
+    def set_gitignore(self, *, content: str) -> None:
+        return run_async(self._ns().set_gitignore(content=content))
+
+    def delete_gitignore(self) -> None:
+        return run_async(self._ns().delete_gitignore())
