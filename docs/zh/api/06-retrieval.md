@@ -430,7 +430,9 @@ curl -X POST http://localhost:1933/api/v1/search/search \
     }'
 ```
 
-**不带会话的搜索（仍会进行意图分析）**
+**不带会话的搜索**
+
+未提供 `session` 或 `session_id` 时，`search()` 会直接执行传入的查询，并跳过意图分析和查询扩展。
 
 ```bash
 curl -X POST http://localhost:1933/api/v1/search/search \
@@ -490,7 +492,7 @@ for ctx in results.resources:
 
 ```python
 # search 也可以在没有会话的情况下使用
-# 它仍然会对查询进行意图分析
+# 它会直接执行传入的查询，不进行意图分析
 results = client.search(
     "how to implement OAuth 2.0 authorization code flow"
 )
@@ -537,7 +539,7 @@ openviking search "best practices" --context-type skill
 # 带时间过滤的搜索
 openviking search "watch vs scheduled" --after 2026-03-15 --before 2026-03-20
 
-# 不带会话的搜索（仍进行意图分析）
+# 不带会话的搜索（直接检索）
 openviking search "how to implement OAuth 2.0 authorization code flow"
 
 # 限定层级范围（仅 L0）

@@ -428,7 +428,10 @@ curl -X POST http://localhost:1933/api/v1/search/search \
     }'
 ```
 
-**Search without Session (Still Performs Intent Analysis)**
+**Search without Session**
+
+Without `session` or `session_id`, `search()` executes the supplied query directly and skips
+intent analysis and query expansion.
 
 ```bash
 curl -X POST http://localhost:1933/api/v1/search/search \
@@ -488,7 +491,7 @@ for ctx in results.resources:
 
 ```python
 # search can also be used without session
-# It still performs intent analysis on the query
+# It executes the supplied query directly without intent analysis
 results = client.search(
     "how to implement OAuth 2.0 authorization code flow"
 )
@@ -535,7 +538,7 @@ openviking search "best practices" --context-type skill
 # Search with time filter
 openviking search "watch vs scheduled" --after 2026-03-15 --before 2026-03-20
 
-# Search without session (still performs intent analysis)
+# Search without session (direct retrieval)
 openviking search "how to implement OAuth 2.0 authorization code flow"
 
 # Limit to specific level(s) (L0 only)
