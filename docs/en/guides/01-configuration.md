@@ -794,7 +794,9 @@ Set `code_summary_mode` to one of:
 | `"llm"` | Always use LLM for summarization (higher cost) | |
 | `"ast_llm"` | Extract AST skeleton (with full docstrings) first, then pass it as context to LLM (highest quality, moderate cost) | |
 
-AST extraction supports: Python, JavaScript/TypeScript, Rust, Go, Java, C/C++. Other languages, extraction failures, or empty skeletons automatically fall back to LLM.
+AST extraction supports: Python, JavaScript/TypeScript, Java, C/C++, Rust, Go, C#, PHP,
+and Lua. Other languages, extraction failures, or empty skeletons automatically fall back
+to LLM.
 
 See [Code Skeleton Extraction](../concepts/06-extraction.md#code-skeleton-extraction-ast-mode) for details.
 

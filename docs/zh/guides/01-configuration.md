@@ -763,7 +763,8 @@ ollama pull guoxuter/ov_intent_analysis_sft:v7_q8
 | `"llm"` | 全部走 LLM 生成摘要（成本较高） | |
 | `"ast_llm"` | 先提取 AST 骨架（含完整注释），再将骨架作为上下文辅助 LLM 生成摘要（质量最高，成本居中） | |
 
-AST 提取支持：Python、JavaScript/TypeScript、Rust、Go、Java、C/C++。其他语言、提取失败或骨架为空时自动 fallback 到 LLM。
+AST 提取支持：Python、JavaScript/TypeScript、Java、C/C++、Rust、Go、C#、PHP 和 Lua。
+其他语言、提取失败或骨架为空时自动 fallback 到 LLM。
 
 详见 [代码骨架提取](../concepts/06-extraction.md#代码骨架提取ast-模式)。
 
