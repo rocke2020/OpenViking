@@ -321,7 +321,7 @@ async def test_queued_cancelled_job_is_acked_and_rolled_back_without_execution()
     service = MagicMock()
     service.rollback_cancelled_add_resource = AsyncMock()
     service.execute_add_resource_job = AsyncMock()
-    processor = AddResourceProcessor(service, asyncio.get_running_loop())
+    processor = AddResourceProcessor(service, asyncio.get_running_loop(), "AddResource")
     resource_lock = MagicMock()
     resource_lock.close = AsyncMock()
     processor._load_lock = AsyncMock(return_value=resource_lock)
@@ -374,7 +374,7 @@ async def test_post_execution_cancel_rolls_back_without_completing():
         return {"status": "success"}
 
     service.execute_add_resource_job = AsyncMock(side_effect=execute)
-    processor = AddResourceProcessor(service, asyncio.get_running_loop())
+    processor = AddResourceProcessor(service, asyncio.get_running_loop(), "AddResource")
 
     await processor._process(msg, msg.to_dict())
 
@@ -409,7 +409,7 @@ async def test_cancel_racing_with_completion_still_rolls_back():
         return await complete(*args, **kwargs)
 
     tracker.complete = cancel_before_complete
-    processor = AddResourceProcessor(service, asyncio.get_running_loop())
+    processor = AddResourceProcessor(service, asyncio.get_running_loop(), "AddResource")
 
     await processor._process(msg, msg.to_dict())
 
@@ -480,7 +480,7 @@ async def test_running_job_rolls_back_instead_of_completing_after_cancel():
         return {"status": "success"}
 
     service.execute_add_resource_job = AsyncMock(side_effect=execute)
-    processor = AddResourceProcessor(service, asyncio.get_running_loop())
+    processor = AddResourceProcessor(service, asyncio.get_running_loop(), "AddResource")
 
     await processor._process(msg, msg.to_dict())
 
