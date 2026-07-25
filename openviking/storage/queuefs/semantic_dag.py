@@ -5,7 +5,7 @@
 import asyncio
 import threading
 from dataclasses import dataclass, field
-from typing import Callable, ClassVar, Dict, List, Optional, Set
+from typing import Awaitable, Callable, ClassVar, Dict, List, Optional, Set
 from weakref import WeakKeyDictionary
 
 from openviking.server.identity import RequestContext
@@ -155,6 +155,7 @@ def get_semantic_node_scheduler(max_workers: int) -> SemanticNodeScheduler:
 class SemanticDagExecutor:
     """Execute semantic generation with DAG-style, event-driven lazy dispatch."""
 
+    _cancellation_refresh_interval = 0.25
     _active_lock: ClassVar[threading.Lock] = threading.Lock()
     _active_executors: ClassVar[Set["SemanticDagExecutor"]] = set()
 
@@ -176,6 +177,7 @@ class SemanticDagExecutor:
         coalesce_key: str = "",
         coalesce_version: int = 0,
         is_cancelled: Optional[Callable[[], bool]] = None,
+        refresh_cancelled: Optional[Callable[[], Awaitable[bool]]] = None,
     ):
         self._processor = processor
         self._context_type = context_type
@@ -192,6 +194,9 @@ class SemanticDagExecutor:
         self._coalesce_key = coalesce_key
         self._coalesce_version = coalesce_version
         self._is_cancelled_callback = is_cancelled
+        self._refresh_cancelled_callback = refresh_cancelled
+        self._cancellation_refresh_lock = asyncio.Lock()
+        self._next_cancellation_refresh_at = 0.0
         self._stale = False
         self._changed_paths = {
             path for key in ("added", "modified", "deleted") for path in self._changes.get(key, [])
@@ -374,6 +379,7 @@ class SemanticDagExecutor:
                 self._work_drained.set()
 
     async def _run_work_inner(self, work: DagWork) -> None:
+        await self._refresh_cancelled_state()
         if work.kind == "vectorize":
             await self._run_vectorize_work(work.vectorize_task)
             return
@@ -406,6 +412,20 @@ class SemanticDagExecutor:
 
         self._mark_node_done()
         logger.warning("Unknown semantic DAG work kind: %s", work.kind)
+
+    async def _refresh_cancelled_state(self) -> None:
+        if self._refresh_cancelled_callback is None:
+            return
+        loop = asyncio.get_running_loop()
+        if loop.time() < self._next_cancellation_refresh_at:
+            return
+        async with self._cancellation_refresh_lock:
+            if loop.time() < self._next_cancellation_refresh_at:
+                return
+            await self._refresh_cancelled_callback()
+            self._next_cancellation_refresh_at = (
+                loop.time() + self._cancellation_refresh_interval
+            )
 
     async def _dispatch_vectorize_tasks(self, tasks: List[VectorizeTask]) -> None:
         self._vectorize_done = asyncio.Event()

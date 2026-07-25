@@ -90,6 +90,7 @@ _ADD_RESOURCE_ARGS_RESERVED_FIELDS = frozenset(
         "allow_local_path_resolution",
         "enforce_public_remote_targets",
         "resource_lock",
+        "target_created",
         "stage_callback",
         "source_task_id",
         "args",
@@ -414,6 +415,7 @@ class ResourceService:
                 resource_lock=resource_lock,
                 stage_callback=stage_callback,
                 source_task_id=msg.task_id,
+                target_created=msg.target_created,
                 strict=msg.strict,
                 source_name=msg.source_name,
                 ignore_dirs=msg.ignore_dirs,
@@ -706,10 +708,15 @@ class ResourceService:
             uri=root_uri,
             timeout=0.0,
         )
-        target_created = not await self._viking_fs.exists(root_uri, ctx=ctx)
         target_preexisting = await self._resource_processor.target_contains_preexisting_data(
             root_uri,
             ctx=ctx,
+        )
+        handle = resource_lock.handle
+        target_created = bool(
+            handle is not None
+            and dst_path in getattr(handle, "created_paths", ())
+            and not target_preexisting
         )
         return root_uri, resource_lock, target_preexisting, target_created
 
@@ -997,12 +1004,18 @@ class ResourceService:
                     target_created = True
                 elif not defer_target_resolution:
                     lock_lease = await _reserve_tree(root_uri)
-                    target_created = not await self._viking_fs.exists(root_uri, ctx=ctx)
                     target_preexisting = (
                         await self._resource_processor.target_contains_preexisting_data(
                             root_uri,
                             ctx=ctx,
                         )
+                    )
+                    handle = lock_lease.handle
+                    target_created = bool(
+                        handle is not None
+                        and self._viking_fs._uri_to_path(root_uri, ctx=ctx)
+                        in getattr(handle, "created_paths", ())
+                        and not target_preexisting
                     )
                 else:
                     target_preexisting = None

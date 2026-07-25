@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock
 
 import pytest
@@ -83,7 +84,9 @@ async def test_reservation_returns_first_available_lock(monkeypatch):
         monkeypatch,
         existing={"viking://resources/report"},
     )
-    lease = object()
+    lease = SimpleNamespace(
+        handle=SimpleNamespace(created_paths=["/agfs/viking://resources/report_1"])
+    )
     processor.acquire_resource_lock = AsyncMock(return_value=lease)
 
     uri, acquired = await processor.reserve_unique_candidate(
@@ -100,6 +103,7 @@ async def test_reservation_returns_first_available_lock(monkeypatch):
 async def test_reservation_does_not_treat_lock_directory_as_existing_resource(monkeypatch):
     processor = _make_processor(monkeypatch)
     lease = AsyncMock()
+    lease.handle = SimpleNamespace(created_paths=["/agfs/viking://resources/report"])
     processor.acquire_resource_lock = AsyncMock(return_value=lease)
     processor.target_contains_preexisting_data = AsyncMock(return_value=False)
     viking_fs = resource_processor_module.get_viking_fs()

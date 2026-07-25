@@ -3,8 +3,11 @@
 
 """Unit tests for TaskTracker."""
 
+import asyncio
 import json
 import time
+from copy import deepcopy
+from dataclasses import asdict
 
 import pytest
 
@@ -81,6 +84,18 @@ class _FakeAgfs:
         if size >= 0:
             return data[offset : offset + size]
         return data[offset:]
+
+    def stat(self, path: str):
+        normalized = path.rstrip("/") or "/"
+        if normalized in self.dirs:
+            return {"isDir": True}
+        if normalized in self.files:
+            return {"isDir": False}
+        raise FileNotFoundError(path)
+
+    def rm(self, path: str, recursive: bool = False, force: bool = True):
+        self.files.pop(path, None)
+        return {"message": "removed"}
 
     def ls(self, path: str = "/"):
         prefix = path.rstrip("/") or "/"
@@ -164,6 +179,84 @@ async def test_cancelled_task_is_not_reported_as_running(tracker: TaskTracker):
         "viking://resources/demo",
         **_owner_kwargs(),
     )
+
+
+async def test_persisted_cancellation_wins_over_stale_cached_completion():
+    agfs = _FakeAgfs()
+    worker_tracker = TaskTracker(store=PersistentTaskStore(agfs))
+    api_tracker = TaskTracker(store=PersistentTaskStore(agfs))
+    task = await worker_tracker.create("add_resource", **_owner_kwargs())
+    await worker_tracker.start(task.task_id, **_owner_kwargs())
+
+    await api_tracker.cancel(task.task_id, **_owner_kwargs())
+    completed = await worker_tracker.complete(task.task_id, {}, **_owner_kwargs())
+
+    assert completed is False
+    persisted = await TaskTracker(store=PersistentTaskStore(agfs)).get(
+        task.task_id,
+        **_owner_kwargs(),
+    )
+    assert persisted is not None
+    assert persisted.status == TaskStatus.CANCELLED
+
+
+async def test_concurrent_cancel_cannot_be_overwritten_by_late_completion():
+    class PausingTaskStore:
+        def __init__(self):
+            self.payload = None
+            self.lock = asyncio.Lock()
+            self.cancel_write_started = asyncio.Event()
+            self.release_cancel_write = asyncio.Event()
+
+        async def create(self, task):
+            self.payload = self._payload(task)
+
+        async def update(self, task):
+            self.payload = self._payload(task)
+
+        async def update_if_status(self, task, expected_statuses):
+            async with self.lock:
+                if self.payload["status"] not in expected_statuses:
+                    return False
+                if task.status == TaskStatus.CANCELLED:
+                    self.cancel_write_started.set()
+                    await self.release_cancel_write.wait()
+                self.payload = self._payload(task)
+                return True
+
+        async def get(self, task_id, *, account_id=None, user_id=None):
+            return deepcopy(self.payload)
+
+        async def list(self, account_id, *, user_id=None):
+            return [deepcopy(self.payload)]
+
+        async def delete(self, task_id, *, account_id, user_id=None):
+            return None
+
+        @staticmethod
+        def _payload(task):
+            payload = asdict(task)
+            payload["status"] = task.status.value
+            return payload
+
+    store = PausingTaskStore()
+    worker_tracker = TaskTracker(store=store)
+    api_tracker = TaskTracker(store=store)
+    task = await worker_tracker.create("add_resource", **_owner_kwargs())
+    await worker_tracker.start(task.task_id, **_owner_kwargs())
+
+    cancelling = asyncio.create_task(api_tracker.cancel(task.task_id, **_owner_kwargs()))
+    await store.cancel_write_started.wait()
+    completing = asyncio.create_task(worker_tracker.complete(task.task_id, {}, **_owner_kwargs()))
+    store.release_cancel_write.set()
+
+    cancelled, completed = await asyncio.gather(cancelling, completing)
+
+    assert cancelled is not None
+    assert cancelled.status == TaskStatus.CANCELLED
+    assert completed is False
+    assert store.payload["status"] == TaskStatus.CANCELLED.value
+    assert worker_tracker.is_cancelled(task.task_id) is True
 
 
 async def test_update_stage(tracker: TaskTracker):

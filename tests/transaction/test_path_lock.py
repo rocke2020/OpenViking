@@ -332,7 +332,21 @@ class TestPathLockBehavior:
         ok = await lock.acquire_tree(target, tx, timeout=3.0)
         assert ok is True
         assert _single_lock_path(tx) == f"{target}/{LOCK_FILE_NAME}"
+        assert target in tx.created_paths
         assert agfs_client.stat(target).get("isDir") is True
+
+        await lock.release(tx)
+
+    async def test_acquire_tree_does_not_claim_preexisting_empty_directory(
+        self, agfs_client, test_dir
+    ):
+        lock = PathLockEngine(agfs_client)
+        tx = LockHandle(id="tx-tree-existing")
+        target = f"{test_dir}/existing-resource"
+        agfs_client.mkdir(target)
+
+        assert await lock.acquire_tree(target, tx, timeout=3.0) is True
+        assert target not in tx.created_paths
 
         await lock.release(tx)
 

@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Collection, Dict, List, Optional, Protocol
 
 from openviking.pyagfs import AsyncAGFSClient
 from openviking.pyagfs.exceptions import AGFSAlreadyExistsError, AGFSNotFoundError
+from openviking.storage.transaction.lock_handle import LockHandle
+from openviking.storage.transaction.path_lock import PathLockEngine
 
 SYSTEM_TASK_ACCOUNT_ID = "_system"
 SYSTEM_TASK_USER_ID = "root"
@@ -19,6 +21,8 @@ class TaskStore(Protocol):
     async def create(self, task: Any) -> None: ...
 
     async def update(self, task: Any) -> None: ...
+
+    async def update_if_status(self, task: Any, expected_statuses: Collection[str]) -> bool: ...
 
     async def get(
         self,
@@ -45,13 +49,39 @@ class PersistentTaskStore:
     TASKS_DIRNAME = "tasks"
 
     def __init__(self, agfs: Any) -> None:
+        sync_agfs = agfs._client if isinstance(agfs, AsyncAGFSClient) else agfs
         self._agfs = agfs if isinstance(agfs, AsyncAGFSClient) else AsyncAGFSClient(agfs)
+        self._task_locks = PathLockEngine(sync_agfs)
 
     async def create(self, task: Any) -> None:
         await self._write_task(task)
 
     async def update(self, task: Any) -> None:
         await self._write_task(task)
+
+    async def update_if_status(
+        self,
+        task: Any,
+        expected_statuses: Collection[str],
+    ) -> bool:
+        """Update a task only while its persisted status is still expected."""
+        path = self._task_path(task.account_id, task.user_id, task.task_id)
+        owner = LockHandle()
+        acquired = await self._task_locks.acquire_exact_path(path, owner, timeout=None)
+        if not acquired:
+            raise RuntimeError(f"Failed to acquire task state lock: {task.task_id}")
+        try:
+            current = await self.get(
+                task.task_id,
+                account_id=task.account_id,
+                user_id=task.user_id,
+            )
+            if current is None or current.get("status") not in expected_statuses:
+                return False
+            await self._write_task(task)
+            return True
+        finally:
+            await self._task_locks.release(owner)
 
     async def get(
         self,

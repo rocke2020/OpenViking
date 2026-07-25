@@ -138,6 +138,7 @@ class ResourceProcessor:
         }
         defer_post_processing = bool(kwargs.pop("defer_post_processing", False))
         preacquired_lock = kwargs.pop("resource_lock", NO_LOCK) or NO_LOCK
+        target_created_hint = kwargs.pop("target_created", None)
         telemetry = get_current_telemetry()
 
         async def _set_stage(stage: str) -> None:
@@ -312,11 +313,23 @@ class ResourceProcessor:
                             resource_lock = await self.acquire_resource_lock(
                                 lock_manager, dst_path, uri=root_uri
                             )
-                        target_created = not await viking_fs.exists(root_uri, ctx=ctx)
+                        else:
+                            dst_path = viking_fs._uri_to_path(root_uri, ctx=ctx)
+                        handle = resource_lock.handle
+                        target_created = (
+                            target_created_hint
+                            if isinstance(target_created_hint, bool)
+                            else bool(
+                                handle is not None
+                                and dst_path in getattr(handle, "created_paths", ())
+                            )
+                        )
                         target_preexisting = await self.target_contains_preexisting_data(
                             root_uri,
                             ctx=ctx,
                         )
+                        if target_preexisting:
+                            target_created = False
                     if not target_preexisting:
                         await viking_fs.persist_temp_tree(temp_uri, root_uri, ctx=ctx)
                         await rewrite_image_uris(
@@ -477,6 +490,10 @@ class ResourceProcessor:
                 resource_lock = await self.acquire_resource_lock(
                     lock_manager, dst_path, uri=root_uri, timeout=0.0
                 )
+                handle = resource_lock.handle
+                if handle is None or dst_path not in getattr(handle, "created_paths", ()):
+                    await resource_lock.close()
+                    continue
                 if await self.target_contains_preexisting_data(root_uri, ctx=ctx):
                     await resource_lock.close()
                     continue

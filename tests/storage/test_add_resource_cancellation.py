@@ -16,7 +16,7 @@ from openviking.storage.queuefs.add_resource_processor import AddResourceProcess
 from openviking.storage.queuefs.semantic_dag import DagWork, SemanticDagExecutor, VectorizeTask
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
-from openviking_cli.exceptions import NotFoundError
+from openviking_cli.exceptions import InvalidArgumentError, NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
 from tests.test_task_tracker import _FakeAgfs
 
@@ -35,6 +35,16 @@ def test_add_resource_message_persists_target_ownership_for_safe_rollback():
     restored = AddResourceMsg.from_dict(msg.to_dict())
 
     assert restored.target_created is True
+
+
+def test_add_resource_args_reject_user_controlled_target_ownership():
+    service = ResourceService()
+
+    with pytest.raises(InvalidArgumentError, match="target_created"):
+        service._normalize_add_resource_args(
+            {"target_created": True},
+            watch_interval=0,
+        )
 
 
 def test_legacy_add_resource_message_treats_target_ownership_as_unknown():
@@ -150,6 +160,9 @@ async def test_explicit_target_ownership_is_read_after_lifecycle_lock(monkeypatc
     service = ResourceService()
     resource_lock = MagicMock()
     resource_lock.active = True
+    resource_lock.handle = SimpleNamespace(
+        created_paths=["/local/acme/resources/demo"],
+    )
     resource_processor = MagicMock()
     resource_processor.tree_builder.resolve_target_uri = AsyncMock(
         return_value=("viking://resources/demo", None)
@@ -171,7 +184,6 @@ async def test_explicit_target_ownership_is_read_after_lifecycle_lock(monkeypatc
     )
     service._resource_processor = resource_processor
     service._viking_fs = MagicMock()
-    service._viking_fs.exists = AsyncMock(return_value=False)
     service._viking_fs._uri_to_path.return_value = "/local/acme/resources/demo"
     monkeypatch.setattr(
         "openviking.storage.transaction.get_lock_manager",
@@ -206,6 +218,7 @@ async def test_explicit_target_ownership_is_read_after_lifecycle_lock(monkeypatc
 async def test_preexisting_empty_target_is_never_marked_task_created(monkeypatch):
     service = ResourceService()
     resource_lock = MagicMock()
+    resource_lock.handle = SimpleNamespace(created_paths=[])
     resource_processor = MagicMock()
     resource_processor.tree_builder.resolve_target_uri = AsyncMock(
         return_value=("viking://resources/demo", None)
@@ -215,6 +228,38 @@ async def test_preexisting_empty_target_is_never_marked_task_created(monkeypatch
     service._resource_processor = resource_processor
     service._viking_fs = MagicMock()
     service._viking_fs.exists = AsyncMock(return_value=True)
+    service._viking_fs._uri_to_path.return_value = "/local/acme/resources/demo"
+    monkeypatch.setattr("openviking.storage.transaction.get_lock_manager", lambda: object())
+
+    _, _, target_preexisting, target_created = await service._plan_resource_target(
+        path="https://example.com/demo.git",
+        ctx=RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER),
+        target=SimpleNamespace(to="viking://resources/demo", parent=None, create_parent=False),
+        source_name="demo",
+        source_info=SimpleNamespace(
+            source_name="demo",
+            source_path="https://example.com/demo.git",
+            source_format="repository",
+        ),
+    )
+
+    assert target_preexisting is False
+    assert target_created is False
+
+
+@pytest.mark.asyncio
+async def test_target_created_during_lock_race_is_not_claimed(monkeypatch):
+    service = ResourceService()
+    resource_processor = MagicMock()
+    resource_processor.tree_builder.resolve_target_uri = AsyncMock(
+        return_value=("viking://resources/demo", None)
+    )
+    resource_lock = MagicMock()
+    resource_lock.handle = SimpleNamespace(created_paths=[])
+    resource_processor.acquire_resource_lock = AsyncMock(return_value=resource_lock)
+    resource_processor.target_contains_preexisting_data = AsyncMock(return_value=False)
+    service._resource_processor = resource_processor
+    service._viking_fs = MagicMock()
     service._viking_fs._uri_to_path.return_value = "/local/acme/resources/demo"
     monkeypatch.setattr("openviking.storage.transaction.get_lock_manager", lambda: object())
 
@@ -707,6 +752,7 @@ async def test_semantic_cancellation_reconciles_vectorize_work_skipped_before_en
         cancelled = True
 
     processor._vectorize_single_file = AsyncMock(side_effect=enqueue_first_embedding)
+    refresh_cancelled = AsyncMock(side_effect=lambda: cancelled)
     resource_lock = MagicMock()
     resource_lock.close = AsyncMock()
     ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
@@ -718,6 +764,7 @@ async def test_semantic_cancellation_reconciles_vectorize_work_skipped_before_en
         semantic_msg_id="semantic-2",
         lock=resource_lock,
         is_cancelled=lambda: cancelled,
+        refresh_cancelled=refresh_cancelled,
     )
 
     def seed_vectorization(*_args, **_kwargs):
@@ -746,12 +793,34 @@ async def test_semantic_cancellation_reconciles_vectorize_work_skipped_before_en
     await executor.run("viking://resources/demo")
 
     processor._vectorize_single_file.assert_awaited_once()
+    refresh_cancelled.assert_awaited_once()
     resource_lock.close.assert_not_awaited()
 
     await tracker.decrement("semantic-2")
 
     assert "semantic-2" not in tracker._tasks
     resource_lock.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_semantic_cancellation_refresh_is_shared_within_poll_interval(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_viking_fs",
+        MagicMock,
+    )
+    refresh_cancelled = AsyncMock(return_value=False)
+    executor = SemanticDagExecutor(
+        processor=MagicMock(),
+        context_type="resource",
+        max_concurrent_llm=4,
+        ctx=RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER),
+        is_cancelled=lambda: False,
+        refresh_cancelled=refresh_cancelled,
+    )
+
+    await asyncio.gather(*(executor._refresh_cancelled_state() for _ in range(20)))
+
+    refresh_cancelled.assert_awaited_once()
 
 
 @pytest.mark.asyncio

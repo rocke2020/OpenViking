@@ -156,7 +156,11 @@ class PathLockEngine:
             return [primary]
         return [primary, prefixed]
 
-    async def _ensure_directory_exists_async(self, path: str):
+    async def _ensure_directory_exists_async(
+        self,
+        path: str,
+        owner: Optional[LockOwner] = None,
+    ):
         """Async variant for lock acquisition paths."""
         try:
             await self._async_agfs.stat(path)
@@ -164,8 +168,10 @@ class PathLockEngine:
             try:
                 parent = self._get_parent_path(path)
                 if parent:
-                    await self._ensure_directory_exists_async(parent)
+                    await self._ensure_directory_exists_async(parent, owner)
                 await self._async_agfs.mkdir(path)
+                if owner is not None and hasattr(owner, "add_created_path"):
+                    owner.add_created_path(path)
                 logger.debug(f"Directory created: {path}")
             except Exception as e:
                 if await self._is_existing_directory_async(path):
@@ -724,7 +730,7 @@ class PathLockEngine:
                 await asyncio.sleep(_POLL_INTERVAL)
                 continue
 
-            if not await self._ensure_directory_exists_async(path):
+            if not await self._ensure_directory_exists_async(path, owner):
                 logger.warning(f"[TREE] Failed to ensure directory exists: {path}")
                 return False
 

@@ -341,6 +341,19 @@ class SemanticProcessor(DequeueHandlerBase):
                     task_tracker is not None and task_tracker.is_cancelled(msg.source_task_id)
                 )
 
+            async def _refresh_source_task_cancelled() -> bool:
+                nonlocal source_task_cancelled
+                if task_tracker is not None:
+                    source_task = await task_tracker.get(
+                        msg.source_task_id,
+                        account_id=msg.account_id,
+                        user_id=msg.user_id,
+                    )
+                    source_task_cancelled = (
+                        source_task is not None and source_task.status == TaskStatus.CANCELLED
+                    )
+                return _source_task_is_cancelled()
+
             if is_semantic_msg_stale(msg):
                 logger.info(
                     "Skipping stale semantic message: uri=%s version=%s",
@@ -470,6 +483,9 @@ class SemanticProcessor(DequeueHandlerBase):
                                 coalesce_key=msg.coalesce_key,
                                 coalesce_version=msg.coalesce_version,
                                 is_cancelled=_source_task_is_cancelled
+                                if task_tracker is not None
+                                else None,
+                                refresh_cancelled=_refresh_source_task_cancelled
                                 if task_tracker is not None
                                 else None,
                             )

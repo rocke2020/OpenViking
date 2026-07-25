@@ -348,9 +348,9 @@ class TaskTracker:
                 if stage is not None:
                     task.stage = stage
                 task.updated_at = time.time()
-                await self._store.update(task)
-                with self._lock:
-                    self._tasks[task.task_id] = task
+                if await self._update_if_active(task):
+                    with self._lock:
+                        self._tasks[task.task_id] = task
 
     async def update_stage(
         self,
@@ -365,9 +365,9 @@ class TaskTracker:
             if task and task.status not in _TERMINAL_STATUSES:
                 task.stage = stage
                 task.updated_at = time.time()
-                await self._store.update(task)
-                with self._lock:
-                    self._tasks[task.task_id] = task
+                if await self._update_if_active(task):
+                    with self._lock:
+                        self._tasks[task.task_id] = task
 
     async def complete(
         self,
@@ -389,10 +389,10 @@ class TaskTracker:
                 if resource_id is not None:
                     task.resource_id = resource_id
                 task.updated_at = time.time()
-                await self._store.update(task)
-                with self._lock:
-                    self._tasks[task.task_id] = task
-                transitioned = True
+                transitioned = await self._update_if_active(task)
+                if transitioned:
+                    with self._lock:
+                        self._tasks[task.task_id] = task
         if transitioned:
             logger.info("[TaskTracker] Task %s completed", task_id)
         return transitioned
@@ -413,10 +413,10 @@ class TaskTracker:
                 task.stage = "failed"
                 task.error = _sanitize_error(error)
                 task.updated_at = time.time()
-                await self._store.update(task)
-                with self._lock:
-                    self._tasks[task.task_id] = task
-                transitioned = True
+                transitioned = await self._update_if_active(task)
+                if transitioned:
+                    with self._lock:
+                        self._tasks[task.task_id] = task
         if transitioned:
             logger.warning("[TaskTracker] Task %s failed: %s", task_id, _sanitize_error(error))
 
@@ -435,10 +435,12 @@ class TaskTracker:
                 task.status = TaskStatus.CANCELLED
                 task.stage = "cancelled"
                 task.updated_at = time.time()
-                await self._store.update(task)
-                with self._lock:
-                    self._tasks[task.task_id] = task
-                logger.info("[TaskTracker] Task %s cancelled", task_id)
+                if await self._update_if_active(task):
+                    with self._lock:
+                        self._tasks[task.task_id] = task
+                    logger.info("[TaskTracker] Task %s cancelled", task_id)
+                else:
+                    task = await self._load_for_update(task_id, account_id, user_id)
             return self._copy(task)
 
     def is_cancelled(self, task_id: str) -> bool:
@@ -455,13 +457,15 @@ class TaskTracker:
     ) -> Optional[TaskRecord]:
         """Look up a single task. Returns a snapshot copy (None if not found)."""
         async with self._async_lock:
-            with self._lock:
-                task = self._tasks.get(task_id)
-            if task is None and account_id is not None:
+            task = None
+            if account_id is not None and user_id is not None:
                 task = await self._load_from_store(task_id, account_id, user_id)
                 if task is not None:
                     with self._lock:
                         self._tasks[task.task_id] = task
+            else:
+                with self._lock:
+                    task = self._tasks.get(task_id)
             if task is None or not self._matches_owner(task, account_id, user_id):
                 return None
             return self._copy(task)
@@ -526,13 +530,39 @@ class TaskTracker:
         account_id: Optional[str],
         user_id: Optional[str],
     ) -> Optional[TaskRecord]:
+        if account_id is not None and user_id is not None:
+            persisted = await self._load_from_store(task_id, account_id, user_id)
+            if persisted is not None:
+                with self._lock:
+                    self._tasks[task_id] = persisted
+                return self._copy(persisted)
         with self._lock:
             task = self._tasks.get(task_id)
         if task is not None:
-            return task if self._matches_owner(task, account_id, user_id) else None
+            return self._copy(task) if self._matches_owner(task, account_id, user_id) else None
         if account_id is None or user_id is None:
             return None
         return await self._load_from_store(task_id, account_id, user_id)
+
+    async def _update_if_active(self, task: TaskRecord) -> bool:
+        updater = getattr(self._store, "update_if_status", None)
+        if updater is None:
+            await self._store.update(task)
+            return True
+        transitioned = await updater(
+            task,
+            (TaskStatus.PENDING.value, TaskStatus.RUNNING.value),
+        )
+        if not transitioned and task.account_id is not None and task.user_id is not None:
+            persisted = await self._load_from_store(
+                task.task_id,
+                task.account_id,
+                task.user_id,
+            )
+            if persisted is not None:
+                with self._lock:
+                    self._tasks[task.task_id] = persisted
+        return transitioned
 
     @staticmethod
     def _record_from_payload(payload: Dict[str, Any]) -> TaskRecord:

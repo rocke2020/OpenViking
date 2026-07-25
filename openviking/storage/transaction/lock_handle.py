@@ -33,6 +33,7 @@ class LockHandle:
 
     id: str = field(default_factory=_new_lock_id)
     locks: list[str] = field(default_factory=list)
+    created_paths: list[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     last_active_at: float = field(init=False)
 
@@ -46,3 +47,7 @@ class LockHandle:
     def remove_lock(self, lock_path: str) -> None:
         if lock_path in self.locks:
             self.locks.remove(lock_path)
+
+    def add_created_path(self, path: str) -> None:
+        if path not in self.created_paths:
+            self.created_paths.append(path)
