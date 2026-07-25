@@ -124,7 +124,9 @@ class SemanticNodeScheduler:
                 continue
 
             try:
-                if not item.executor.closed:
+                if not item.executor.closed or (
+                    item.work.kind == "vectorize" and item.executor._cancel_requested()
+                ):
                     await item.executor._run_work(item.work)
             except asyncio.CancelledError:
                 raise
@@ -273,8 +275,6 @@ class SemanticDagExecutor:
                     return
 
                 await self._dispatch_vectorize_tasks(tasks)
-                if self._cancel_requested():
-                    await tracker.cancel(self._semantic_msg_id)
             else:
                 # No vectorize tasks — release lock immediately (via wrapped callback)
                 try:
@@ -374,10 +374,10 @@ class SemanticDagExecutor:
                 self._work_drained.set()
 
     async def _run_work_inner(self, work: DagWork) -> None:
-        if self._stop_if_cancelled():
-            return
         if work.kind == "vectorize":
             await self._run_vectorize_work(work.vectorize_task)
+            return
+        if self._stop_if_cancelled():
             return
 
         self._mark_node_started()
@@ -423,13 +423,25 @@ class SemanticDagExecutor:
     async def _run_vectorize_work(self, task: Optional[VectorizeTask]) -> None:
         try:
             if task is not None:
-                await self._run_vectorize_task(task)
+                if self._cancel_requested():
+                    self._stale = True
+                    self._closed = True
+                    await self._reconcile_cancelled_vectorize_task(task)
+                else:
+                    await self._run_vectorize_task(task)
         except Exception as exc:
             logger.error("Vectorization dispatch task failed: %s", exc, exc_info=True)
         finally:
             self._pending_vectorize_work = max(0, self._pending_vectorize_work - 1)
             if self._pending_vectorize_work == 0 and self._vectorize_done:
                 self._vectorize_done.set()
+
+    async def _reconcile_cancelled_vectorize_task(self, task: VectorizeTask) -> None:
+        from .embedding_tracker import EmbeddingTaskTracker
+
+        tracker = EmbeddingTaskTracker.get_instance()
+        for _ in range(self._vectorize_output_count(task)):
+            await tracker.decrement(task.semantic_msg_id)
 
     async def _run_vectorize_task(self, task: VectorizeTask) -> None:
         if task.task_type == "file":
@@ -916,10 +928,11 @@ class SemanticDagExecutor:
             return
         async with self._vectorize_lock:
             self._pending_vectorize_tasks.append(task)
-            if task.task_type == "file":
-                self._vectorize_task_count += 1
-            else:  # directory
-                self._vectorize_task_count += 2
+            self._vectorize_task_count += self._vectorize_output_count(task)
+
+    @staticmethod
+    def _vectorize_output_count(task: VectorizeTask) -> int:
+        return 1 if task.task_type == "file" else 2
 
     def get_stats(self) -> DagStats:
         return DagStats(

@@ -623,6 +623,138 @@ async def test_semantic_cancellation_after_embedding_registration_releases_lock(
 
 
 @pytest.mark.asyncio
+async def test_semantic_cancellation_after_embedding_dispatch_waits_for_worker_drain(monkeypatch):
+    from openviking.storage.queuefs.embedding_tracker import EmbeddingTaskTracker
+
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_viking_fs",
+        MagicMock,
+    )
+    tracker = EmbeddingTaskTracker.get_instance()
+    tracker._tasks.clear()
+    cancelled = False
+    wait_tracker = MagicMock()
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_request_wait_tracker",
+        lambda: wait_tracker,
+    )
+    resource_lock = MagicMock()
+    resource_lock.close = AsyncMock()
+    ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+    executor = SemanticDagExecutor(
+        processor=MagicMock(),
+        context_type="resource",
+        max_concurrent_llm=1,
+        ctx=ctx,
+        telemetry_id="telemetry-1",
+        semantic_msg_id="semantic-1",
+        lock=resource_lock,
+        is_cancelled=lambda: cancelled,
+    )
+
+    def seed_vectorization(*_args, **_kwargs):
+        executor._vectorize_task_count = 1
+        executor._pending_vectorize_tasks = [
+            VectorizeTask(
+                task_type="file",
+                uri="viking://resources/demo/file.txt",
+                context_type="resource",
+                ctx=ctx,
+                file_path="viking://resources/demo/file.txt",
+            )
+        ]
+        executor._root_done.set()
+
+    async def dispatch_then_cancel(_tasks):
+        nonlocal cancelled
+        cancelled = True
+
+    executor._schedule_dir = seed_vectorization
+    monkeypatch.setattr(executor, "_dispatch_vectorize_tasks", dispatch_then_cancel)
+
+    await executor.run("viking://resources/demo")
+
+    assert "semantic-1" in tracker._tasks
+    wait_tracker.mark_semantic_done.assert_not_called()
+    resource_lock.close.assert_not_awaited()
+
+    await tracker.decrement("semantic-1")
+
+    assert "semantic-1" not in tracker._tasks
+    wait_tracker.mark_semantic_done.assert_called_once_with(
+        "telemetry-1",
+        "semantic-1",
+        processed_delta=0,
+    )
+    resource_lock.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_semantic_cancellation_reconciles_vectorize_work_skipped_before_enqueue(monkeypatch):
+    from openviking.storage.queuefs.embedding_tracker import EmbeddingTaskTracker
+
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_viking_fs",
+        MagicMock,
+    )
+    tracker = EmbeddingTaskTracker.get_instance()
+    tracker._tasks.clear()
+    cancelled = False
+    processor = MagicMock()
+
+    async def enqueue_first_embedding(*_args, **_kwargs):
+        nonlocal cancelled
+        cancelled = True
+
+    processor._vectorize_single_file = AsyncMock(side_effect=enqueue_first_embedding)
+    resource_lock = MagicMock()
+    resource_lock.close = AsyncMock()
+    ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+    executor = SemanticDagExecutor(
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=1,
+        ctx=ctx,
+        semantic_msg_id="semantic-2",
+        lock=resource_lock,
+        is_cancelled=lambda: cancelled,
+    )
+
+    def seed_vectorization(*_args, **_kwargs):
+        executor._vectorize_task_count = 3
+        executor._pending_vectorize_tasks = [
+            VectorizeTask(
+                task_type="file",
+                uri="viking://resources/demo/first.txt",
+                context_type="resource",
+                ctx=ctx,
+                semantic_msg_id="semantic-2",
+                file_path="viking://resources/demo/first.txt",
+            ),
+            VectorizeTask(
+                task_type="directory",
+                uri="viking://resources/demo/child",
+                context_type="resource",
+                ctx=ctx,
+                semantic_msg_id="semantic-2",
+            ),
+        ]
+        executor._root_done.set()
+
+    executor._schedule_dir = seed_vectorization
+
+    await executor.run("viking://resources/demo")
+
+    processor._vectorize_single_file.assert_awaited_once()
+    resource_lock.close.assert_not_awaited()
+
+    await tracker.decrement("semantic-2")
+
+    assert "semantic-2" not in tracker._tasks
+    resource_lock.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_semantic_processor_restores_cancelled_state_after_restart(monkeypatch):
     agfs = _FakeAgfs()
     original_tracker = TaskTracker(store=PersistentTaskStore(agfs))
