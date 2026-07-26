@@ -21,13 +21,14 @@ from openviking.storage.collection_schemas import (
 from openviking.storage.errors import EmbeddingRebuildRequiredError
 from openviking.storage.expr import Eq
 from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
+from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.vectordb import engine as vectordb_engine
+from openviking.storage.vectordb.collection.result import UpsertDataResult
+from openviking.storage.vectordb.collection.vikingdb_collection import VikingDBCollection
 from openviking.storage.vectordb.collection.volcengine_api_key_collection import (
     VolcengineApiKeyCollection,
 )
-from openviking.storage.vectordb.collection.vikingdb_collection import VikingDBCollection
 from openviking.storage.vectordb.collection.volcengine_collection import VolcengineCollection
-from openviking.storage.vectordb.collection.result import UpsertDataResult
 from openviking.storage.vectordb_adapters.base import (
     VIKINGDB_TEXT_FIELD_BYTE_LIMIT,
     _truncate_text_field,
@@ -600,6 +601,99 @@ async def test_embedding_handler_preserves_parent_uri_for_backend_upsert_logic(m
     assert result is not None
     assert "data" in captured
     assert captured["data"]["parent_uri"] == "viking://resources"
+
+
+@pytest.mark.asyncio
+async def test_embedding_handler_skips_legacy_task_bound_message_after_restart(monkeypatch):
+    class _CapturingVikingDB:
+        is_closing = False
+        mode = "local"
+
+        def __init__(self):
+            self.upsert_calls = 0
+
+        async def upsert(self, _data, *, ctx, partial_update=False):
+            self.upsert_calls += 1
+            return "rec-1"
+
+    source_task = SimpleNamespace(status="cancelled")
+
+    class _ReloadedTaskTracker:
+        async def run_unless_cancelled(self, task_id, operation, *, account_id, user_id):
+            assert task_id == "task-1"
+            assert account_id == "acme"
+            assert user_id == "alice"
+            if source_task.status == "cancelled":
+                return False, None
+            return True, await operation()
+
+    embedder = _DummyEmbedder()
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: _DummyConfig(embedder),
+    )
+    monkeypatch.setattr(
+        "openviking.service.task_tracker.get_task_tracker",
+        lambda: _ReloadedTaskTracker(),
+    )
+    vikingdb = _CapturingVikingDB()
+    handler = TextEmbeddingHandler(vikingdb)
+    payload = _build_queue_payload_for_account("acme")
+    queue_data = json.loads(payload["data"])
+    semantic_msg = SemanticMsg(
+        uri="viking://resources/sample",
+        context_type="resource",
+        source_task_id="task-1",
+    )
+    queue_data.pop("source_task_id", None)
+    queue_data["semantic_msg_id"] = semantic_msg.id
+    queue_data["context_data"]["user"] = {
+        "account_id": "acme",
+        "user_id": "alice",
+    }
+    payload["data"] = json.dumps(queue_data)
+
+    await handler.on_dequeue(payload)
+
+    assert embedder.calls == 1
+    assert vikingdb.upsert_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_embedding_handler_skips_pre_upgrade_semantic_message_with_unknown_task(
+    monkeypatch,
+):
+    class _CapturingVikingDB:
+        is_closing = False
+        mode = "local"
+
+        def __init__(self):
+            self.upsert_calls = 0
+
+        async def upsert(self, _data, *, ctx, partial_update=False):
+            self.upsert_calls += 1
+            return "rec-1"
+
+    embedder = _DummyEmbedder()
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: _DummyConfig(embedder),
+    )
+    vikingdb = _CapturingVikingDB()
+    handler = TextEmbeddingHandler(vikingdb)
+    payload = _build_queue_payload_for_account("acme")
+    queue_data = json.loads(payload["data"])
+    queue_data.pop("source_task_id", None)
+    queue_data["semantic_msg_id"] = SemanticMsg(
+        uri="viking://resources/sample",
+        context_type="resource",
+    ).id
+    payload["data"] = json.dumps(queue_data)
+
+    await handler.on_dequeue(payload)
+
+    assert embedder.calls == 0
+    assert vikingdb.upsert_calls == 0
 
 
 @pytest.mark.asyncio

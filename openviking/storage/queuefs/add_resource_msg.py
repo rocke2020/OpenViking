@@ -37,6 +37,7 @@ class AddResourceMsg:
     source_name: Optional[str] = None
     target_preexisting: Optional[bool] = None
     target_created: Optional[bool] = None
+    target_materialization_pending: bool = False
     watch_interval: float = 0
     skip_watch_management: bool = True
     defer_target_resolution: bool = False
@@ -117,6 +118,7 @@ class AddResourceMsg:
             target_created=(
                 data["target_created"] if isinstance(data.get("target_created"), bool) else None
             ),
+            target_materialization_pending=bool(data.get("target_materialization_pending", False)),
             prepared=prepared,
             watch_interval=float(data.get("watch_interval", 0) or 0),
             skip_watch_management=bool(data.get("skip_watch_management", True)),

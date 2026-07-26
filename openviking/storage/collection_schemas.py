@@ -561,6 +561,17 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     report_success = True
                     return None
 
+                if embedding_msg.legacy_task_identity_unknown:
+                    logger.warning(
+                        "Skipping pre-upgrade semantic embedding with unknown source task "
+                        "identity (%s)",
+                        self._embedding_msg_log_context(embedding_msg),
+                    )
+                    self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
+                    self._record_request_success(embedding_msg)
+                    report_success = True
+                    return inserted_data
+
                 # Process string (text) or list (multimodal) messages
                 if not isinstance(embedding_msg.message, (str, list)):
                     logger.debug(
@@ -759,11 +770,48 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         user_id="default",
                     )
                     ctx = RequestContext(user=user, role=Role.ROOT)
-                    result = await self._vikingdb.upsert(
-                        inserted_data,
-                        ctx=ctx,
-                        partial_update=True,
-                    )
+
+                    async def _upsert() -> str:
+                        return await self._vikingdb.upsert(
+                            inserted_data,
+                            ctx=ctx,
+                            partial_update=True,
+                        )
+
+                    if embedding_msg.source_task_id:
+                        source_user = inserted_data.get("user")
+                        source_user_id = (
+                            source_user.get("user_id") if isinstance(source_user, dict) else None
+                        )
+                        source_account_id = (
+                            source_user.get("account_id")
+                            if isinstance(source_user, dict)
+                            else account_id
+                        )
+                        if not source_account_id or not source_user_id:
+                            raise ValueError("Embedding source task is missing its owner identity")
+                        from openviking.service.task_tracker import get_task_tracker
+
+                        accepted, result = await get_task_tracker().run_unless_cancelled(
+                            embedding_msg.source_task_id,
+                            _upsert,
+                            account_id=source_account_id,
+                            user_id=source_user_id,
+                        )
+                        if not accepted:
+                            logger.info(
+                                "Skipped embedding write for cancelled source task %s",
+                                embedding_msg.source_task_id,
+                            )
+                            self._merge_request_stats(
+                                embedding_msg.telemetry_id,
+                                processed=1,
+                            )
+                            self._record_request_success(embedding_msg)
+                            report_success = True
+                            return inserted_data
+                    else:
+                        result = await _upsert()
                     record_id = result
                     if record_id:
                         logger.debug(

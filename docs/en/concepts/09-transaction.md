@@ -159,9 +159,23 @@ During this period, `rm` attempting to acquire a TreeLock on the same path will 
 Cancellation is cooperative across the durable add-resource worker and its semantic DAG. The task
 record is first persisted as `cancelled`, new DAG work and semantic writes then stop, and in-flight
 work drains before rollback. Rollback runs while the lifecycle lock is still held and releases it
-afterward. The queue message records whether this task created the target: rollback removes only a
-target with `target_created=true`; a pre-existing target, and a legacy message whose ownership is
-unknown, are never deleted.
+afterward. A deferred target first persists its resolved URI in a `materialization_pending` state,
+which grants no deletion authority. After its TreeLock materializes the target, ownership is
+persisted as true before the first source write. Restart recovery reloads the pending state, replays
+the exact resolved URI instead of auto-naming again, and reacquires the TreeLock. An empty directory
+left by a crash may be reclaimed only after that TreeLock is held and the target is confirmed to
+contain no pre-existing data. Cancellation before that transition does not delete the target.
+Embedding messages also carry the source task ID, and task-bound semantic message IDs retain that
+identity for rolling recovery of older embedding payloads. Each vector upsert is serialized with
+cancellation so a recovered worker cannot write after rollback starts. A pre-upgrade semantic
+embedding payload that has neither an explicit task ID nor a task-bound semantic message ID is
+skipped fail-closed because its ownership cannot be recovered safely.
+
+Rollback removes only a target with `target_created=true`; a pre-existing target, and a legacy
+message whose ownership is unknown, are never deleted. `VikingFS.rm` deletes the target's VectorDB
+rows before its files. An index-delete failure or the failure to durably enqueue the parent
+directory's delete refresh keeps the queue message unacknowledged, so restart recovery can retry
+the rollback.
 
 **Incremental update** (target already exists) — temp stays in place:
 
@@ -182,8 +196,16 @@ wrong scope.
 
 Automatic naming is handled by the resource layer, not the lock service:
 `ResourceProcessor` checks `exists(candidate_uri)` first; occupied candidates
-try `_1`, `_2`, and so on. Only a non-existing candidate attempts `TreeLock`,
-without waiting. If that candidate is busy, the next suffix is tried.
+try `_1`, `_2`, and so on. For a deferred target, a non-existing candidate is
+first reserved with an ExactPathLock without creating the directory. The final
+URI is persisted as `materialization_pending`, then the same lock owner upgrades
+the reservation to a TreeLock, which creates the directory. Only after that
+upgrade does the task persist `target_created=true`. A restart during the pending
+phase repeats the TreeLock upgrade and the empty-target ownership check before
+granting deletion authority. If a competing descendant writer prevents the
+TreeLock upgrade or leaves pre-existing data, cancellation remains fail-closed
+and cannot delete that writer's target. If a candidate is busy, the next suffix
+is tried.
 
 **Server restart recovery**: SemanticMsg is persisted in QueueFS. On restart, `SemanticProcessor` detects that the `lifecycle_lock_handle_id` handle is missing from the in-memory LockManager and re-acquires a TreeLock.
 

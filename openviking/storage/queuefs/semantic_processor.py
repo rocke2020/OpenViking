@@ -292,6 +292,7 @@ class SemanticProcessor(DequeueHandlerBase):
             peer_id=msg.peer_id,
             role=msg.role,
             skip_vectorization=msg.skip_vectorization,
+            source_task_id=msg.source_task_id,
             changes={"modified": [uri]},
             coalesce_key=build_semantic_coalesce_key(
                 context_type=msg.context_type,
@@ -299,6 +300,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 account_id=msg.account_id,
                 user_id=msg.user_id,
                 peer_id=msg.peer_id,
+                source_task_id=msg.source_task_id,
             ),
         )
         await semantic_queue.enqueue(parent_msg)
@@ -474,6 +476,7 @@ class SemanticProcessor(DequeueHandlerBase):
                                 incremental_update=is_incremental,
                                 target_uri=target_uri,
                                 semantic_msg_id=msg.id,
+                                source_task_id=msg.source_task_id,
                                 telemetry_id=msg.telemetry_id,
                                 recursive=msg.recursive,
                                 lock=semantic_lock.lock,
@@ -1585,6 +1588,7 @@ class SemanticProcessor(DequeueHandlerBase):
         overview: str,
         ctx: Optional[RequestContext] = None,
         semantic_msg_id: Optional[str] = None,
+        source_task_id: str = "",
     ) -> None:
         """Create directory Context and enqueue to EmbeddingQueue."""
 
@@ -1598,6 +1602,7 @@ class SemanticProcessor(DequeueHandlerBase):
             context_type=context_type,
             ctx=active_ctx,
             semantic_msg_id=semantic_msg_id,
+            source_task_id=source_task_id,
         )
 
     async def _vectorize_single_file(
@@ -1608,6 +1613,7 @@ class SemanticProcessor(DequeueHandlerBase):
         summary_dict: Dict[str, str],
         ctx: Optional[RequestContext] = None,
         semantic_msg_id: Optional[str] = None,
+        source_task_id: str = "",
         use_summary: bool = False,
         preserve_existing_created_at: bool = False,
     ) -> None:
@@ -1622,6 +1628,7 @@ class SemanticProcessor(DequeueHandlerBase):
             context_type=context_type,
             ctx=active_ctx,
             semantic_msg_id=semantic_msg_id,
+            source_task_id=source_task_id,
             use_summary=use_summary,
             preserve_existing_created_at=preserve_existing_created_at,
         )

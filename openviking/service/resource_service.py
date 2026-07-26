@@ -106,6 +106,7 @@ _ADD_RESOURCE_ARGS_RESERVED_FIELDS = frozenset(
         "request_validator",
         "understanding_response_id",
         "defer_post_processing",
+        "rollback_target_callback",
     }
 )
 
@@ -374,6 +375,36 @@ class ResourceService:
         )
         return task
 
+    @staticmethod
+    async def _persist_add_resource_rollback_target(
+        task_id: str,
+        result: Dict[str, Any],
+        target_created: Any,
+        *,
+        ctx: RequestContext,
+        materialization_pending: bool = False,
+    ) -> None:
+        """Persist the resolved target before another cancellation boundary."""
+        root_uri = result.get("root_uri")
+        if (
+            not isinstance(root_uri, str)
+            or not root_uri
+            or (type(target_created) is not bool and not materialization_pending)
+        ):
+            return
+        from openviking.service.task_tracker import get_task_tracker
+
+        updated = await get_task_tracker().update_add_resource_rollback_target(
+            task_id,
+            root_uri,
+            target_created,
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+            materialization_pending=materialization_pending,
+        )
+        if updated is None:
+            raise InternalError(f"Add-resource task is missing: {task_id}")
+
     async def execute_add_resource_job(
         self,
         msg: Any,
@@ -416,6 +447,7 @@ class ResourceService:
                 stage_callback=stage_callback,
                 source_task_id=msg.task_id,
                 target_created=msg.target_created,
+                target_materialization_pending=msg.target_materialization_pending,
                 strict=msg.strict,
                 source_name=msg.source_name,
                 ignore_dirs=msg.ignore_dirs,
@@ -528,6 +560,18 @@ class ResourceService:
             ctx=ctx,
             lock_handle=resource_lock.handle if resource_lock is not None else None,
         )
+        from openviking.service.fs_service import enqueue_delete_refresh
+        from openviking_cli.utils import VikingURI
+
+        parent = VikingURI(msg.root_uri).parent
+        if parent is not None:
+            await enqueue_delete_refresh(
+                root_uri=parent.uri,
+                deleted_uri=msg.root_uri,
+                context_type="resource",
+                ctx=ctx,
+                telemetry_id="",
+            )
 
     async def reacquire_add_resource_job_lock(
         self,
@@ -1105,6 +1149,18 @@ class ResourceService:
                     response["root_uri"] = root_uri
                 return response
 
+            async def _persist_resolved_rollback_target(
+                root_uri: str,
+                target_created: Optional[bool],
+            ) -> None:
+                await self._persist_add_resource_rollback_target(
+                    source_task_id,
+                    {"root_uri": root_uri},
+                    target_created,
+                    ctx=ctx,
+                    materialization_pending=target_created is None,
+                )
+
             result = await self._resource_processor.process_resource(
                 path=path,
                 ctx=ctx,
@@ -1117,6 +1173,9 @@ class ResourceService:
                 summarize=summarize,
                 stage_callback=stage_callback,
                 source_task_id=source_task_id,
+                rollback_target_callback=(
+                    _persist_resolved_rollback_target if source_task_id else None
+                ),
                 allow_local_path_resolution=allow_local_path_resolution,
                 defer_post_processing=not wait,
                 **kwargs,
@@ -1127,7 +1186,14 @@ class ResourceService:
             prepared = result.pop("_post_process", None)
             deferred_lock = result.pop("_resource_lock", NO_LOCK)
             if source_task_id and isinstance(prepared, dict):
-                result["_target_created"] = prepared.get("target_created")
+                target_created = prepared.get("target_created")
+                result["_target_created"] = target_created
+                await self._persist_add_resource_rollback_target(
+                    source_task_id,
+                    result,
+                    target_created,
+                    ctx=ctx,
+                )
             if wait:
                 if stage_callback is not None:
                     stage_result = stage_callback("processing_queue")

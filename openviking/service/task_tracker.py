@@ -21,7 +21,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 from uuid import uuid4
 
 from openviking.service.task_store import TaskStore
@@ -58,6 +58,8 @@ class TaskRecord:
     stage: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    rollback_target_created: Optional[bool] = None
+    rollback_target_materialization_pending: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize for JSON response."""
@@ -68,6 +70,8 @@ class TaskRecord:
         d["result"] = _sanitize_task_result(d.get("result"))
         d.pop("account_id", None)
         d.pop("user_id", None)
+        d.pop("rollback_target_created", None)
+        d.pop("rollback_target_materialization_pending", None)
         return d
 
 
@@ -442,6 +446,72 @@ class TaskTracker:
                 else:
                     task = await self._load_for_update(task_id, account_id, user_id)
             return self._copy(task)
+
+    async def update_add_resource_rollback_target(
+        self,
+        task_id: str,
+        resource_id: str,
+        rollback_target_created: Optional[bool],
+        *,
+        account_id: str,
+        user_id: str,
+        materialization_pending: bool = False,
+    ) -> Optional[TaskRecord]:
+        """Persist the resolved target needed to roll back a deferred add-resource task."""
+        async with self._async_lock:
+            updater = getattr(self._store, "update_add_resource_rollback_target", None)
+            if updater is not None:
+                payload = await updater(
+                    task_id,
+                    account_id=account_id,
+                    user_id=user_id,
+                    resource_id=resource_id,
+                    rollback_target_created=rollback_target_created,
+                    materialization_pending=materialization_pending,
+                )
+                task = self._record_from_payload(payload) if payload is not None else None
+            else:
+                task = await self._load_for_update(task_id, account_id, user_id)
+                if task is not None:
+                    task.resource_id = resource_id
+                    task.rollback_target_created = rollback_target_created
+                    task.rollback_target_materialization_pending = materialization_pending
+                    task.updated_at = time.time()
+                    await self._store.update(task)
+            if task is not None:
+                with self._lock:
+                    self._tasks[task.task_id] = task
+                return self._copy(task)
+            return None
+
+    async def run_unless_cancelled(
+        self,
+        task_id: str,
+        operation: Callable[[], Awaitable[Any]],
+        *,
+        account_id: str,
+        user_id: str,
+    ) -> tuple[bool, Any]:
+        """Run an operation atomically unless the task was cancelled."""
+        runner = getattr(self._store, "run_if_status", None)
+        if runner is not None:
+            return await runner(
+                task_id,
+                operation,
+                account_id=account_id,
+                user_id=user_id,
+                expected_statuses=(
+                    TaskStatus.PENDING.value,
+                    TaskStatus.RUNNING.value,
+                    TaskStatus.COMPLETED.value,
+                    TaskStatus.FAILED.value,
+                ),
+            )
+        async with self._async_lock:
+            task = await self._load_for_update(task_id, account_id, user_id)
+            if task is None or task.status == TaskStatus.CANCELLED:
+                return False, None
+            return True, await operation()
 
     def is_cancelled(self, task_id: str) -> bool:
         """Return the cached cancellation state for cooperative workers."""

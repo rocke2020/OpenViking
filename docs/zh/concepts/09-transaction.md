@@ -155,8 +155,19 @@ VectorDB 删除失败 -> 直接抛异常，锁自动释放，文件和索引都�
 
 取消操作会在持久化的 add-resource worker 与 semantic DAG 之间协作完成。系统先把任务状态
 持久化为 `cancelled`，再停止调度新的 DAG 工作和语义写入；进行中的工作排空后，系统会在
-仍持有生命周期锁时执行回滚，最后才释放锁。队列消息会记录目标是否由本任务创建：只有
-`target_created=true` 时才删除目标；预先存在的目标以及所有权未知的旧消息永远不会触发删除。
+仍持有生命周期锁时执行回滚，最后才释放锁。对于延迟解析的目标，系统先把最终 URI
+持久化为 `materialization_pending`，此状态不授予删除权限；TreeLock 创建目标后，再在
+首次源文件写入前把所有权持久化为 `target_created=true`。如果在 pending 阶段重启，
+恢复逻辑会按最终 URI 精确重放并重新获取 TreeLock；只有持锁且确认崩溃遗留目录为空时，
+才会接管该目录并授予删除权限。在此转换前收到取消不会删除目标。Embedding 消息也会
+携带来源任务 ID；任务绑定的 semantic 消息 ID 还会保留该身份，以便滚动升级时恢复
+缺少新字段的旧 embedding 负载。每次向量 upsert 都与取消操作串行化，避免恢复后的
+worker 在回滚开始后继续写入。如果升级前的语义 embedding 负载既没有显式任务 ID，
+也没有任务绑定的 semantic 消息 ID，则因无法安全恢复其所有权而按 fail-closed 策略跳过。
+
+只有 `target_created=true` 时才删除目标；预先存在的目标以及所有权未知的旧消息永远不会
+触发删除。`VikingFS.rm` 会先删除目标的 VectorDB 记录，再删除文件。索引删除失败，或父目录
+删除刷新无法持久入队时，队列消息都不会被 ACK，因此重启恢复可以重试回滚。
 
 **增量更新**（target 已存在）— temp 保持不动：
 
@@ -175,8 +186,13 @@ VectorDB 删除失败 -> 直接抛异常，锁自动释放，文件和索引都�
 同一个 `.path.ovlock` 时出现释放顺序错误。
 
 自动命名由资源层处理，不属于锁服务：`ResourceProcessor` 先用 `exists(candidate_uri)`
-判断候选目录是否已占用；已存在则尝试 `_1`、`_2` 后缀。候选目录不存在时才尝试
-获取该目录的 `TreeLock`，且不等待；如果同名正在被并发请求处理，就直接尝试下一个后缀。
+判断候选目录是否已占用；已存在则尝试 `_1`、`_2` 后缀。对于延迟解析的目标，不存在的
+候选会先用 ExactPathLock 预留，但不创建目录；系统先把最终 URI 持久化为
+`materialization_pending`，同一锁持有者再把预留升级为 TreeLock 并创建目录，随后才
+持久化 `target_created=true`。如果 pending 阶段发生重启，系统会重新完成 TreeLock
+升级和空目标所有权检查后才授予删除权限。如果并发的子路径写入使 TreeLock 升级失败，
+或目标中已有外部数据，取消仍保持 fail-closed，不会删除其他 writer 的目标。如果同名
+正在被并发请求处理，就直接尝试下一个后缀。
 
 **服务重启恢复**：SemanticMsg 持久化在 QueueFS 中。重启后 `SemanticProcessor` 发现 `lifecycle_lock_handle_id` 对应的 handle 不在内存中，会重新获取 TreeLock。
 

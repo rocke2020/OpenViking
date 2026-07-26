@@ -5,6 +5,8 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Union
 from uuid import uuid4
 
+from openviking.storage.queuefs.semantic_msg import source_task_id_from_semantic_msg_id
+
 
 @dataclass
 class EmbeddingMsg:
@@ -13,6 +15,7 @@ class EmbeddingMsg:
     id: str = field(default_factory=lambda: str(uuid4()))
     telemetry_id: str = ""
     semantic_msg_id: Optional[str] = None
+    source_task_id: str = ""
 
     def __init__(
         self,
@@ -20,12 +23,20 @@ class EmbeddingMsg:
         context_data: Dict[str, Any],
         telemetry_id: str = "",
         semantic_msg_id: Optional[str] = None,
+        source_task_id: str = "",
     ):
         self.id = str(uuid4())
         self.message = message
         self.context_data = context_data
         self.telemetry_id = telemetry_id
         self.semantic_msg_id = semantic_msg_id
+        self.source_task_id = source_task_id
+        self._legacy_task_identity_unknown = False
+
+    @property
+    def legacy_task_identity_unknown(self) -> bool:
+        """Whether a pre-upgrade semantic payload cannot be tied to its source task."""
+        return self._legacy_task_identity_unknown
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert embedding message to dictionary format."""
@@ -38,11 +49,20 @@ class EmbeddingMsg:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "EmbeddingMsg":
         """Create an embedding message object from dictionary."""
+        semantic_msg_id = data.get("semantic_msg_id")
+        source_task_id_missing = "source_task_id" not in data
+        source_task_id = str(data.get("source_task_id") or "")
+        if not source_task_id:
+            source_task_id = source_task_id_from_semantic_msg_id(semantic_msg_id)
         obj = EmbeddingMsg(
             message=data["message"],
             context_data=data["context_data"],
             telemetry_id=data.get("telemetry_id", ""),
-            semantic_msg_id=data.get("semantic_msg_id"),
+            semantic_msg_id=semantic_msg_id,
+            source_task_id=source_task_id,
+        )
+        obj._legacy_task_identity_unknown = bool(
+            source_task_id_missing and semantic_msg_id and not source_task_id
         )
         obj.id = data.get("id", obj.id)
         return obj

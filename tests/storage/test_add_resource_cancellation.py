@@ -11,8 +11,12 @@ from openviking.server.identity import RequestContext, Role
 from openviking.service.resource_service import ResourceService
 from openviking.service.task_store import PersistentTaskStore
 from openviking.service.task_tracker import TaskStatus, TaskTracker, set_task_tracker
+from openviking.storage.errors import ResourceBusyError
 from openviking.storage.queuefs.add_resource_msg import AddResourceMsg
-from openviking.storage.queuefs.add_resource_processor import AddResourceProcessor
+from openviking.storage.queuefs.add_resource_processor import (
+    AddResourceProcessor,
+    AddResourceTaskCancelled,
+)
 from openviking.storage.queuefs.semantic_dag import DagWork, SemanticDagExecutor, VectorizeTask
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
@@ -301,7 +305,25 @@ async def test_cancel_rollback_never_deletes_preexisting_or_unknown_target(targe
 
 
 @pytest.mark.asyncio
-async def test_cancel_rollback_deletes_only_task_created_target():
+async def test_cancel_rollback_deletes_only_task_created_target(monkeypatch):
+    enqueued = []
+
+    class FakeQueue:
+        async def enqueue(self, msg):
+            enqueued.append(msg)
+
+    class FakeQueueManager:
+        SEMANTIC = "Semantic"
+
+        def get_queue(self, name, allow_create=False):
+            assert name == self.SEMANTIC
+            assert allow_create is True
+            return FakeQueue()
+
+    monkeypatch.setattr(
+        "openviking.service.fs_service.get_queue_manager",
+        lambda: FakeQueueManager(),
+    )
     service = ResourceService()
     service._viking_fs = AsyncMock()
     msg = AddResourceMsg(
@@ -325,6 +347,10 @@ async def test_cancel_rollback_deletes_only_task_created_target():
         ctx=ctx,
         lock_handle="lock-handle",
     )
+    assert len(enqueued) == 1
+    assert enqueued[0].uri == "viking://resources"
+    assert enqueued[0].source_task_id == ""
+    assert enqueued[0].changes == {"deleted": ["viking://resources/demo"]}
 
 
 @pytest.mark.asyncio
@@ -400,6 +426,49 @@ async def test_queued_cancelled_job_is_acked_and_rolled_back_without_execution()
 
 
 @pytest.mark.asyncio
+async def test_cancelled_job_falls_back_to_fresh_lock_when_handoff_is_invalid():
+    tracker = TaskTracker(store=PersistentTaskStore(_FakeAgfs()))
+    set_task_tracker(tracker)
+    task = await tracker.create(
+        "add_resource",
+        resource_id="viking://resources/demo",
+        account_id="acme",
+        user_id="alice",
+        task_id="task-1",
+    )
+    await tracker.start(task.task_id, account_id="acme", user_id="alice")
+    service = MagicMock()
+    service.rollback_cancelled_add_resource = AsyncMock()
+    service.execute_add_resource_job = AsyncMock()
+    processor = AddResourceProcessor(service, asyncio.get_running_loop(), "AddResource")
+
+    async def cancel_while_loading_lock(*_args, **_kwargs):
+        await tracker.cancel(task.task_id, account_id="acme", user_id="alice")
+        raise ValueError("stale handoff")
+
+    processor._load_lock = AsyncMock(side_effect=cancel_while_loading_lock)
+    msg = AddResourceMsg(
+        task_id=task.task_id,
+        root_uri="viking://resources/demo",
+        account_id="acme",
+        user_id="alice",
+        role="user",
+        path="https://example.com/demo.git",
+        target_created=True,
+        lock_handoff_retry=2,
+    )
+
+    await processor._process(msg, msg.to_dict())
+
+    service.execute_add_resource_job.assert_not_awaited()
+    service.rollback_cancelled_add_resource.assert_awaited_once_with(
+        msg,
+        ctx=ANY,
+        resource_lock=None,
+    )
+
+
+@pytest.mark.asyncio
 async def test_post_execution_cancel_rolls_back_without_completing():
     tracker = TaskTracker(store=PersistentTaskStore(_FakeAgfs()))
     set_task_tracker(tracker)
@@ -427,6 +496,103 @@ async def test_post_execution_cancel_rolls_back_without_completing():
     assert task is not None
     assert task.status == TaskStatus.CANCELLED
     service.rollback_cancelled_add_resource.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_post_execution_rollback_failure_is_not_acked():
+    tracker = TaskTracker(store=PersistentTaskStore(_FakeAgfs()))
+    set_task_tracker(tracker)
+    service = MagicMock()
+    service.rollback_cancelled_add_resource = AsyncMock(side_effect=RuntimeError("rollback failed"))
+    msg = AddResourceMsg(
+        task_id="task-1",
+        root_uri="viking://resources/demo",
+        account_id="acme",
+        user_id="alice",
+        role="user",
+        target_created=True,
+    )
+
+    async def execute(*_args, **_kwargs):
+        await tracker.cancel(msg.task_id, account_id="acme", user_id="alice")
+        return {"status": "success"}
+
+    service.execute_add_resource_job = AsyncMock(side_effect=execute)
+    processor = AddResourceProcessor(service, asyncio.get_running_loop(), "AddResource")
+
+    with pytest.raises(RuntimeError, match="rollback failed"):
+        await processor._process(msg, msg.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_cancel_racing_with_failure_rolls_back_before_ack():
+    tracker = TaskTracker(store=PersistentTaskStore(_FakeAgfs()))
+    set_task_tracker(tracker)
+    service = MagicMock()
+    service.execute_add_resource_job = AsyncMock(side_effect=RuntimeError("processing failed"))
+    service.rollback_cancelled_add_resource = AsyncMock()
+    msg = AddResourceMsg(
+        task_id="task-1",
+        root_uri="viking://resources/demo",
+        account_id="acme",
+        user_id="alice",
+        role="user",
+        path="https://example.com/demo.git",
+        target_created=True,
+    )
+    original_fail = tracker.fail
+
+    async def cancel_before_fail(task_id, error, account_id=None, user_id=None):
+        await tracker.cancel(task_id, account_id=account_id, user_id=user_id)
+        await original_fail(
+            task_id,
+            error,
+            account_id=account_id,
+            user_id=user_id,
+        )
+
+    tracker.fail = cancel_before_fail
+    processor = AddResourceProcessor(service, asyncio.get_running_loop(), "AddResource")
+
+    await processor._process(msg, msg.to_dict())
+
+    task = await tracker.get(msg.task_id, account_id="acme", user_id="alice")
+    assert task is not None
+    assert task.status == TaskStatus.CANCELLED
+    service.rollback_cancelled_add_resource.assert_awaited_once_with(
+        msg,
+        ctx=ANY,
+        resource_lock=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollback_target_persistence_failure_is_not_acked():
+    from openviking.utils.resource_processor import RollbackTargetPersistenceError
+
+    tracker = TaskTracker(store=PersistentTaskStore(_FakeAgfs()))
+    set_task_tracker(tracker)
+    service = MagicMock()
+    service.execute_add_resource_job = AsyncMock(
+        side_effect=RollbackTargetPersistenceError("task persistence failed")
+    )
+    service.rollback_cancelled_add_resource = AsyncMock()
+    msg = AddResourceMsg(
+        task_id="task-1",
+        root_uri="viking://resources/placeholder",
+        account_id="acme",
+        user_id="alice",
+        role="user",
+        defer_target_resolution=True,
+    )
+    processor = AddResourceProcessor(service, asyncio.get_running_loop(), "AddResource")
+
+    with pytest.raises(RollbackTargetPersistenceError, match="task persistence failed"):
+        await processor._process(msg, msg.to_dict())
+
+    task = await tracker.get(msg.task_id, account_id="acme", user_id="alice")
+    assert task is not None
+    assert task.status == TaskStatus.RUNNING
 
 
 @pytest.mark.asyncio
@@ -470,6 +636,14 @@ async def test_cancel_racing_with_completion_still_rolls_back():
 
 @pytest.mark.asyncio
 async def test_deferred_target_resolution_updates_rollback_ownership():
+    tracker = TaskTracker(store=PersistentTaskStore(_FakeAgfs()))
+    set_task_tracker(tracker)
+    await tracker.create(
+        "add_resource",
+        account_id="acme",
+        user_id="alice",
+        task_id="task-1",
+    )
     service = ResourceService()
     service.add_resource = AsyncMock(
         return_value={
@@ -498,6 +672,355 @@ async def test_deferred_target_resolution_updates_rollback_ownership():
     assert result == {"status": "success", "root_uri": "viking://resources/resolved"}
     assert msg.root_uri == "viking://resources/resolved"
     assert msg.target_created is True
+
+
+@pytest.mark.asyncio
+async def test_execute_job_does_not_repeat_durable_rollback_target_update():
+    tracker = TaskTracker(store=PersistentTaskStore(_FakeAgfs()))
+    set_task_tracker(tracker)
+    await tracker.create(
+        "add_resource",
+        account_id="acme",
+        user_id="alice",
+        task_id="task-1",
+    )
+    update_rollback_target = tracker.update_add_resource_rollback_target
+    tracker.update_add_resource_rollback_target = AsyncMock(wraps=update_rollback_target)
+    service = ResourceService()
+    ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+
+    async def add_resource(**_kwargs):
+        await service._persist_add_resource_rollback_target(
+            "task-1",
+            {"root_uri": "viking://resources/resolved"},
+            True,
+            ctx=ctx,
+        )
+        return {
+            "status": "success",
+            "root_uri": "viking://resources/resolved",
+            "_target_created": True,
+        }
+
+    service.add_resource = AsyncMock(side_effect=add_resource)
+    msg = AddResourceMsg(
+        task_id="task-1",
+        root_uri="viking://resources/placeholder",
+        account_id="acme",
+        user_id="alice",
+        role="user",
+        path="https://example.larkoffice.com/docx/token",
+        defer_target_resolution=True,
+    )
+
+    result = await service.execute_add_resource_job(
+        msg,
+        ctx=ctx,
+        resource_lock=None,
+        stage_callback=AsyncMock(),
+    )
+
+    assert result == {"status": "success", "root_uri": "viking://resources/resolved"}
+    tracker.update_add_resource_rollback_target.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_deferred_target_is_persisted_before_next_cancellation_stage():
+    tracker = TaskTracker(store=PersistentTaskStore(_FakeAgfs()))
+    set_task_tracker(tracker)
+    await tracker.create(
+        "add_resource",
+        account_id="acme",
+        user_id="alice",
+        task_id="task-1",
+    )
+    resource_processor = MagicMock()
+
+    async def process_resource(**kwargs):
+        assert kwargs["defer_post_processing"] is False
+        await kwargs["rollback_target_callback"](
+            "viking://resources/resolved",
+            True,
+        )
+        return {
+            "status": "success",
+            "root_uri": "viking://resources/resolved",
+            "_target_created": True,
+        }
+
+    resource_processor.process_resource = AsyncMock(side_effect=process_resource)
+    service = ResourceService(
+        viking_fs=MagicMock(),
+        resource_processor=resource_processor,
+        skill_processor=MagicMock(),
+    )
+    ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+
+    async def cancel_at_processing_queue(stage):
+        assert stage == "processing_queue"
+        persisted = await tracker.get(
+            "task-1",
+            account_id="acme",
+            user_id="alice",
+        )
+        assert persisted is not None
+        assert persisted.resource_id == "viking://resources/resolved"
+        assert persisted.rollback_target_created is True
+        await tracker.cancel("task-1", account_id="acme", user_id="alice")
+        raise AddResourceTaskCancelled
+
+    with pytest.raises(AddResourceTaskCancelled):
+        await service.add_resource(
+            path="/tmp/demo.txt",
+            ctx=ctx,
+            to="viking://resources/placeholder",
+            wait=True,
+            skip_watch_management=True,
+            source_task_id="task-1",
+            stage_callback=cancel_at_processing_queue,
+        )
+
+
+@pytest.mark.asyncio
+async def test_deferred_target_resolution_survives_restart_for_rollback(monkeypatch):
+    agfs = _FakeAgfs()
+    tracker = TaskTracker(store=PersistentTaskStore(agfs))
+    set_task_tracker(tracker)
+    await tracker.create(
+        "add_resource",
+        account_id="acme",
+        user_id="alice",
+        task_id="task-1",
+    )
+    service = ResourceService()
+    ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+
+    async def add_resource(**_kwargs):
+        await service._persist_add_resource_rollback_target(
+            "task-1",
+            {"root_uri": "viking://resources/resolved"},
+            True,
+            ctx=ctx,
+        )
+        return {
+            "status": "success",
+            "root_uri": "viking://resources/resolved",
+            "_target_created": True,
+        }
+
+    service.add_resource = AsyncMock(side_effect=add_resource)
+    msg = AddResourceMsg(
+        task_id="task-1",
+        root_uri="viking://resources/placeholder",
+        account_id="acme",
+        user_id="alice",
+        role="user",
+        path="https://example.larkoffice.com/docx/token",
+        defer_target_resolution=True,
+    )
+    persisted_queue_payload = msg.to_dict()
+
+    await service.execute_add_resource_job(
+        msg,
+        ctx=ctx,
+        resource_lock=None,
+        stage_callback=AsyncMock(),
+    )
+    await tracker.cancel(msg.task_id, account_id="acme", user_id="alice")
+
+    set_task_tracker(TaskTracker(store=PersistentTaskStore(agfs)))
+    recovered_service = ResourceService()
+    recovered_service._viking_fs = AsyncMock()
+    semantic_queue = SimpleNamespace(enqueue=AsyncMock())
+    queue_manager = SimpleNamespace(
+        SEMANTIC="Semantic",
+        get_queue=MagicMock(return_value=semantic_queue),
+    )
+    monkeypatch.setattr(
+        "openviking.service.fs_service.get_queue_manager",
+        lambda: queue_manager,
+    )
+    recovered_msg = AddResourceMsg.from_dict(persisted_queue_payload)
+    processor = AddResourceProcessor(
+        recovered_service,
+        asyncio.get_running_loop(),
+        "AddResource",
+    )
+
+    await processor._process(recovered_msg, persisted_queue_payload)
+
+    recovered_service._viking_fs.rm.assert_awaited_once_with(
+        "viking://resources/resolved",
+        recursive=True,
+        ctx=ANY,
+        lock_handle=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovered_deferred_target_replays_exact_persisted_uri():
+    agfs = _FakeAgfs()
+    tracker = TaskTracker(store=PersistentTaskStore(agfs))
+    await tracker.create(
+        "add_resource",
+        resource_id="viking://resources/placeholder",
+        account_id="acme",
+        user_id="alice",
+        task_id="task-1",
+    )
+    await tracker.update_add_resource_rollback_target(
+        "task-1",
+        "viking://resources/resolved",
+        True,
+        account_id="acme",
+        user_id="alice",
+    )
+    recovered_tracker = TaskTracker(store=PersistentTaskStore(agfs))
+    recovered_task = await recovered_tracker.get(
+        "task-1",
+        account_id="acme",
+        user_id="alice",
+    )
+    service = ResourceService()
+    service.add_resource = AsyncMock(
+        return_value={
+            "status": "success",
+            "root_uri": "viking://resources/resolved",
+            "_target_created": True,
+        }
+    )
+    msg = AddResourceMsg(
+        task_id="task-1",
+        root_uri="viking://resources/placeholder",
+        account_id="acme",
+        user_id="alice",
+        role="user",
+        path="https://example.larkoffice.com/docx/token",
+        defer_target_resolution=True,
+    )
+
+    AddResourceProcessor._restore_rollback_target(msg, recovered_task)
+    await service.execute_add_resource_job(
+        msg,
+        ctx=RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER),
+        resource_lock=None,
+        stage_callback=AsyncMock(),
+    )
+
+    assert service.add_resource.await_args.kwargs["to"] == "viking://resources/resolved"
+    assert service.add_resource.await_args.kwargs["parent"] is None
+
+
+@pytest.mark.asyncio
+async def test_recovered_pending_materialization_replays_under_tree_lock():
+    agfs = _FakeAgfs()
+    tracker = TaskTracker(store=PersistentTaskStore(agfs))
+    await tracker.create(
+        "add_resource",
+        resource_id="viking://resources/placeholder",
+        account_id="acme",
+        user_id="alice",
+        task_id="task-1",
+    )
+    await tracker.update_add_resource_rollback_target(
+        "task-1",
+        "viking://resources/resolved",
+        None,
+        account_id="acme",
+        user_id="alice",
+        materialization_pending=True,
+    )
+    recovered_tracker = TaskTracker(store=PersistentTaskStore(agfs))
+    recovered_task = await recovered_tracker.get(
+        "task-1",
+        account_id="acme",
+        user_id="alice",
+    )
+    service = ResourceService()
+    service.add_resource = AsyncMock(
+        return_value={
+            "status": "success",
+            "root_uri": "viking://resources/resolved",
+            "_target_created": True,
+        }
+    )
+    msg = AddResourceMsg(
+        task_id="task-1",
+        root_uri="viking://resources/placeholder",
+        account_id="acme",
+        user_id="alice",
+        role="user",
+        path="https://example.larkoffice.com/docx/token",
+        defer_target_resolution=True,
+    )
+
+    AddResourceProcessor._restore_rollback_target(msg, recovered_task)
+    await service.execute_add_resource_job(
+        msg,
+        ctx=RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER),
+        resource_lock=None,
+        stage_callback=AsyncMock(),
+    )
+
+    assert service.add_resource.await_args.kwargs["to"] == "viking://resources/resolved"
+    assert service.add_resource.await_args.kwargs["target_created"] is None
+    assert service.add_resource.await_args.kwargs["target_materialization_pending"] is True
+    assert msg.target_created is None
+
+
+@pytest.mark.asyncio
+async def test_recovered_pending_materialization_remains_unacked_while_old_lock_is_busy():
+    tracker = TaskTracker(store=PersistentTaskStore(_FakeAgfs()))
+    set_task_tracker(tracker)
+    task = await tracker.create(
+        "add_resource",
+        resource_id="viking://resources/placeholder",
+        account_id="acme",
+        user_id="alice",
+        task_id="task-1",
+    )
+    await tracker.update_add_resource_rollback_target(
+        task.task_id,
+        "viking://resources/resolved",
+        None,
+        account_id="acme",
+        user_id="alice",
+        materialization_pending=True,
+    )
+    service = MagicMock()
+    service.execute_add_resource_job = AsyncMock(
+        side_effect=ResourceBusyError(
+            "Resource reservation could not be materialized",
+            uri="viking://resources/resolved",
+            retryable=True,
+        )
+    )
+    service.rollback_cancelled_add_resource = AsyncMock()
+    processor = AddResourceProcessor(service, asyncio.get_running_loop(), "AddResource")
+    report_success = MagicMock()
+    report_requeue = MagicMock()
+    report_error = MagicMock()
+    processor.set_callbacks(report_success, report_requeue, report_error)
+    msg = AddResourceMsg(
+        task_id=task.task_id,
+        root_uri="viking://resources/placeholder",
+        account_id="acme",
+        user_id="alice",
+        role="user",
+        path="https://example.larkoffice.com/docx/token",
+        defer_target_resolution=True,
+    )
+
+    with pytest.raises(ResourceBusyError, match="could not be materialized"):
+        await processor._process(msg, msg.to_dict())
+
+    current = await tracker.get(task.task_id, account_id="acme", user_id="alice")
+    assert current is not None
+    assert current.status == TaskStatus.RUNNING
+    report_success.assert_not_called()
+    report_requeue.assert_not_called()
+    report_error.assert_not_called()
+    service.rollback_cancelled_add_resource.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -982,3 +1505,94 @@ async def test_semantic_processor_restores_cancelled_state_after_restart(monkeyp
     processor._sync_topdown_recursive.assert_not_awaited()
     resource_lock.close.assert_awaited_once()
     processor._enqueue_parent_refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_parent_semantic_refresh_separates_source_task_coalescing(monkeypatch):
+    enqueued = []
+
+    class FakeQueue:
+        async def enqueue(self, msg):
+            enqueued.append(msg)
+
+    class FakeQueueManager:
+        SEMANTIC = "Semantic"
+
+        def get_queue(self, name, allow_create=False):
+            assert name == self.SEMANTIC
+            assert allow_create is True
+            return FakeQueue()
+
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.get_queue_manager",
+        lambda: FakeQueueManager(),
+    )
+    processor = SemanticProcessor()
+    first_msg = SemanticMsg(
+        uri="viking://resources/demo/child",
+        context_type="resource",
+        account_id="acme",
+        user_id="alice",
+        role="user",
+        source_task_id="task-1",
+    )
+    second_msg = SemanticMsg(
+        uri=first_msg.uri,
+        context_type="resource",
+        account_id="acme",
+        user_id="alice",
+        role="user",
+        source_task_id="task-2",
+    )
+
+    await processor._enqueue_parent_refresh(first_msg, first_msg.uri)
+    await processor._enqueue_parent_refresh(second_msg, second_msg.uri)
+
+    assert len(enqueued) == 2
+    assert enqueued[0].source_task_id == "task-1"
+    assert enqueued[1].source_task_id == "task-2"
+    assert enqueued[0].coalesce_key != enqueued[1].coalesce_key
+
+
+@pytest.mark.asyncio
+async def test_semantic_dag_passes_source_task_id_to_vectorizers(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_viking_fs",
+        MagicMock,
+    )
+    processor = MagicMock()
+    processor._vectorize_single_file = AsyncMock()
+    processor._vectorize_directory = AsyncMock()
+    ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+    executor = SemanticDagExecutor(
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=1,
+        ctx=ctx,
+        source_task_id="task-1",
+    )
+
+    await executor._run_vectorize_task(
+        VectorizeTask(
+            task_type="file",
+            uri="viking://resources/demo/readme.md",
+            context_type="resource",
+            ctx=ctx,
+            file_path="viking://resources/demo/readme.md",
+            summary_dict={"name": "readme.md", "summary": "summary"},
+            parent_uri="viking://resources/demo",
+        )
+    )
+    await executor._run_vectorize_task(
+        VectorizeTask(
+            task_type="directory",
+            uri="viking://resources/demo",
+            context_type="resource",
+            ctx=ctx,
+            abstract="abstract",
+            overview="overview",
+        )
+    )
+
+    assert processor._vectorize_single_file.await_args.kwargs["source_task_id"] == "task-1"
+    assert processor._vectorize_directory.await_args.kwargs["source_task_id"] == "task-1"

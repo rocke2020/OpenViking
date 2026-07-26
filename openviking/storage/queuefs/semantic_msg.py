@@ -6,9 +6,34 @@ import json
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from openviking.storage.transaction import LockHandoffRef
+
+_TASK_BOUND_SEMANTIC_ID_PREFIX = "task:"
+
+
+def build_semantic_msg_id(source_task_id: str = "") -> str:
+    nonce = str(uuid4())
+    if not source_task_id:
+        return nonce
+    return f"{_TASK_BOUND_SEMANTIC_ID_PREFIX}{source_task_id}:{nonce}"
+
+
+def source_task_id_from_semantic_msg_id(semantic_msg_id: Any) -> str:
+    if not isinstance(semantic_msg_id, str) or not semantic_msg_id.startswith(
+        _TASK_BOUND_SEMANTIC_ID_PREFIX
+    ):
+        return ""
+    encoded = semantic_msg_id[len(_TASK_BOUND_SEMANTIC_ID_PREFIX) :]
+    source_task_id, separator, nonce = encoded.rpartition(":")
+    if not separator or not source_task_id:
+        return ""
+    try:
+        UUID(nonce)
+    except (TypeError, ValueError):
+        return ""
+    return source_task_id
 
 
 def build_semantic_coalesce_key(
@@ -18,8 +43,12 @@ def build_semantic_coalesce_key(
     account_id: str = "default",
     user_id: str = "default",
     peer_id: str = "default",
+    source_task_id: str = "",
 ) -> str:
-    return "|".join([context_type, account_id, user_id, peer_id, uri.rstrip("/")])
+    parts = [context_type, account_id, user_id, peer_id, uri.rstrip("/")]
+    if source_task_id:
+        parts.append(source_task_id)
+    return "|".join(parts)
 
 
 @dataclass
@@ -82,7 +111,7 @@ class SemanticMsg:
         coalesce_version: int = 0,
         changes: Optional[Dict[str, List[str]]] = None,
     ):
-        self.id = str(uuid4())
+        self.id = build_semantic_msg_id(source_task_id)
         self.uri = uri
         self.context_type = context_type
         self.recursive = recursive
@@ -126,6 +155,9 @@ class SemanticMsg:
                 missing.append("context_type")
             raise ValueError(f"Missing required fields: {missing}")
 
+        source_task_id = str(data.get("source_task_id") or "")
+        if not source_task_id:
+            source_task_id = source_task_id_from_semantic_msg_id(data.get("id"))
         obj = cls(
             uri=uri,
             context_type=context_type,
@@ -140,7 +172,7 @@ class SemanticMsg:
             lock_handoff=LockHandoffRef.from_value(data.get("lock_handoff")),
             is_code_repo=data.get("is_code_repo", False),
             target_preexisting=data.get("target_preexisting"),
-            source_task_id=str(data.get("source_task_id") or ""),
+            source_task_id=source_task_id,
             coalesce_key=data.get("coalesce_key", ""),
             coalesce_version=data.get("coalesce_version", 0),
             changes=data.get("changes"),

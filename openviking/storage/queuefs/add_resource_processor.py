@@ -75,6 +75,81 @@ class AddResourceProcessor(DequeueHandlerBase):
         self.report_success()
         return True
 
+    @staticmethod
+    def _restore_rollback_target(msg: AddResourceMsg, task: Any) -> None:
+        resource_id = getattr(task, "resource_id", None)
+        if task is None or not isinstance(resource_id, str) or not resource_id:
+            return
+        rollback_target_created = getattr(task, "rollback_target_created", None)
+        materialization_pending = bool(
+            getattr(task, "rollback_target_materialization_pending", False)
+        )
+        if type(rollback_target_created) is not bool and not materialization_pending:
+            return
+        msg.root_uri = resource_id
+        msg.target_created = (
+            rollback_target_created if type(rollback_target_created) is bool else None
+        )
+        msg.target_materialization_pending = materialization_pending
+        msg.defer_target_resolution = False
+
+    async def _rollback_cancelled(
+        self,
+        msg: AddResourceMsg,
+        *,
+        ctx: RequestContext,
+        tracker: Any,
+        resource_lock: Any,
+    ) -> None:
+        task = await tracker.get(
+            msg.task_id,
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+        )
+        self._restore_rollback_target(msg, task)
+        await self._resource_service.rollback_cancelled_add_resource(
+            msg,
+            ctx=ctx,
+            resource_lock=resource_lock,
+        )
+
+    async def _fail_or_rollback_cancelled(
+        self,
+        msg: AddResourceMsg,
+        error: str,
+        *,
+        ctx: RequestContext,
+        tracker: Any,
+        resource_lock: Any,
+    ) -> bool:
+        """Fail the task unless cancellation won, in which case roll it back."""
+        current_task = await tracker.get(
+            msg.task_id,
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+        )
+        if current_task is None or current_task.status != TaskStatus.CANCELLED:
+            await tracker.fail(
+                msg.task_id,
+                error,
+                account_id=ctx.account_id,
+                user_id=ctx.user.user_id,
+            )
+            current_task = await tracker.get(
+                msg.task_id,
+                account_id=ctx.account_id,
+                user_id=ctx.user.user_id,
+            )
+        if current_task is None or current_task.status != TaskStatus.CANCELLED:
+            return False
+        await self._rollback_cancelled(
+            msg,
+            ctx=ctx,
+            tracker=tracker,
+            resource_lock=resource_lock,
+        )
+        return True
+
     async def _process(self, msg: AddResourceMsg, data: Dict[str, Any]) -> None:
         ctx = RequestContext(
             user=UserIdentifier(msg.account_id, msg.user_id),
@@ -89,6 +164,7 @@ class AddResourceProcessor(DequeueHandlerBase):
             user_id=ctx.user.user_id,
             task_id=msg.task_id,
         )
+        self._restore_rollback_target(msg, task)
         if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
             self.report_success()
             return None
@@ -96,22 +172,41 @@ class AddResourceProcessor(DequeueHandlerBase):
         try:
             resource_lock = await self._load_lock(msg, ctx)
         except Exception as exc:
-            if await self._requeue_lock_handoff(msg, exc):
-                return None
-            await tracker.fail(
+            current_task = await tracker.get(
                 msg.task_id,
-                f"Invalid lock_handoff: {exc}",
                 account_id=ctx.account_id,
                 user_id=ctx.user.user_id,
             )
-            self.report_error(f"Invalid lock_handoff: {exc}", data)
+            if current_task is not None and current_task.status == TaskStatus.CANCELLED:
+                await self._rollback_cancelled(
+                    msg,
+                    ctx=ctx,
+                    tracker=tracker,
+                    resource_lock=None,
+                )
+                self.report_success()
+                return None
+            if await self._requeue_lock_handoff(msg, exc):
+                return None
+            error = f"Invalid lock_handoff: {exc}"
+            if await self._fail_or_rollback_cancelled(
+                msg,
+                error,
+                ctx=ctx,
+                tracker=tracker,
+                resource_lock=None,
+            ):
+                self.report_success()
+                return None
+            self.report_error(error, data)
             return None
 
         if task.status == TaskStatus.CANCELLED:
             try:
-                await self._resource_service.rollback_cancelled_add_resource(
+                await self._rollback_cancelled(
                     msg,
                     ctx=ctx,
+                    tracker=tracker,
                     resource_lock=resource_lock,
                 )
             finally:
@@ -159,31 +254,40 @@ class AddResourceProcessor(DequeueHandlerBase):
                     user_id=ctx.user.user_id,
                 )
                 if current_task is not None and current_task.status == TaskStatus.CANCELLED:
-                    await self._resource_service.rollback_cancelled_add_resource(
+                    await self._rollback_cancelled(
                         msg,
                         ctx=ctx,
+                        tracker=tracker,
                         resource_lock=resource_lock,
                     )
                     self.report_success()
                     return None
                 if result.get("status") == "error":
                     errors = result.get("errors") or ["resource processing failed"]
-                    await tracker.fail(
-                        msg.task_id,
-                        "; ".join(str(error) for error in errors),
-                        account_id=ctx.account_id,
-                        user_id=ctx.user.user_id,
-                    )
+                    error = "; ".join(str(error) for error in errors)
+                    if await self._fail_or_rollback_cancelled(
+                        msg,
+                        error,
+                        ctx=ctx,
+                        tracker=tracker,
+                        resource_lock=resource_lock,
+                    ):
+                        self.report_success()
+                        return None
                     self.report_error("resource processing failed", data)
                     return None
                 queue_errors = summarize_queue_errors(result.get("queue_status"))
                 if queue_errors:
-                    await tracker.fail(
-                        msg.task_id,
-                        "queue processing failed: " + "; ".join(queue_errors),
-                        account_id=ctx.account_id,
-                        user_id=ctx.user.user_id,
-                    )
+                    error = "queue processing failed: " + "; ".join(queue_errors)
+                    if await self._fail_or_rollback_cancelled(
+                        msg,
+                        error,
+                        ctx=ctx,
+                        tracker=tracker,
+                        resource_lock=resource_lock,
+                    ):
+                        self.report_success()
+                        return None
                     self.report_error("queue processing failed", data)
                     return None
                 completed = await tracker.complete(
@@ -200,17 +304,19 @@ class AddResourceProcessor(DequeueHandlerBase):
                         user_id=ctx.user.user_id,
                     )
                     if current_task is not None and current_task.status == TaskStatus.CANCELLED:
-                        await self._resource_service.rollback_cancelled_add_resource(
+                        await self._rollback_cancelled(
                             msg,
                             ctx=ctx,
+                            tracker=tracker,
                             resource_lock=resource_lock,
                         )
                 self.report_success()
                 return None
             except AddResourceTaskCancelled:
-                await self._resource_service.rollback_cancelled_add_resource(
+                await self._rollback_cancelled(
                     msg,
                     ctx=ctx,
+                    tracker=tracker,
                     resource_lock=resource_lock,
                 )
                 self.report_success()
@@ -219,12 +325,29 @@ class AddResourceProcessor(DequeueHandlerBase):
                 # Leave both task and QueueFS message active; RecoverStale owns restart recovery.
                 raise
             except Exception as exc:
-                await tracker.fail(
-                    msg.task_id,
-                    str(exc),
-                    account_id=ctx.account_id,
-                    user_id=ctx.user.user_id,
+                from openviking.storage.errors import ResourceBusyError
+                from openviking.utils.resource_processor import (
+                    RollbackTargetPersistenceError,
                 )
+
+                if isinstance(exc, RollbackTargetPersistenceError):
+                    raise
+                if (
+                    isinstance(exc, ResourceBusyError)
+                    and msg.target_materialization_pending
+                    and exc.retryable
+                ):
+                    # Keep the message unACKed for RecoverStale instead of failing a durable task.
+                    raise
+                if await self._fail_or_rollback_cancelled(
+                    msg,
+                    str(exc),
+                    ctx=ctx,
+                    tracker=tracker,
+                    resource_lock=resource_lock,
+                ):
+                    self.report_success()
+                    return None
                 self.report_error(str(exc), data)
                 return None
             finally:

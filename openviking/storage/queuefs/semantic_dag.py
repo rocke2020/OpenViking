@@ -168,6 +168,7 @@ class SemanticDagExecutor:
         incremental_update: bool = False,
         target_uri: Optional[str] = None,
         semantic_msg_id: Optional[str] = None,
+        source_task_id: str = "",
         telemetry_id: str = "",
         recursive: bool = True,
         lock: LockLease = NO_LOCK,
@@ -185,6 +186,7 @@ class SemanticDagExecutor:
         self._incremental_update = incremental_update
         self._target_uri = target_uri
         self._semantic_msg_id = semantic_msg_id
+        self._source_task_id = source_task_id
         self._telemetry_id = telemetry_id
         self._recursive = recursive
         self._lock = lock
@@ -472,24 +474,34 @@ class SemanticDagExecutor:
 
     async def _run_vectorize_task(self, task: VectorizeTask) -> None:
         if task.task_type == "file":
+            kwargs = {
+                "parent_uri": task.parent_uri,
+                "context_type": task.context_type,
+                "file_path": task.file_path,
+                "summary_dict": task.summary_dict,
+                "ctx": task.ctx,
+                "semantic_msg_id": task.semantic_msg_id,
+                "use_summary": task.use_summary,
+            }
+            if self._source_task_id:
+                kwargs["source_task_id"] = self._source_task_id
             await self._processor._vectorize_single_file(
-                parent_uri=task.parent_uri,
-                context_type=task.context_type,
-                file_path=task.file_path,
-                summary_dict=task.summary_dict,
-                ctx=task.ctx,
-                semantic_msg_id=task.semantic_msg_id,
-                use_summary=task.use_summary,
+                **kwargs,
             )
             return
 
+        kwargs = {
+            "ctx": task.ctx,
+            "semantic_msg_id": task.semantic_msg_id,
+        }
+        if self._source_task_id:
+            kwargs["source_task_id"] = self._source_task_id
         await self._processor._vectorize_directory(
             task.uri,
             task.context_type,
             task.abstract,
             task.overview,
-            ctx=task.ctx,
-            semantic_msg_id=task.semantic_msg_id,
+            **kwargs,
         )
 
     async def _dispatch_dir(self, dir_uri: str, parent_uri: Optional[str]) -> bool:

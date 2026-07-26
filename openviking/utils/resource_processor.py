@@ -38,6 +38,10 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+class RollbackTargetPersistenceError(RuntimeError):
+    """Rollback metadata could not be persisted for a reserved resource target."""
+
+
 class ResourceProcessor:
     """
     Handles coordinated write operations.
@@ -119,6 +123,7 @@ class ResourceProcessor:
         summarize: bool = False,
         stage_callback: Optional[Callable[[str], Any]] = None,
         source_task_id: str = "",
+        rollback_target_callback: Optional[Callable[[str, Optional[bool]], Any]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -139,6 +144,7 @@ class ResourceProcessor:
         defer_post_processing = bool(kwargs.pop("defer_post_processing", False))
         preacquired_lock = kwargs.pop("resource_lock", NO_LOCK) or NO_LOCK
         target_created_hint = kwargs.pop("target_created", None)
+        target_materialization_pending = bool(kwargs.pop("target_materialization_pending", False))
         telemetry = get_current_telemetry()
 
         async def _set_stage(stage: str) -> None:
@@ -283,6 +289,7 @@ class ResourceProcessor:
             target_preexisting = False
             target_created = False
             source_committed = False
+            candidate_target_reserved = False
 
             if root_uri and temp_uri:
                 from openviking.storage.transaction import get_lock_manager
@@ -300,7 +307,9 @@ class ResourceProcessor:
                             root_uri, resource_lock = await self.reserve_unique_candidate(
                                 candidate_uri=candidate_uri,
                                 ctx=ctx,
+                                create_target=rollback_target_callback is None,
                             )
+                            candidate_target_reserved = rollback_target_callback is not None
                             result["root_uri"] = root_uri
                             if root_uri != candidate_uri:
                                 result.setdefault("warnings", []).append(
@@ -308,28 +317,81 @@ class ResourceProcessor:
                                     f"Tip: Use --to <path> to specify exact target."
                                 )
                     else:
-                        if not resource_lock.active:
+                        if target_materialization_pending and resource_lock.active:
+                            await self.materialize_candidate_reservation(
+                                resource_lock,
+                                root_uri,
+                                ctx=ctx,
+                                allow_existing_empty=True,
+                            )
+                            target_created = True
+                        elif not resource_lock.active:
                             dst_path = viking_fs._uri_to_path(root_uri, ctx=ctx)
                             resource_lock = await self.acquire_resource_lock(
                                 lock_manager, dst_path, uri=root_uri
                             )
                         else:
                             dst_path = viking_fs._uri_to_path(root_uri, ctx=ctx)
-                        handle = resource_lock.handle
-                        target_created = (
-                            target_created_hint
-                            if isinstance(target_created_hint, bool)
-                            else bool(
-                                handle is not None
-                                and dst_path in getattr(handle, "created_paths", ())
+                        if not target_materialization_pending:
+                            handle = resource_lock.handle
+                            target_created = (
+                                target_created_hint
+                                if isinstance(target_created_hint, bool)
+                                else bool(
+                                    handle is not None
+                                    and dst_path in getattr(handle, "created_paths", ())
+                                )
                             )
-                        )
                         target_preexisting = await self.target_contains_preexisting_data(
                             root_uri,
                             ctx=ctx,
                         )
                         if target_preexisting:
                             target_created = False
+                        elif target_materialization_pending:
+                            target_created = True
+
+                    async def _persist_rollback_ownership(
+                        created: Optional[bool],
+                    ) -> None:
+                        result["_target_created"] = created
+                        try:
+                            callback_result = rollback_target_callback(root_uri, created)
+                            if inspect.isawaitable(callback_result):
+                                await callback_result
+                        except Exception as persistence_error:
+                            rollback_error = None
+                            try:
+                                if created is True:
+                                    await get_viking_fs().rm(
+                                        root_uri,
+                                        recursive=True,
+                                        ctx=ctx,
+                                        lock_handle=resource_lock.handle,
+                                    )
+                            except Exception as exc:
+                                rollback_error = exc
+                            finally:
+                                if resource_lock.active:
+                                    await resource_lock.close()
+                            message = f"Failed to persist rollback target: {persistence_error}"
+                            if rollback_error is not None:
+                                message += f"; compensating rollback failed: {rollback_error}"
+                            raise RollbackTargetPersistenceError(message) from (
+                                rollback_error or persistence_error
+                            )
+
+                    if rollback_target_callback is not None and root_uri:
+                        await _persist_rollback_ownership(
+                            None if candidate_target_reserved else target_created
+                        )
+                    if candidate_target_reserved:
+                        await self.materialize_candidate_reservation(
+                            resource_lock,
+                            root_uri,
+                            ctx=ctx,
+                        )
+                        await _persist_rollback_ownership(True)
                     if not target_preexisting:
                         await viking_fs.persist_temp_tree(temp_uri, root_uri, ctx=ctx)
                         await rewrite_image_uris(
@@ -471,8 +533,9 @@ class ResourceProcessor:
         candidate_uri: str,
         ctx: RequestContext,
         max_attempts: int = 100,
+        create_target: bool = True,
     ) -> tuple[str, OwnedLockLease]:
-        """Pick the first free candidate URI and reserve it with a resource TreeLock."""
+        """Pick and lock the first free candidate URI."""
         from openviking.storage.errors import ResourceBusyError
         from openviking.storage.transaction import get_lock_manager
 
@@ -487,19 +550,44 @@ class ResourceProcessor:
 
             dst_path = viking_fs._uri_to_path(root_uri, ctx=ctx)
             try:
-                resource_lock = await self.acquire_resource_lock(
-                    lock_manager, dst_path, uri=root_uri, timeout=0.0
-                )
+                if create_target:
+                    resource_lock = await self.acquire_resource_lock(
+                        lock_manager, dst_path, uri=root_uri, timeout=0.0
+                    )
+                else:
+                    resource_lock = await OwnedLockLease.acquire_exact_paths(
+                        lock_manager,
+                        [dst_path],
+                        timeout=0.0,
+                    )
                 handle = resource_lock.handle
-                if handle is None or dst_path not in getattr(handle, "created_paths", ()):
+                if handle is None:
                     await resource_lock.close()
                     continue
-                if await self.target_contains_preexisting_data(root_uri, ctx=ctx):
+                if create_target and dst_path not in getattr(handle, "created_paths", ()):
+                    await resource_lock.close()
+                    continue
+                if create_target:
+                    target_preexisting = await self.target_contains_preexisting_data(
+                        root_uri,
+                        ctx=ctx,
+                    )
+                else:
+                    target_preexisting = await viking_fs.exists(root_uri, ctx=ctx)
+                if target_preexisting:
                     await resource_lock.close()
                     continue
                 return root_uri, resource_lock
-            except ResourceBusyError as exc:
-                last_busy_error = exc
+            except (LockAcquisitionError, ResourceBusyError) as exc:
+                if isinstance(exc, ResourceBusyError):
+                    last_busy_error = exc
+                else:
+                    last_busy_error = ResourceBusyError(
+                        f"Resource is busy: {root_uri}",
+                        uri=root_uri,
+                        conflict_type="path_busy",
+                        retryable=True,
+                    )
                 continue
 
         if last_busy_error is not None:
@@ -513,6 +601,46 @@ class ResourceProcessor:
 
         raise FileExistsError(
             f"Cannot resolve unique name for {candidate_uri} after {max_attempts} attempts"
+        )
+
+    @staticmethod
+    async def materialize_candidate_reservation(
+        resource_lock: OwnedLockLease,
+        root_uri: str,
+        *,
+        ctx: RequestContext,
+        allow_existing_empty: bool = False,
+    ) -> None:
+        """Create a reserved target after its rollback identity is durable."""
+        from openviking.storage.errors import ResourceBusyError
+        from openviking.storage.transaction import get_lock_manager
+
+        viking_fs = get_viking_fs()
+        dst_path = viking_fs._uri_to_path(root_uri, ctx=ctx)
+        handle = resource_lock.handle
+        if handle is None:
+            raise ResourceBusyError(
+                f"Resource reservation expired: {root_uri}",
+                uri=root_uri,
+                conflict_type="path_busy",
+                retryable=True,
+            )
+        lock_manager = get_lock_manager()
+        if await lock_manager.acquire_tree(handle, dst_path, timeout=0.0):
+            if dst_path in getattr(handle, "created_paths", ()) or (
+                allow_existing_empty
+                and not await ResourceProcessor.target_contains_preexisting_data(
+                    root_uri,
+                    ctx=ctx,
+                )
+            ):
+                return
+        await resource_lock.close()
+        raise ResourceBusyError(
+            f"Resource reservation could not be materialized: {root_uri}",
+            uri=root_uri,
+            conflict_type="path_busy",
+            retryable=True,
         )
 
     @staticmethod

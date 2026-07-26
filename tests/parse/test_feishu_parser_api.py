@@ -512,6 +512,7 @@ async def test_uat_producer_cancellation_respects_queue_ownership(
     )
     queue_manager = SimpleNamespace(enqueue=enqueue)
     lock_lease = SimpleNamespace(
+        handle=SimpleNamespace(created_paths=[]),
         to_handoff=Mock(
             return_value=SimpleNamespace(
                 to_dict=Mock(

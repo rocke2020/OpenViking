@@ -309,6 +309,7 @@ async def vectorize_directory_meta(
     context_type: str = "resource",
     ctx: Optional[RequestContext] = None,
     semantic_msg_id: Optional[str] = None,
+    source_task_id: str = "",
     include_overview: bool = True,
     scalar_overrides: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> None:
@@ -360,6 +361,7 @@ async def vectorize_directory_meta(
         )
         if msg_abstract:
             msg_abstract.semantic_msg_id = semantic_msg_id
+            msg_abstract.source_task_id = source_task_id
             try:
                 await embedding_queue.enqueue(msg_abstract)
                 enqueued += 1
@@ -393,6 +395,7 @@ async def vectorize_directory_meta(
             )
             if msg_overview:
                 msg_overview.semantic_msg_id = semantic_msg_id
+                msg_overview.source_task_id = source_task_id
                 try:
                     await embedding_queue.enqueue(msg_overview)
                     enqueued += 1
@@ -419,6 +422,7 @@ async def vectorize_file(
     context_type: str = "resource",
     ctx: Optional[RequestContext] = None,
     semantic_msg_id: Optional[str] = None,
+    source_task_id: str = "",
     use_summary: bool = False,
     preserve_existing_created_at: bool = False,
     scalar_override: Optional[Dict[str, Any]] = None,
@@ -541,6 +545,7 @@ async def vectorize_file(
 
         _apply_scalar_overrides(embedding_msg, scalar_override)
         embedding_msg.semantic_msg_id = semantic_msg_id
+        embedding_msg.source_task_id = source_task_id
         await embedding_queue.enqueue(embedding_msg)
         enqueued = True
         logger.debug(f"Enqueued file for vectorization: {file_path}")

@@ -31,6 +31,49 @@ from openviking_cli.utils import VikingURI, get_logger
 
 logger = get_logger(__name__)
 
+
+async def enqueue_delete_refresh(
+    *,
+    root_uri: str,
+    deleted_uri: str,
+    context_type: str,
+    ctx: RequestContext,
+    telemetry_id: Optional[str] = None,
+) -> None:
+    """Durably enqueue a parent semantic refresh after a child is deleted."""
+    queue_manager = get_queue_manager()
+    semantic_queue = queue_manager.get_queue(queue_manager.SEMANTIC, allow_create=True)
+    if telemetry_id is None:
+        telemetry_id = get_current_telemetry().telemetry_id
+    msg = SemanticMsg(
+        uri=root_uri,
+        context_type=context_type,
+        recursive=False,
+        account_id=ctx.account_id,
+        user_id=ctx.user.user_id,
+        peer_id=ctx.user.user_id,
+        role=str(ctx.role),
+        skip_vectorization=False,
+        telemetry_id=telemetry_id,
+        coalesce_key=build_semantic_coalesce_key(
+            context_type=context_type,
+            uri=root_uri,
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+            peer_id=ctx.user.user_id,
+        ),
+        changes={"deleted": [deleted_uri]},
+    )
+    if telemetry_id:
+        get_request_wait_tracker().register_semantic_root(telemetry_id, msg.id)
+    try:
+        await semantic_queue.enqueue(msg)
+    except Exception as exc:
+        if telemetry_id:
+            get_request_wait_tracker().mark_semantic_failed(telemetry_id, msg.id, str(exc))
+        raise
+
+
 if TYPE_CHECKING:
     from openviking.resource.watch_manager import WatchManager
     from openviking.resource.watch_scheduler import WatchScheduler
@@ -340,39 +383,14 @@ class FSService:
         ctx: RequestContext,
     ) -> None:
         try:
-            queue_manager = get_queue_manager()
+            await enqueue_delete_refresh(
+                root_uri=root_uri,
+                deleted_uri=deleted_uri,
+                context_type=context_type,
+                ctx=ctx,
+            )
         except RuntimeError as exc:
             logger.warning("QueueManager not available, skipping delete refresh: %s", exc)
-            return
-        semantic_queue = queue_manager.get_queue(queue_manager.SEMANTIC, allow_create=True)
-        telemetry_id = get_current_telemetry().telemetry_id
-        msg = SemanticMsg(
-            uri=root_uri,
-            context_type=context_type,
-            recursive=False,
-            account_id=ctx.account_id,
-            user_id=ctx.user.user_id,
-            peer_id=ctx.user.user_id,
-            role=str(ctx.role),
-            skip_vectorization=False,
-            telemetry_id=telemetry_id,
-            coalesce_key=build_semantic_coalesce_key(
-                context_type=context_type,
-                uri=root_uri,
-                account_id=ctx.account_id,
-                user_id=ctx.user.user_id,
-                peer_id=ctx.user.user_id,
-            ),
-            changes={"deleted": [deleted_uri]},
-        )
-        if telemetry_id:
-            get_request_wait_tracker().register_semantic_root(telemetry_id, msg.id)
-        try:
-            await semantic_queue.enqueue(msg)
-        except Exception as exc:
-            if telemetry_id:
-                get_request_wait_tracker().mark_semantic_failed(telemetry_id, msg.id, str(exc))
-            raise
 
     async def _wait_for_refresh(self, *, timeout: Optional[float]) -> Dict[str, Any]:
         telemetry_id = get_current_telemetry().telemetry_id
