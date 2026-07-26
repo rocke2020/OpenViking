@@ -297,12 +297,13 @@ class SemanticDagExecutor:
             self._closed = True
             self._unregister_active()
 
-    def _schedule_work(self, work: DagWork) -> None:
+    def _schedule_work(self, work: DagWork) -> bool:
         if self._closed or self._stop_if_cancelled():
-            return
+            return False
         if self._scheduler is None:
             self._scheduler = get_semantic_node_scheduler(self._node_concurrency)
         self._scheduler.submit(self, work)
+        return True
 
     def _schedule_dir(self, dir_uri: str, parent_uri: Optional[str]) -> None:
         if self._closed:
@@ -431,13 +432,16 @@ class SemanticDagExecutor:
         self._vectorize_done = asyncio.Event()
         self._pending_vectorize_work = len(tasks)
         for task in tasks:
-            self._schedule_work(
+            accepted = self._schedule_work(
                 DagWork(
                     kind="vectorize",
                     dir_uri=task.uri,
                     vectorize_task=task,
                 )
             )
+            if not accepted:
+                await self._reconcile_skipped_vectorize_task(task)
+                self._mark_vectorize_work_done()
         await self._vectorize_done.wait()
 
     async def _run_vectorize_work(self, task: Optional[VectorizeTask]) -> None:
@@ -446,17 +450,20 @@ class SemanticDagExecutor:
                 if self._cancel_requested():
                     self._stale = True
                     self._closed = True
-                    await self._reconcile_cancelled_vectorize_task(task)
+                    await self._reconcile_skipped_vectorize_task(task)
                 else:
                     await self._run_vectorize_task(task)
         except Exception as exc:
             logger.error("Vectorization dispatch task failed: %s", exc, exc_info=True)
         finally:
-            self._pending_vectorize_work = max(0, self._pending_vectorize_work - 1)
-            if self._pending_vectorize_work == 0 and self._vectorize_done:
-                self._vectorize_done.set()
+            self._mark_vectorize_work_done()
 
-    async def _reconcile_cancelled_vectorize_task(self, task: VectorizeTask) -> None:
+    def _mark_vectorize_work_done(self) -> None:
+        self._pending_vectorize_work = max(0, self._pending_vectorize_work - 1)
+        if self._pending_vectorize_work == 0 and self._vectorize_done:
+            self._vectorize_done.set()
+
+    async def _reconcile_skipped_vectorize_task(self, task: VectorizeTask) -> None:
         from .embedding_tracker import EmbeddingTaskTracker
 
         tracker = EmbeddingTaskTracker.get_instance()
@@ -845,8 +852,6 @@ class SemanticDagExecutor:
         self._closed = True
         if self._root_done:
             self._root_done.set()
-        if self._vectorize_done:
-            self._vectorize_done.set()
         return True
 
     async def _write_directory_semantics(

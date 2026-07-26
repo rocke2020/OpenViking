@@ -803,6 +803,99 @@ async def test_semantic_cancellation_reconciles_vectorize_work_skipped_before_en
 
 
 @pytest.mark.asyncio
+async def test_semantic_cancellation_during_vectorize_submission_reconciles_rejected_work(
+    monkeypatch,
+):
+    from openviking.storage.queuefs.embedding_tracker import EmbeddingTaskTracker
+
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_viking_fs",
+        MagicMock,
+    )
+    tracker = EmbeddingTaskTracker.get_instance()
+    tracker._tasks.clear()
+    cancelled = False
+    accepted_started = asyncio.Event()
+    release_accepted = asyncio.Event()
+    accepted_work = []
+    accepted_runners = []
+
+    class CancelAfterFirstSubmitScheduler:
+        def submit(self, submitted_executor, work):
+            nonlocal cancelled
+            accepted_work.append(work)
+            cancelled = True
+
+            async def run_accepted_work():
+                accepted_started.set()
+                await release_accepted.wait()
+                await submitted_executor._run_work(work)
+
+            accepted_runners.append(asyncio.create_task(run_accepted_work()))
+
+    scheduler = CancelAfterFirstSubmitScheduler()
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_semantic_node_scheduler",
+        lambda _max_workers: scheduler,
+    )
+    processor = MagicMock()
+    processor._vectorize_single_file = AsyncMock()
+    resource_lock = MagicMock()
+    resource_lock.close = AsyncMock()
+    ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+    executor = SemanticDagExecutor(
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=1,
+        ctx=ctx,
+        semantic_msg_id="semantic-mid-submit",
+        lock=resource_lock,
+        is_cancelled=lambda: cancelled,
+    )
+
+    def seed_vectorization(*_args, **_kwargs):
+        executor._vectorize_task_count = 3
+        executor._pending_vectorize_tasks = [
+            VectorizeTask(
+                task_type="file",
+                uri=f"viking://resources/demo/{index}.txt",
+                context_type="resource",
+                ctx=ctx,
+                semantic_msg_id="semantic-mid-submit",
+                file_path=f"viking://resources/demo/{index}.txt",
+            )
+            for index in range(3)
+        ]
+        executor._root_done.set()
+
+    executor._schedule_dir = seed_vectorization
+    run_task = asyncio.create_task(executor.run("viking://resources/demo"))
+
+    try:
+        await accepted_started.wait()
+        await asyncio.sleep(0)
+
+        record = tracker._tasks["semantic-mid-submit"]
+        assert not run_task.done()
+        assert len(accepted_work) == 1
+        assert executor._pending_vectorize_work == 1
+        assert record.remaining == 1
+        resource_lock.close.assert_not_awaited()
+
+        release_accepted.set()
+        await asyncio.gather(run_task, *accepted_runners)
+
+        assert executor._pending_vectorize_work == 0
+        assert "semantic-mid-submit" not in tracker._tasks
+        processor._vectorize_single_file.assert_not_awaited()
+        resource_lock.close.assert_awaited_once()
+    finally:
+        release_accepted.set()
+        await asyncio.gather(run_task, *accepted_runners, return_exceptions=True)
+        tracker._tasks.clear()
+
+
+@pytest.mark.asyncio
 async def test_semantic_cancellation_refresh_is_shared_within_poll_interval(monkeypatch):
     monkeypatch.setattr(
         "openviking.storage.queuefs.semantic_dag.get_viking_fs",
