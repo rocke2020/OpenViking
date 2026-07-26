@@ -660,9 +660,7 @@ async def test_embedding_handler_skips_legacy_task_bound_message_after_restart(m
 
 
 @pytest.mark.asyncio
-async def test_embedding_handler_skips_pre_upgrade_semantic_message_with_unknown_task(
-    monkeypatch,
-):
+async def test_embedding_handler_processes_pre_upgrade_semantic_message(monkeypatch):
     class _CapturingVikingDB:
         is_closing = False
         mode = "local"
@@ -681,19 +679,25 @@ async def test_embedding_handler_skips_pre_upgrade_semantic_message_with_unknown
     )
     vikingdb = _CapturingVikingDB()
     handler = TextEmbeddingHandler(vikingdb)
-    payload = _build_queue_payload_for_account("acme")
-    queue_data = json.loads(payload["data"])
-    queue_data.pop("source_task_id", None)
-    queue_data["semantic_msg_id"] = SemanticMsg(
-        uri="viking://resources/sample",
-        context_type="resource",
-    ).id
-    payload["data"] = json.dumps(queue_data)
+    queue_data = {
+        "message": "hello",
+        "context_data": {
+            "id": "id-1",
+            "uri": "viking://resources/sample",
+            "account_id": "acme",
+            "abstract": "sample",
+        },
+        "id": "embedding-1",
+        "telemetry_id": "telemetry-1",
+        "semantic_msg_id": "89fda83a-a30d-46a4-851f-bf5220a506d2",
+    }
+    assert "source_task_id" not in queue_data
+    payload = {"data": json.dumps(queue_data)}
 
     await handler.on_dequeue(payload)
 
-    assert embedder.calls == 0
-    assert vikingdb.upsert_calls == 0
+    assert embedder.calls == 1
+    assert vikingdb.upsert_calls == 1
 
 
 @pytest.mark.asyncio

@@ -62,10 +62,9 @@ def test_plain_legacy_semantic_id_does_not_invent_source_task():
     )
 
     assert restored.source_task_id == ""
-    assert restored.legacy_task_identity_unknown is True
 
 
-def test_current_non_task_semantic_payload_is_not_treated_as_legacy_unknown():
+def test_current_non_task_semantic_payload_remains_non_task():
     msg = EmbeddingMsg(
         "hello",
         {"uri": "viking://resources/demo/file.txt"},
@@ -75,4 +74,3 @@ def test_current_non_task_semantic_payload_is_not_treated_as_legacy_unknown():
     restored = EmbeddingMsg.from_dict(msg.to_dict())
 
     assert restored.source_task_id == ""
-    assert restored.legacy_task_identity_unknown is False

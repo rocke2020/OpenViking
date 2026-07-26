@@ -124,9 +124,8 @@ class SemanticNodeScheduler:
                 continue
 
             try:
-                if not item.executor.closed or (
-                    item.work.kind == "vectorize" and item.executor._cancel_requested()
-                ):
+                # Accepted vector work owns tracker accounting even after its executor closes.
+                if not item.executor.closed or item.work.kind == "vectorize":
                     await item.executor._run_work(item.work)
             except asyncio.CancelledError:
                 raise
@@ -232,6 +231,19 @@ class SemanticDagExecutor:
         self._root_uri = root_uri
         self._root_done = asyncio.Event()
         self._scheduler = get_semantic_node_scheduler(self._node_concurrency)
+        embedding_tracker_owns_lock = False
+        completion_closed_lock = False
+
+        async def close_lifecycle_lock() -> None:
+            try:
+                await self._lock.close()
+            except Exception as exc:
+                logger.warning(
+                    "Retrying lifecycle lock release for %s after failure: %s",
+                    self._semantic_msg_id,
+                    exc,
+                )
+                await self._lock.close()
 
         try:
             self._register_active()
@@ -240,27 +252,28 @@ class SemanticDagExecutor:
             if self._cancel_requested():
                 self._stale = True
                 await self._work_drained.wait()
+                await close_lifecycle_lock()
                 if self._telemetry_id and self._semantic_msg_id:
                     get_request_wait_tracker().mark_semantic_done(
                         self._telemetry_id, self._semantic_msg_id, processed_delta=0
                     )
-                await self._lock.close()
                 return
             if self._failure:
                 raise self._failure
 
             # Release owned semantic locks after downstream vectorization finishes.
             async def wrapped_on_complete() -> None:
-                try:
-                    if self._telemetry_id and self._semantic_msg_id:
-                        processed_delta = 0 if self._cancel_requested() else 1
-                        get_request_wait_tracker().mark_semantic_done(
-                            self._telemetry_id,
-                            self._semantic_msg_id,
-                            processed_delta=processed_delta,
-                        )
-                finally:
-                    await self._lock.close()
+                nonlocal completion_closed_lock, embedding_tracker_owns_lock
+                embedding_tracker_owns_lock = False
+                await close_lifecycle_lock()
+                completion_closed_lock = True
+                if self._telemetry_id and self._semantic_msg_id:
+                    processed_delta = 0 if self._cancel_requested() else 1
+                    get_request_wait_tracker().mark_semantic_done(
+                        self._telemetry_id,
+                        self._semantic_msg_id,
+                        processed_delta=processed_delta,
+                    )
 
             async with self._vectorize_lock:
                 task_count = self._vectorize_task_count
@@ -276,12 +289,16 @@ class SemanticDagExecutor:
                     on_complete=wrapped_on_complete,
                     metadata={"uri": root_uri},
                 )
+                # From here, accepted embeddings keep the lifecycle lock until their ACKs drain.
+                embedding_tracker_owns_lock = True
 
                 if self._cancel_requested():
                     await tracker.cancel(self._semantic_msg_id)
                     return
 
                 await self._dispatch_vectorize_tasks(tasks)
+                if self._failure:
+                    raise self._failure
             else:
                 # No vectorize tasks — release lock immediately (via wrapped callback)
                 try:
@@ -290,10 +307,11 @@ class SemanticDagExecutor:
                     logger.error(f"Error in on_complete callback: {e}", exc_info=True)
         except BaseException:
             self._closed = True
-            try:
-                await self._lock.close()
-            except Exception:
-                pass
+            if not embedding_tracker_owns_lock and not completion_closed_lock:
+                try:
+                    await close_lifecycle_lock()
+                except Exception:
+                    pass
             raise
         finally:
             self._closed = True
@@ -347,8 +365,6 @@ class SemanticDagExecutor:
         self._closed = True
         if self._root_done:
             self._root_done.set()
-        if self._vectorize_done:
-            self._vectorize_done.set()
 
     def _register_active(self) -> None:
         with self._active_lock:
@@ -382,10 +398,10 @@ class SemanticDagExecutor:
                 self._work_drained.set()
 
     async def _run_work_inner(self, work: DagWork) -> None:
-        await self._refresh_cancelled_state()
         if work.kind == "vectorize":
             await self._run_vectorize_work(work.vectorize_task)
             return
+        await self._refresh_cancelled_state()
         if self._stop_if_cancelled():
             return
 
@@ -447,16 +463,31 @@ class SemanticDagExecutor:
         await self._vectorize_done.wait()
 
     async def _run_vectorize_work(self, task: Optional[VectorizeTask]) -> None:
+        # Ownership moves exactly once: either reconcile here or let the vectorizer enqueue it.
+        accounting_transferred = False
         try:
             if task is not None:
-                if self._cancel_requested():
-                    self._stale = True
-                    self._closed = True
+                if self._closed:
+                    if self._cancel_requested():
+                        self._stale = True
+                    accounting_transferred = True
                     await self._reconcile_skipped_vectorize_task(task)
                 else:
+                    await self._refresh_cancelled_state()
+                if not accounting_transferred and self._cancel_requested():
+                    self._stale = True
+                    self._closed = True
+                    accounting_transferred = True
+                    await self._reconcile_skipped_vectorize_task(task)
+                elif not accounting_transferred:
+                    accounting_transferred = True
                     await self._run_vectorize_task(task)
         except Exception as exc:
+            if task is not None and not accounting_transferred:
+                accounting_transferred = True
+                await self._reconcile_skipped_vectorize_task(task)
             logger.error("Vectorization dispatch task failed: %s", exc, exc_info=True)
+            self.fail(exc)
         finally:
             self._mark_vectorize_work_done()
 

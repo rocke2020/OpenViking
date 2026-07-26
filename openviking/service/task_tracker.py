@@ -41,6 +41,7 @@ class TaskStatus(str, Enum):
 
 
 _TERMINAL_STATUSES = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
+ADD_RESOURCE_CANCEL_PROTOCOL_VERSION = 1
 
 
 @dataclass
@@ -58,6 +59,7 @@ class TaskRecord:
     stage: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    cancel_protocol_version: int = 0
     rollback_target_created: Optional[bool] = None
     rollback_target_materialization_pending: bool = False
 
@@ -70,6 +72,7 @@ class TaskRecord:
         d["result"] = _sanitize_task_result(d.get("result"))
         d.pop("account_id", None)
         d.pop("user_id", None)
+        d.pop("cancel_protocol_version", None)
         d.pop("rollback_target_created", None)
         d.pop("rollback_target_materialization_pending", None)
         return d
@@ -255,6 +258,7 @@ class TaskTracker:
         account_id: str,
         user_id: str,
         task_id: Optional[str] = None,
+        cancel_protocol_version: int = 0,
     ) -> TaskRecord:
         """Register a new pending task. Returns a snapshot copy."""
         self._validate_owner(account_id, user_id)
@@ -264,6 +268,7 @@ class TaskTracker:
             resource_id=resource_id,
             account_id=account_id,
             user_id=user_id,
+            cancel_protocol_version=cancel_protocol_version,
         )
         async with self._async_lock:
             if task_id:

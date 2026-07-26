@@ -293,6 +293,7 @@ def _task_to_payload(task: Any) -> Dict[str, Any]:
         "stage": task.stage,
         "result": deepcopy(task.result),
         "error": task.error,
+        "cancel_protocol_version": task.cancel_protocol_version,
         "rollback_target_created": task.rollback_target_created,
         "rollback_target_materialization_pending": (task.rollback_target_materialization_pending),
     }

@@ -148,6 +148,8 @@ returns; cooperative worker drain and safe rollback may still be finishing after
 
 Repeating cancellation for an already-cancelled task is idempotent. Tasks owned by another user
 return `NOT_FOUND`; completed, failed, and non-`add_resource` tasks return `FAILED_PRECONDITION`.
+An `add_resource` task created before durable cancellation support also returns
+`FAILED_PRECONDITION`, because its legacy queued messages cannot be stopped safely and must drain.
 Root administrators can use `ov --sudo task cancel` with the configured tenant identity.
 
 **Code Entries:**

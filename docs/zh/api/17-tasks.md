@@ -145,8 +145,9 @@ ov task status uuid-xxx
 worker 的协作排空和安全回滚可能仍在后台收尾。
 
 对已取消任务重复调用是幂等的。其他用户拥有的任务返回 `NOT_FOUND`；completed、failed 或
-非 `add_resource` 任务返回 `FAILED_PRECONDITION`。Root 管理员可结合已配置的租户身份使用
-`ov --sudo task cancel`。
+非 `add_resource` 任务返回 `FAILED_PRECONDITION`。在持久取消能力上线前创建的
+`add_resource` 任务同样返回 `FAILED_PRECONDITION`，因为其旧版队列消息无法安全停止，
+必须正常排空。Root 管理员可结合已配置的租户身份使用 `ov --sudo task cancel`。
 
 **代码入口**：
 - `openviking/server/routers/tasks.py:cancel_task()` - HTTP 路由

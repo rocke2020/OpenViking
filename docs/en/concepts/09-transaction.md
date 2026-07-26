@@ -169,13 +169,17 @@ Embedding messages also carry the source task ID, and task-bound semantic messag
 identity for rolling recovery of older embedding payloads. Each vector upsert is serialized with
 cancellation so a recovered worker cannot write after rollback starts. A pre-upgrade semantic
 embedding payload that has neither an explicit task ID nor a task-bound semantic message ID is
-skipped fail-closed because its ownership cannot be recovered safely.
+processed as legacy non-task work; a normal handler return acknowledges and deletes the queue
+message, so absence of new identity metadata is not a safe reason to skip it. Tasks created before
+this cancellation protocol carry no protocol marker and the cancel endpoint rejects them, allowing
+their legacy queued work to drain normally.
 
-Rollback removes only a target with `target_created=true`; a pre-existing target, and a legacy
-message whose ownership is unknown, are never deleted. `VikingFS.rm` deletes the target's VectorDB
-rows before its files. An index-delete failure or the failure to durably enqueue the parent
-directory's delete refresh keeps the queue message unacknowledged, so restart recovery can retry
-the rollback.
+Rollback removes only a target with `target_created=true`, or an empty
+`materialization_pending` target recovered under its exact reservation lock. A pre-existing target
+and any recovery state that does not prove those conditions are never deleted. `VikingFS.rm`
+deletes the target's VectorDB rows before its files. An index-delete failure or the failure to
+durably enqueue the parent directory's delete refresh keeps the queue message unacknowledged, so
+restart recovery can retry the rollback.
 
 **Incremental update** (target already exists) — temp stays in place:
 

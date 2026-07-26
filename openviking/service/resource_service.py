@@ -38,6 +38,7 @@ from openviking.server.user_config import (
     effective_skill_add_target,
 )
 from openviking.storage import VikingDBManager
+from openviking.storage.errors import ResourceBusyError
 from openviking.storage.queuefs import QueueManager, get_queue_manager
 from openviking.storage.transaction import NO_LOCK, LockLease
 from openviking.storage.viking_fs import VikingFS
@@ -349,7 +350,10 @@ class ResourceService:
         resource_lock: LockLease = NO_LOCK,
     ) -> Any:
         """Persist a job before its TaskRecord so a crash cannot orphan the task."""
-        from openviking.service.task_tracker import get_task_tracker
+        from openviking.service.task_tracker import (
+            ADD_RESOURCE_CANCEL_PROTOCOL_VERSION,
+            get_task_tracker,
+        )
         from openviking.storage.queuefs import get_queue_manager
 
         try:
@@ -366,6 +370,7 @@ class ResourceService:
             account_id=msg.account_id,
             user_id=msg.user_id,
             task_id=msg.task_id,
+            cancel_protocol_version=ADD_RESOURCE_CANCEL_PROTOCOL_VERSION,
         )
         await tracker.update_stage(
             task.task_id,
@@ -507,7 +512,11 @@ class ResourceService:
         ctx: RequestContext,
     ) -> Dict[str, Any]:
         """Persist cancellation for an owned add-resource task."""
-        from openviking.service.task_tracker import TaskStatus, get_task_tracker
+        from openviking.service.task_tracker import (
+            ADD_RESOURCE_CANCEL_PROTOCOL_VERSION,
+            TaskStatus,
+            get_task_tracker,
+        )
 
         tracker = get_task_tracker()
         task = await tracker.get(
@@ -524,6 +533,13 @@ class ResourceService:
         if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
             raise FailedPreconditionError(
                 f"Task is already {task.status.value} and cannot be cancelled"
+            )
+        # Old queued messages do not carry enough identity to stop their writes safely.
+        # Let those tasks drain instead of claiming that the new cancel contract applies.
+        if task.cancel_protocol_version < ADD_RESOURCE_CANCEL_PROTOCOL_VERSION:
+            raise FailedPreconditionError(
+                "Task was created before durable cancellation support and cannot be "
+                "cancelled safely"
             )
 
         cancelled = await tracker.cancel(
@@ -550,6 +566,32 @@ class ResourceService:
         target_created = msg.target_created
         if isinstance(msg.prepared, dict) and "target_created" in msg.prepared:
             target_created = msg.prepared["target_created"] is True
+        materialization_pending = bool(getattr(msg, "target_materialization_pending", False))
+        if target_created is not True and materialization_pending:
+            # A crash may leave the directory behind before target_created is persisted.
+            # Reclaim it only through the exact reservation and only while it is still empty.
+            if resource_lock is None or resource_lock.handle is None:
+                raise ResourceBusyError(
+                    f"Cancelled target reservation must be reacquired: {msg.root_uri}",
+                    uri=msg.root_uri,
+                    conflict_type="path_busy",
+                    retryable=True,
+                )
+            if self._resource_processor is None:
+                raise NotInitializedError("ResourceProcessor")
+            target_has_data = await self._resource_processor.target_contains_preexisting_data(
+                msg.root_uri,
+                ctx=ctx,
+            )
+            if target_has_data:
+                return
+            await self._resource_processor.materialize_candidate_reservation(
+                resource_lock,
+                msg.root_uri,
+                ctx=ctx,
+                allow_existing_empty=True,
+            )
+            target_created = True
         if target_created is not True:
             return
         if self._viking_fs is None:

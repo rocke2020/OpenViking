@@ -561,17 +561,6 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     report_success = True
                     return None
 
-                if embedding_msg.legacy_task_identity_unknown:
-                    logger.warning(
-                        "Skipping pre-upgrade semantic embedding with unknown source task "
-                        "identity (%s)",
-                        self._embedding_msg_log_context(embedding_msg),
-                    )
-                    self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
-                    self._record_request_success(embedding_msg)
-                    report_success = True
-                    return inserted_data
-
                 # Process string (text) or list (multimodal) messages
                 if not isinstance(embedding_msg.message, (str, list)):
                     logger.debug(

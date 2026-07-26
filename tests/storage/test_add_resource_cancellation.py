@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock
 
@@ -10,7 +11,12 @@ import pytest
 from openviking.server.identity import RequestContext, Role
 from openviking.service.resource_service import ResourceService
 from openviking.service.task_store import PersistentTaskStore
-from openviking.service.task_tracker import TaskStatus, TaskTracker, set_task_tracker
+from openviking.service.task_tracker import (
+    ADD_RESOURCE_CANCEL_PROTOCOL_VERSION,
+    TaskStatus,
+    TaskTracker,
+    set_task_tracker,
+)
 from openviking.storage.errors import ResourceBusyError
 from openviking.storage.queuefs.add_resource_msg import AddResourceMsg
 from openviking.storage.queuefs.add_resource_processor import (
@@ -20,7 +26,7 @@ from openviking.storage.queuefs.add_resource_processor import (
 from openviking.storage.queuefs.semantic_dag import DagWork, SemanticDagExecutor, VectorizeTask
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
-from openviking_cli.exceptions import InvalidArgumentError, NotFoundError
+from openviking_cli.exceptions import FailedPreconditionError, InvalidArgumentError, NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
 from tests.test_task_tracker import _FakeAgfs
 
@@ -103,6 +109,7 @@ async def test_cancel_add_resource_is_owner_scoped_and_idempotent():
         resource_id="viking://resources/demo",
         account_id="acme",
         user_id="alice",
+        cancel_protocol_version=ADD_RESOURCE_CANCEL_PROTOCOL_VERSION,
     )
     await tracker.start(task.task_id, account_id="acme", user_id="alice")
 
@@ -121,6 +128,36 @@ async def test_cancel_add_resource_is_owner_scoped_and_idempotent():
 
 
 @pytest.mark.asyncio
+async def test_cancel_rejects_pre_upgrade_task_without_cancel_protocol():
+    agfs = _FakeAgfs()
+    tracker = TaskTracker(store=PersistentTaskStore(agfs))
+    task = await tracker.create(
+        "add_resource",
+        resource_id="viking://resources/demo",
+        account_id="acme",
+        user_id="alice",
+        task_id="legacy-task",
+    )
+    await tracker.start(task.task_id, account_id="acme", user_id="alice")
+    task_path = f"/local/acme/_system/tasks/alice/{task.task_id}.json"
+    payload = json.loads(agfs.files[task_path].decode("utf-8"))
+    payload.pop("cancel_protocol_version", None)
+    agfs.files[task_path] = json.dumps(payload).encode("utf-8")
+
+    recovered_tracker = TaskTracker(store=PersistentTaskStore(agfs))
+    set_task_tracker(recovered_tracker)
+    service = ResourceService()
+    ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+
+    with pytest.raises(FailedPreconditionError, match="before durable cancellation support"):
+        await service.cancel_add_resource_task(task.task_id, ctx=ctx)
+
+    persisted = await recovered_tracker.get(task.task_id, account_id="acme", user_id="alice")
+    assert persisted is not None
+    assert persisted.status == TaskStatus.RUNNING
+
+
+@pytest.mark.asyncio
 async def test_root_cancel_loads_persisted_task_from_explicit_owner_scope():
     agfs = _FakeAgfs()
     original_tracker = TaskTracker(store=PersistentTaskStore(agfs))
@@ -130,6 +167,7 @@ async def test_root_cancel_loads_persisted_task_from_explicit_owner_scope():
         account_id="acme",
         user_id="alice",
         task_id="task-1",
+        cancel_protocol_version=ADD_RESOURCE_CANCEL_PROTOCOL_VERSION,
     )
     set_task_tracker(TaskTracker(store=PersistentTaskStore(agfs)))
     service = ResourceService()
@@ -150,6 +188,7 @@ async def test_default_root_identity_can_cancel_cached_tenant_task():
         account_id="acme",
         user_id="alice",
         task_id="task-1",
+        cancel_protocol_version=ADD_RESOURCE_CANCEL_PROTOCOL_VERSION,
     )
     service = ResourceService()
     root_ctx = RequestContext(user=UserIdentifier("default", "default"), role=Role.ROOT)
@@ -969,6 +1008,75 @@ async def test_recovered_pending_materialization_replays_under_tree_lock():
 
 
 @pytest.mark.asyncio
+async def test_cancel_rollback_removes_materialized_pending_target_under_lock(monkeypatch):
+    agfs = _FakeAgfs()
+    tracker = TaskTracker(store=PersistentTaskStore(agfs))
+    task = await tracker.create(
+        "add_resource",
+        resource_id="viking://resources/placeholder",
+        account_id="acme",
+        user_id="alice",
+        task_id="task-1",
+    )
+    await tracker.update_add_resource_rollback_target(
+        task.task_id,
+        "viking://resources/resolved",
+        None,
+        account_id="acme",
+        user_id="alice",
+        materialization_pending=True,
+    )
+    await tracker.cancel(task.task_id, account_id="acme", user_id="alice")
+    recovered_task = await TaskTracker(store=PersistentTaskStore(agfs)).get(
+        task.task_id,
+        account_id="acme",
+        user_id="alice",
+    )
+    msg = AddResourceMsg(
+        task_id=task.task_id,
+        root_uri="viking://resources/placeholder",
+        account_id="acme",
+        user_id="alice",
+        role="user",
+        path="https://example.larkoffice.com/docx/token",
+        defer_target_resolution=True,
+    )
+    AddResourceProcessor._restore_rollback_target(msg, recovered_task)
+
+    service = ResourceService()
+    service._viking_fs = AsyncMock()
+    service._resource_processor = MagicMock()
+    service._resource_processor.target_contains_preexisting_data = AsyncMock(return_value=False)
+    service._resource_processor.materialize_candidate_reservation = AsyncMock()
+    enqueue_delete_refresh = AsyncMock()
+    monkeypatch.setattr(
+        "openviking.service.fs_service.enqueue_delete_refresh",
+        enqueue_delete_refresh,
+    )
+    resource_lock = MagicMock()
+    resource_lock.handle = object()
+
+    await service.rollback_cancelled_add_resource(
+        msg,
+        ctx=RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER),
+        resource_lock=resource_lock,
+    )
+
+    service._resource_processor.materialize_candidate_reservation.assert_awaited_once_with(
+        resource_lock,
+        "viking://resources/resolved",
+        ctx=ANY,
+        allow_existing_empty=True,
+    )
+    service._viking_fs.rm.assert_awaited_once_with(
+        "viking://resources/resolved",
+        recursive=True,
+        ctx=ANY,
+        lock_handle=resource_lock.handle,
+    )
+
+
+@pytest.mark.asyncio
 async def test_recovered_pending_materialization_remains_unacked_while_old_lock_is_busy():
     tracker = TaskTracker(store=PersistentTaskStore(_FakeAgfs()))
     set_task_tracker(tracker)
@@ -1437,6 +1545,118 @@ async def test_semantic_cancellation_refresh_is_shared_within_poll_interval(monk
     await asyncio.gather(*(executor._refresh_cancelled_state() for _ in range(20)))
 
     refresh_cancelled.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_semantic_vectorize_refresh_failure_reconciles_reserved_work(monkeypatch):
+    from openviking.storage.queuefs.embedding_tracker import EmbeddingTaskTracker
+
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_viking_fs",
+        MagicMock,
+    )
+    tracker = EmbeddingTaskTracker.get_instance()
+    tracker._tasks.clear()
+    resource_lock = MagicMock()
+    resource_lock.close = AsyncMock()
+    ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+    executor = SemanticDagExecutor(
+        processor=MagicMock(),
+        context_type="resource",
+        max_concurrent_llm=1,
+        ctx=ctx,
+        semantic_msg_id="semantic-refresh-failure",
+        lock=resource_lock,
+        is_cancelled=lambda: False,
+        refresh_cancelled=AsyncMock(side_effect=RuntimeError("task store unavailable")),
+    )
+
+    def seed_vectorization(*_args, **_kwargs):
+        executor._vectorize_task_count = 2
+        executor._pending_vectorize_tasks = [
+            VectorizeTask(
+                task_type="file",
+                uri=f"viking://resources/demo/{index}.txt",
+                context_type="resource",
+                ctx=ctx,
+                semantic_msg_id="semantic-refresh-failure",
+                file_path=f"viking://resources/demo/{index}.txt",
+            )
+            for index in range(2)
+        ]
+        executor._root_done.set()
+
+    executor._schedule_dir = seed_vectorization
+
+    try:
+        with pytest.raises(RuntimeError, match="task store unavailable"):
+            await asyncio.wait_for(executor.run("viking://resources/demo"), timeout=1)
+
+        assert "semantic-refresh-failure" not in tracker._tasks
+        assert executor._pending_vectorize_work == 0
+        resource_lock.close.assert_awaited_once()
+    finally:
+        tracker._tasks.clear()
+
+
+@pytest.mark.asyncio
+async def test_semantic_refresh_failure_keeps_lock_until_transferred_embedding_drains(monkeypatch):
+    from openviking.storage.queuefs.embedding_tracker import EmbeddingTaskTracker
+
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_viking_fs",
+        MagicMock,
+    )
+    tracker = EmbeddingTaskTracker.get_instance()
+    tracker._tasks.clear()
+    resource_lock = MagicMock()
+    resource_lock.close = AsyncMock(
+        side_effect=[RuntimeError("release failed"), None],
+    )
+    ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+    executor = SemanticDagExecutor(
+        processor=MagicMock(),
+        context_type="resource",
+        max_concurrent_llm=1,
+        ctx=ctx,
+        semantic_msg_id="semantic-partial-refresh-failure",
+        lock=resource_lock,
+        is_cancelled=lambda: False,
+        refresh_cancelled=AsyncMock(side_effect=[False, RuntimeError("task store unavailable")]),
+    )
+    executor._cancellation_refresh_interval = 0
+    executor._run_vectorize_task = AsyncMock()
+
+    def seed_vectorization(*_args, **_kwargs):
+        executor._vectorize_task_count = 2
+        executor._pending_vectorize_tasks = [
+            VectorizeTask(
+                task_type="file",
+                uri=f"viking://resources/demo/{index}.txt",
+                context_type="resource",
+                ctx=ctx,
+                semantic_msg_id="semantic-partial-refresh-failure",
+                file_path=f"viking://resources/demo/{index}.txt",
+            )
+            for index in range(2)
+        ]
+        executor._root_done.set()
+
+    executor._schedule_dir = seed_vectorization
+
+    try:
+        with pytest.raises(RuntimeError, match="task store unavailable"):
+            await asyncio.wait_for(executor.run("viking://resources/demo"), timeout=1)
+
+        assert tracker._tasks["semantic-partial-refresh-failure"].remaining == 1
+        resource_lock.close.assert_not_awaited()
+
+        await tracker.decrement("semantic-partial-refresh-failure")
+
+        assert "semantic-partial-refresh-failure" not in tracker._tasks
+        assert resource_lock.close.await_count == 2
+    finally:
+        tracker._tasks.clear()
 
 
 @pytest.mark.asyncio

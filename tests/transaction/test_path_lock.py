@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Tests for path lock with fencing tokens."""
 
+import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock
 
 from openviking.storage.transaction import path_lock as path_lock_module
 from openviking.storage.transaction.lock_handle import LockHandle
+from openviking.storage.transaction.lock_lease import OwnedLockLease
 from openviking.storage.transaction.path_lock import (
     EXACT_LOCK_FILE_PREFIX,
     LOCK_FILE_NAME,
@@ -701,3 +703,50 @@ class TestPathLockBehavior:
             pass
 
         await lock.release(tx)
+
+
+async def test_owned_lock_lease_keeps_handle_until_release_succeeds():
+    handle = LockHandle(id="retryable-release")
+    handle.add_lock("/local/acme/resources/.path.ovlock")
+    manager = MagicMock()
+    manager.get_handle.return_value = handle
+    manager.release = AsyncMock(side_effect=[RuntimeError("release failed"), None])
+    lease = OwnedLockLease(manager, handle, start_refresh=False)
+
+    try:
+        await lease.close()
+        raise AssertionError("first release must fail")
+    except RuntimeError as exc:
+        assert str(exc) == "release failed"
+
+    assert lease.handle is handle
+
+    await lease.close()
+
+    assert lease.handle is None
+    assert manager.release.await_count == 2
+
+
+async def test_owned_lock_lease_serializes_concurrent_close():
+    handle = LockHandle(id="concurrent-release")
+    handle.add_lock("/local/acme/resources/.path.ovlock")
+    release_started = asyncio.Event()
+    allow_release = asyncio.Event()
+
+    async def release(_handle):
+        release_started.set()
+        await allow_release.wait()
+
+    manager = MagicMock()
+    manager.get_handle.return_value = handle
+    manager.release = AsyncMock(side_effect=release)
+    lease = OwnedLockLease(manager, handle, start_refresh=False)
+
+    first_close = asyncio.create_task(lease.close())
+    await release_started.wait()
+    second_close = asyncio.create_task(lease.close())
+    await asyncio.sleep(0)
+    allow_release.set()
+    await asyncio.gather(first_close, second_close)
+
+    manager.release.assert_awaited_once_with(handle)

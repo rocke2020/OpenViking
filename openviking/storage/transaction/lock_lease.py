@@ -116,6 +116,7 @@ class OwnedLockLease(LockLease):
         self._manager = manager
         self._handle: Optional[LockHandle] = handle
         self._refresh_task: Optional[asyncio.Task] = None
+        self._state_lock = asyncio.Lock()
         if start_refresh and handle.locks:
             self._start_refresh()
 
@@ -185,16 +186,18 @@ class OwnedLockLease(LockLease):
         return LockHandoffRef(handle_id=handle.id, lock_paths=tuple(handle.locks))
 
     async def close(self) -> None:
-        await self._stop_refresh()
-        handle = self.handle or self._handle
-        self._handle = None
-        if handle is not None:
-            await self._manager.release(handle)
+        async with self._state_lock:
+            await self._stop_refresh()
+            handle = self.handle or self._handle
+            if handle is not None:
+                await self._manager.release(handle)
+            self._handle = None
 
     async def handoff(self) -> None:
         """Stop managing this lease after another worker has received its handle."""
-        await self._stop_refresh()
-        self._handle = None
+        async with self._state_lock:
+            await self._stop_refresh()
+            self._handle = None
 
     def _start_refresh(self) -> None:
         if self._refresh_task is not None:

@@ -10,7 +10,11 @@ from typing import Any, Dict, Optional
 
 from openviking.observability.context import bind_execution_context
 from openviking.server.identity import RequestContext, Role
-from openviking.service.task_tracker import TaskStatus, get_task_tracker
+from openviking.service.task_tracker import (
+    ADD_RESOURCE_CANCEL_PROTOCOL_VERSION,
+    TaskStatus,
+    get_task_tracker,
+)
 from openviking.storage.queuefs.add_resource_msg import AddResourceMsg
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.telemetry import bind_telemetry, resolve_telemetry
@@ -163,6 +167,7 @@ class AddResourceProcessor(DequeueHandlerBase):
             account_id=ctx.account_id,
             user_id=ctx.user.user_id,
             task_id=msg.task_id,
+            cancel_protocol_version=ADD_RESOURCE_CANCEL_PROTOCOL_VERSION,
         )
         self._restore_rollback_target(msg, task)
         if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
