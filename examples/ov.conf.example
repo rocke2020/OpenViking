@@ -4,6 +4,9 @@
         "port": 1933,
         "root_api_key": null,
         "cors_origins": ["*"],
+        "agent_evolution": {
+            "enabled": false,
+        },
         "observability": {
             "metrics": {
                 "enabled": true,

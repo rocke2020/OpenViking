@@ -211,7 +211,7 @@ class FSService:
         refresh_parent_uri = self._semantic_refresh_parent_uri(uri, context_type)
         memory_overview_uri = self._memory_overview_parent_uri(uri, context_type)
         result = await viking_fs.rm(uri, recursive=recursive, ctx=ctx)
-        await self._sync_watch_after_rm(uri, context_type=context_type)
+        await self._sync_watch_after_rm(uri, account_id=ctx.account_id, context_type=context_type)
         queue_status = None
         request_registered = False
         telemetry_id = get_current_telemetry().telemetry_id
@@ -408,11 +408,14 @@ class FSService:
         await watch_manager.sync_tasks_with_resource_move_internal(
             from_uri,
             to_uri,
+            account_id=ctx.account_id,
             move_resource=lambda: viking_fs.mv(from_uri, to_uri, ctx=ctx),
             rollback_resource=lambda: viking_fs.mv(to_uri, from_uri, ctx=ctx),
         )
 
-    async def _sync_watch_after_rm(self, uri: str, *, context_type: str) -> None:
+    async def _sync_watch_after_rm(
+        self, uri: str, *, account_id: str, context_type: str
+    ) -> None:
         if context_type != "resource":
             return
         if is_watch_task_control_uri(uri):
@@ -420,7 +423,7 @@ class FSService:
         watch_manager = self._get_watch_manager()
         if not watch_manager:
             return
-        deactivated = await watch_manager.deactivate_tasks_under_uri_internal(uri)
+        deactivated = await watch_manager.deactivate_tasks_under_uri_internal(uri, account_id)
         if deactivated:
             logger.info(
                 "Deactivated %d watch task(s) after deleting %s",
@@ -661,6 +664,19 @@ class FSService:
         viking_fs = self._ensure_initialized()
         path = validate_viking_uri(path, field_name="path")
         return await viking_fs.show_blob_raw(target_ref, path=path, ctx=ctx)
+
+    async def diff(
+        self,
+        *,
+        path: str,
+        from_ref: Optional[str],
+        to_ref: str,
+        ctx: RequestContext,
+    ) -> Dict[str, Any]:
+        """Return a unified text diff for one path between two snapshots."""
+        viking_fs = self._ensure_initialized()
+        path = validate_viking_uri(path, field_name="path")
+        return await viking_fs.diff(path=path, from_ref=from_ref, to_ref=to_ref, ctx=ctx)
 
     async def log(
         self,
