@@ -1,14 +1,22 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 
+import gc
 import threading
 import traceback
+import weakref
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import pytest
 
 from openviking.storage.vectordb.collection.local_collection import (
     get_or_create_local_collection,
 )
 from openviking.storage.vectordb.index import cuvs_index
+from openviking.storage.vectordb.store.data import CandidateData
+from openviking.storage.vectordb.store.local_store import StoreEngineProxy
+from openviking.storage.vectordb.store.store_manager import StoreManager
 from openviking.telemetry.backends.memory import MemoryOperationTelemetry
 from openviking.telemetry.context import bind_telemetry
 
@@ -17,6 +25,7 @@ class FakeCuVSRuntime:
     def __init__(self, metric):
         self.metric = metric
         self.search_count = 0
+        self.search_batch_sizes = []
 
     def build(self, dataset):
         return [list(vector) for vector in dataset]
@@ -40,8 +49,28 @@ class FakeCuVSRuntime:
         rows = rows[:limit]
         return [row[1] for row in rows], [row[2] for row in rows]
 
+    def search_batch(self, index, queries, limit, mask):
+        self.search_batch_sizes.append(len(queries))
+        results = [self.search(index, query, limit, mask) for query in queries]
+        return [result[0] for result in results], [result[1] for result in results]
+
     def close(self):
         pass
+
+
+class BlockingFakeCuVSRuntime(FakeCuVSRuntime):
+    def __init__(self, metric):
+        super().__init__(metric)
+        self.block_next_batch = False
+        self.search_started = threading.Event()
+        self.release_search = threading.Event()
+
+    def search_batch(self, index, queries, limit, mask):
+        if self.block_next_batch:
+            self.block_next_batch = False
+            self.search_started.set()
+            assert self.release_search.wait(timeout=5)
+        return super().search_batch(index, queries, limit, mask)
 
 
 class MemoryAwareFakeCuVSRuntime(FakeCuVSRuntime):
@@ -321,6 +350,188 @@ def test_local_collection_allows_concurrent_warmed_cuvs_searches(monkeypatch):
         collection.close()
 
 
+def test_local_collection_micro_batches_compatible_offset_and_projection_requests(monkeypatch):
+    runtime = FakeCuVSRuntime("inner_product")
+    monkeypatch.setattr(
+        cuvs_index,
+        "_CuVSRuntime",
+        lambda _algorithm, _metric, _build_params, _search_params, _dtype: runtime,
+    )
+    collection = get_or_create_local_collection(
+        meta_data={
+            "CollectionName": "cuvs_micro_batch_projection",
+            "Fields": [
+                {"FieldName": "id", "FieldType": "string", "IsPrimaryKey": True},
+                {"FieldName": "vector", "FieldType": "vector", "Dim": 4},
+                {"FieldName": "account_id", "FieldType": "string"},
+                {"FieldName": "rank", "FieldType": "int64"},
+            ],
+        },
+        config={
+            "dense_search": {
+                "backend": "cuvs",
+                "algorithm": "brute_force",
+                "micro_batching_enabled": True,
+                "micro_batching_max_batch_size": 2,
+                "micro_batching_max_wait_ms": 50.0,
+            }
+        },
+    )
+    try:
+        collection.create_index(
+            "default",
+            {
+                "IndexName": "default",
+                "VectorIndex": {"IndexType": "flat", "Distance": "cosine"},
+            },
+        )
+        collection.upsert_data(
+            [
+                {
+                    "id": "first",
+                    "vector": [1.0, 0.0, 0.0, 0.0],
+                    "account_id": "a",
+                    "rank": 1,
+                },
+                {
+                    "id": "second",
+                    "vector": [0.8, 0.2, 0.0, 0.0],
+                    "account_id": "b",
+                    "rank": 2,
+                },
+                {
+                    "id": "third",
+                    "vector": [0.0, 1.0, 0.0, 0.0],
+                    "account_id": "c",
+                    "rank": 3,
+                },
+            ]
+        )
+        # Warm the immutable snapshot, then isolate the concurrent measurement.
+        assert (
+            collection.search_by_vector("default", dense_vector=[1.0, 0.0, 0.0, 0.0], limit=1)
+            .data[0]
+            .id
+            == "first"
+        )
+        runtime.search_batch_sizes.clear()
+        barrier = threading.Barrier(3)
+
+        def search_with_offset():
+            barrier.wait(timeout=5)
+            return collection.search_by_vector(
+                "default",
+                dense_vector=[1.0, 0.0, 0.0, 0.0],
+                limit=1,
+                offset=1,
+                output_fields=["rank"],
+            )
+
+        def search_two():
+            barrier.wait(timeout=5)
+            return collection.search_by_vector(
+                "default",
+                dense_vector=[1.0, 0.0, 0.0, 0.0],
+                limit=2,
+                output_fields=["account_id"],
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            offset_future = executor.submit(search_with_offset)
+            two_future = executor.submit(search_two)
+            barrier.wait(timeout=5)
+            offset_result = offset_future.result(timeout=5)
+            two_result = two_future.result(timeout=5)
+
+        assert runtime.search_batch_sizes == [2]
+        assert [(item.id, item.fields) for item in offset_result.data] == [("second", {"rank": 2})]
+        assert [(item.id, item.fields) for item in two_result.data] == [
+            ("first", {"account_id": "a"}),
+            ("second", {"account_id": "b"}),
+        ]
+    finally:
+        collection.close()
+
+
+def test_local_collection_no_filter_requests_fill_warm_micro_batch(monkeypatch):
+    runtime = BlockingFakeCuVSRuntime("inner_product")
+    monkeypatch.setattr(
+        cuvs_index,
+        "_CuVSRuntime",
+        lambda _algorithm, _metric, _build_params, _search_params, _dtype: runtime,
+    )
+    collection = get_or_create_local_collection(
+        meta_data={
+            "CollectionName": "cuvs_micro_batch_no_filter",
+            "Fields": [
+                {"FieldName": "id", "FieldType": "string", "IsPrimaryKey": True},
+                {"FieldName": "vector", "FieldType": "vector", "Dim": 4},
+            ],
+        },
+        config={
+            "dense_search": {
+                "backend": "cuvs",
+                "algorithm": "brute_force",
+                "micro_batching_enabled": True,
+                "micro_batching_max_batch_size": 2,
+                "micro_batching_max_wait_ms": 100.0,
+            }
+        },
+    )
+    try:
+        local_index = collection.create_index(
+            "default",
+            {
+                "IndexName": "default",
+                "VectorIndex": {"IndexType": "flat", "Distance": "cosine"},
+            },
+        )
+        collection.upsert_data(
+            [
+                {"id": "first", "vector": [1.0, 0.0, 0.0, 0.0]},
+                {"id": "second", "vector": [0.0, 1.0, 0.0, 0.0]},
+            ]
+        )
+        assert (
+            collection.search_by_vector("default", dense_vector=[1.0, 0.0, 0.0, 0.0], limit=1)
+            .data[0]
+            .id
+            == "first"
+        )
+        runtime.search_batch_sizes.clear()
+        runtime.block_next_batch = True
+
+        def search(vector):
+            return collection.search_by_vector("default", dense_vector=vector, limit=1)
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            active = executor.submit(search, [1.0, 0.0, 0.0, 0.0])
+            assert runtime.search_started.wait(timeout=5)
+            queued = [
+                executor.submit(search, [0.0, 1.0, 0.0, 0.0]),
+                executor.submit(search, [1.0, 0.0, 0.0, 0.0]),
+            ]
+            with local_index.dense_search._micro_batch_condition:
+                assert local_index.dense_search._micro_batch_condition.wait_for(
+                    lambda: local_index.dense_search._micro_batch_warm_lookahead == 2,
+                    timeout=5,
+                )
+            assert all(not future.done() for future in queued)
+
+            runtime.release_search.set()
+            assert active.result(timeout=5).data[0].id == "first"
+            assert [future.result(timeout=5).data[0].id for future in queued] == [
+                "second",
+                "first",
+            ]
+
+        assert runtime.search_batch_sizes == [1, 2]
+        assert local_index.dense_search._micro_batch_warm_lookahead == 0
+    finally:
+        runtime.release_search.set()
+        collection.close()
+
+
 def test_persistent_collection_rehydrates_cuvs_from_local_store(monkeypatch, tmp_path):
     patch_cuvs_runtime(monkeypatch)
     path = str(tmp_path / "cuvs-persistent")
@@ -351,6 +562,243 @@ def test_persistent_collection_rehydrates_cuvs_from_local_store(monkeypatch, tmp
     reopened = get_or_create_local_collection(path=path, config=config)
     try:
         result = reopened.search_by_vector("default", dense_vector=[1, 0, 0, 0], limit=1)
+        assert [item.id for item in result.data] == ["persisted"]
+    finally:
+        reopened.close()
+
+
+def test_persistent_cuvs_recovery_deserializes_candidates_lazily(monkeypatch, tmp_path):
+    patch_cuvs_runtime(monkeypatch)
+    path = str(tmp_path / "cuvs-streaming-recovery")
+    config = {"dense_search": {"backend": "cuvs", "algorithm": "brute_force"}}
+    collection = get_or_create_local_collection(
+        meta_data={
+            "CollectionName": "cuvs_streaming_recovery",
+            "Fields": [
+                {"FieldName": "id", "FieldType": "string", "IsPrimaryKey": True},
+                {"FieldName": "vector", "FieldType": "vector", "Dim": 4},
+            ],
+        },
+        path=path,
+        config=config,
+    )
+    for index_name in ("first", "second"):
+        collection.create_index(
+            index_name,
+            {
+                "IndexName": index_name,
+                "VectorIndex": {"IndexType": "flat", "Distance": "cosine"},
+            },
+        )
+    record_count = 64
+    collection.upsert_data(
+        [
+            {
+                "id": f"row-{offset}",
+                "vector": [float(offset + 1), 1.0, 0.0, 0.0],
+            }
+            for offset in range(record_count)
+        ]
+    )
+    collection.close()
+
+    original_from_bytes = CandidateData.from_bytes
+    original_pack_vector = cuvs_index.CuVSDenseIndex._pack_vector
+    candidate_refs = []
+    events = []
+    peak_live_candidates = 0
+
+    def tracked_from_bytes(data):
+        nonlocal peak_live_candidates
+        candidate = original_from_bytes(data)
+        candidate_refs.append(weakref.ref(candidate))
+        events.append("decode")
+        peak_live_candidates = max(
+            peak_live_candidates,
+            sum(candidate_ref() is not None for candidate_ref in candidate_refs),
+        )
+        return candidate
+
+    def tracked_pack_vector(self, vector):
+        events.append("pack")
+        return original_pack_vector(self, vector)
+
+    monkeypatch.setattr(CandidateData, "from_bytes", staticmethod(tracked_from_bytes))
+    monkeypatch.setattr(cuvs_index.CuVSDenseIndex, "_pack_vector", tracked_pack_vector)
+
+    reopened = get_or_create_local_collection(path=path, config=config)
+    try:
+        for index_name in ("first", "second"):
+            index = reopened.get_index(index_name)
+            assert index is not None
+            assert index.dense_search is not None
+            assert index.dense_search.size == record_count
+
+        assert events.count("decode") == record_count * 2
+        assert events.count("pack") == record_count * 2
+        assert events.index("pack") < len(events) - 1 - events[::-1].index("decode")
+        assert peak_live_candidates <= 3
+        gc.collect()
+        assert not any(candidate_ref() is not None for candidate_ref in candidate_refs)
+    finally:
+        reopened.close()
+
+
+def test_persistent_native_recovery_does_not_scan_candidates(monkeypatch, tmp_path):
+    path = str(tmp_path / "native-recovery-no-candidate-scan")
+    collection = get_or_create_local_collection(
+        meta_data={
+            "CollectionName": "native_recovery_no_candidate_scan",
+            "Fields": [
+                {"FieldName": "id", "FieldType": "string", "IsPrimaryKey": True},
+                {"FieldName": "vector", "FieldType": "vector", "Dim": 4},
+            ],
+        },
+        path=path,
+    )
+    collection.create_index(
+        "default",
+        {
+            "IndexName": "default",
+            "VectorIndex": {"IndexType": "flat", "Distance": "cosine"},
+        },
+    )
+    collection.upsert_data([{"id": "persisted", "vector": [1.0, 0.0, 0.0, 0.0]}])
+    collection.close()
+
+    original_read_all = StoreEngineProxy.read_all
+
+    def reject_candidate_scan(self, table_name):
+        if table_name == StoreManager.CandsTable:
+            raise AssertionError("native snapshot recovery must not scan candidate rows")
+        return original_read_all(self, table_name)
+
+    monkeypatch.setattr(StoreEngineProxy, "read_all", reject_candidate_scan)
+    reopened = get_or_create_local_collection(path=path)
+    try:
+        result = reopened.search_by_vector("default", dense_vector=[1.0, 0.0, 0.0, 0.0], limit=1)
+        assert [item.id for item in result.data] == ["persisted"]
+    finally:
+        reopened.close()
+
+
+def test_persistent_cuvs_recovery_materializes_when_native_snapshot_is_missing(
+    monkeypatch, tmp_path
+):
+    patch_cuvs_runtime(monkeypatch)
+    path = str(tmp_path / "cuvs-missing-native-snapshot")
+    config = {"dense_search": {"backend": "cuvs", "algorithm": "brute_force"}}
+    collection = get_or_create_local_collection(
+        meta_data={
+            "CollectionName": "cuvs_missing_native_snapshot",
+            "Fields": [
+                {"FieldName": "id", "FieldType": "string", "IsPrimaryKey": True},
+                {"FieldName": "vector", "FieldType": "vector", "Dim": 4},
+            ],
+        },
+        path=path,
+        config=config,
+    )
+    collection.create_index(
+        "default",
+        {
+            "IndexName": "default",
+            "VectorIndex": {"IndexType": "flat", "Distance": "cosine"},
+        },
+    )
+    collection.upsert_data([{"id": "persisted", "vector": [1.0, 0.0, 0.0, 0.0]}])
+    index = collection.get_index("default")
+    assert index is not None
+    version_dir = Path(index.version_dir)
+    collection.close()
+
+    markers = list(version_dir.glob("*.write_done"))
+    assert markers
+    for marker in markers:
+        marker.unlink()
+
+    reopened = get_or_create_local_collection(path=path, config=config)
+    try:
+        result = reopened.search_by_vector("default", dense_vector=[1.0, 0.0, 0.0, 0.0], limit=1)
+        assert [item.id for item in result.data] == ["persisted"]
+        recovered_index = reopened.get_index("default")
+        assert recovered_index is not None
+        assert recovered_index.dense_search is not None
+        assert recovered_index.dense_search.size == 1
+    finally:
+        reopened.close()
+
+
+def test_failed_cuvs_recovery_closes_candidate_iterator_and_partial_shadow(monkeypatch, tmp_path):
+    patch_cuvs_runtime(monkeypatch)
+    path = str(tmp_path / "cuvs-failed-streaming-recovery")
+    config = {"dense_search": {"backend": "cuvs", "algorithm": "brute_force"}}
+    collection = get_or_create_local_collection(
+        meta_data={
+            "CollectionName": "cuvs_failed_streaming_recovery",
+            "Fields": [
+                {"FieldName": "id", "FieldType": "string", "IsPrimaryKey": True},
+                {"FieldName": "vector", "FieldType": "vector", "Dim": 4},
+            ],
+        },
+        path=path,
+        config=config,
+    )
+    collection.create_index(
+        "default",
+        {
+            "IndexName": "default",
+            "VectorIndex": {"IndexType": "flat", "Distance": "cosine"},
+        },
+    )
+    collection.upsert_data([{"id": "persisted", "vector": [1.0, 0.0, 0.0, 0.0]}])
+    collection.close()
+
+    iterator_closed = False
+    original_iter_all_cands_data = StoreManager.iter_all_cands_data
+
+    def broken_candidates(_self):
+        nonlocal iterator_closed
+        try:
+            yield CandidateData(label=1, vector=[1.0, 0.0, 0.0, 0.0])
+            yield CandidateData(label=2, vector=[1.0, 0.0])
+        finally:
+            iterator_closed = True
+
+    class TrackingRuntime(FakeCuVSRuntime):
+        def __init__(self):
+            super().__init__("inner_product")
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    runtime = TrackingRuntime()
+    monkeypatch.setattr(StoreManager, "iter_all_cands_data", broken_candidates)
+    monkeypatch.setattr(
+        cuvs_index,
+        "_CuVSRuntime",
+        lambda _algorithm, _metric, _build_params, _search_params, _dtype: runtime,
+    )
+
+    with pytest.raises(ValueError, match="cuVS vector dimension mismatch"):
+        get_or_create_local_collection(path=path, config=config)
+
+    assert iterator_closed
+    assert runtime.closed
+
+    # Release must be complete when the constructor raises: restoring a valid
+    # stream and runtime should allow this same persistent collection to reopen
+    # immediately, without waiting for traceback GC to drop native locks.
+    monkeypatch.setattr(StoreManager, "iter_all_cands_data", original_iter_all_cands_data)
+    patch_cuvs_runtime(monkeypatch)
+    reopened = get_or_create_local_collection(path=path, config=config)
+    try:
+        result = reopened.search_by_vector(
+            "default",
+            dense_vector=[1.0, 0.0, 0.0, 0.0],
+            limit=1,
+        )
         assert [item.id for item in result.data] == ["persisted"]
     finally:
         reopened.close()

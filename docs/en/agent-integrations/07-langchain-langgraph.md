@@ -59,6 +59,7 @@ chain.invoke(
 | Store durable cross-thread state | `OpenVikingStore` |
 | Inject context into LangGraph as middleware | `OpenVikingContextMiddleware` |
 | Back LangChain chat history with OpenViking | `OpenVikingChatMessageHistory` |
+| Record caller-selected LangChain messages from a custom lifecycle | `OpenVikingSessionRecorder` |
 
 ## Quick examples
 
@@ -116,6 +117,40 @@ middleware = OpenVikingContextMiddleware(
     capture_on_after_agent=True,
 )
 ```
+
+### Session recorder
+
+Use the recorder when your application already owns the conversation lifecycle
+and only needs reusable OpenViking persistence:
+
+```python
+from openviking.integrations.langchain import (
+    OpenVikingPartialWriteError,
+    OpenVikingSessionRecorder,
+)
+
+recorder = OpenVikingSessionRecorder(url="http://localhost:1933", api_key="...")
+try:
+    recorder.record("support-thread-1", messages, peer_id="assistant-a")
+except OpenVikingPartialWriteError as exc:
+    recorder.record(
+        "support-thread-1",
+        messages[exc.input_messages_consumed :],
+        peer_id="assistant-a",
+    )
+recorder.flush("support-thread-1")
+recorder.close()
+```
+
+`record()` writes only the messages supplied by the caller. It filters framework
+control messages, writes in server-safe batches, and applies the configured
+commit policy. If a later batch or the post-write commit fails,
+`OpenVikingPartialWriteError` reports the confirmed input prefix so callers can
+retry only the unwritten suffix; an empty suffix safely retries a pending
+commit. When supplying `context_parts`, resend them only if
+`exc.context_attached` is false. `flush()` forces a commit only when the session
+has pending content. After `close()`, the recorder cannot be reused; injected
+clients remain owned by the caller.
 
 ## Try the examples
 

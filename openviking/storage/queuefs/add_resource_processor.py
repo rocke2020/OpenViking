@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Durable add-resource consumer on the legacy ExternalParse queue."""
+"""Durable add-resource queue consumer."""
 
 import asyncio
 import concurrent.futures
@@ -28,9 +28,11 @@ class AddResourceProcessor(DequeueHandlerBase):
         self,
         resource_service: Any,
         service_loop: asyncio.AbstractEventLoop,
+        queue_name: str,
     ):
         self._resource_service = resource_service
         self._service_loop = service_loop
+        self._queue_name = queue_name
 
     async def _load_lock(self, msg: AddResourceMsg, ctx: RequestContext) -> Any:
         if msg.lock_handoff is None:
@@ -55,11 +57,11 @@ class AddResourceProcessor(DequeueHandlerBase):
         if msg.lock_handoff_retry >= 2:
             return False
 
-        from openviking.storage.queuefs import QueueManager, get_queue_manager
+        from openviking.storage.queuefs import get_queue_manager
 
         payload = msg.to_dict()
         payload["lock_handoff_retry"] = msg.lock_handoff_retry + 1
-        await get_queue_manager().enqueue(QueueManager.ADD_RESOURCE, payload)
+        await get_queue_manager().enqueue(self._queue_name, payload)
         logger.warning(
             "[AddResource] Requeued task %s after lock handoff failure: %s",
             msg.task_id,
@@ -78,7 +80,7 @@ class AddResourceProcessor(DequeueHandlerBase):
         tracker = get_task_tracker()
         task = await tracker.create(
             "add_resource",
-            resource_id=msg.root_uri,
+            resource_id=None if msg.defer_target_resolution else msg.root_uri,
             account_id=ctx.account_id,
             user_id=ctx.user.user_id,
             task_id=msg.task_id,
@@ -158,6 +160,7 @@ class AddResourceProcessor(DequeueHandlerBase):
                     result,
                     account_id=ctx.account_id,
                     user_id=ctx.user.user_id,
+                    resource_id=result.get("root_uri"),
                 )
                 self.report_success()
                 return None
