@@ -1,6 +1,8 @@
 # 路径锁与崩溃恢复
 
-OpenViking 通过**路径锁**和**Redo Log** 两个简单原语保护核心写操作（`rm`、`mv`、`add_resource`、`session.commit`）的一致性，确保 VikingFS、VectorDB、QueueManager 三个子系统在故障时不会出现数据不一致。
+OpenViking 组合使用**路径锁**、持久化 **QueueFS** 任务和操作专属的恢复标记，
+保护 VikingFS、VectorDB 与后台处理中的核心写操作（`rm`、`mv`、`add_resource`、
+`session.commit`）。
 
 ## 设计哲学
 
@@ -10,11 +12,11 @@ OpenViking 是上下文数据库，FS 是源数据，VectorDB 是派生索引。
 
 ## 设计原则
 
-1. **写互斥**：通过路径锁保证同一路径同一时间只有一个写操作
-2. **默认生效**：所有数据操作命令自动加锁，用户无需额外配置
+1. **在需要的位置保证写互斥**：受保护的状态转换使用路径锁排除冲突写入
+2. **默认由内部处理**：需要事务保护的操作自行获取适当范围的锁，调用方无需配置锁范围
 3. **锁即保护**：进入 LockContext 时加锁，退出时释放，没有 undo/journal/commit 语义
-4. **仅 session_memory 需要崩溃恢复**：通过 RedoLog 在进程崩溃后重做记忆提取
-5. **Queue 操作在锁外执行**：SemanticQueue/EmbeddingQueue 的 enqueue 是幂等的，失败可重试
+4. **按操作设计崩溃恢复**：QueueFS 重放持久化后台任务，archive 和任务标记区分完成、失败与中断状态
+5. **慢任务不占用短临界区**：为关闭崩溃窗口，持锁期间可以完成持久化队列交接；LLM 和 embedding 工作异步执行，资源生命周期锁则可能有意跨越这一交接继续持有
 
 ## 架构
 
@@ -56,7 +58,7 @@ class LockHandle:
 **LockManager** 是全局单例，管理锁生命周期：
 - 创建/释放 LockHandle
 - 后台清理泄漏的锁（进程内安全网）
-- 启动时执行 RedoLog 恢复
+- 启动时执行旧版 RedoLog 的兼容恢复
 
 **LockContext** 是异步上下文管理器，封装加锁/解锁生命周期：
 
@@ -69,15 +71,24 @@ async with LockContext(get_lock_manager(), [path], lock_mode="exact") as handle:
 # 退出时自动释放锁（包括异常情况）
 ```
 
-### 组件 2：RedoLog（崩溃恢复）
+### 组件 2：QueueFS + Archive 标记（崩溃恢复）
 
-仅用于 `session.commit` 的记忆提取阶段。操作前写标记，成功后删标记，启动时扫描遗留标记并重做。
+当前 `session.commit` 使用持久化的 `SessionCommit` QueueFS 队列和 archive
+本地状态完成恢复：
 
-```
+- Phase 1 在改写实时消息根之前，把可恢复意图写入 archive 元数据。
+- 归档消息从实时消息根消失之前，原始 archive 已经持久化。
+- Phase 2 最后写入 `.done`；重放看到 `.done` 时跳过已完成任务。
+- 终态失败写入 `.failed.json`，其中包含失败阶段和已经完成的 memory 步骤。
+
+启用兼容恢复时，`LockManager` 启动后仍会扫描旧版 RedoLog 路径：
+
+```text
 /local/_system/redo/{task_id}/redo.json
 ```
 
-Memory 提取是幂等的 — 从同一个 archive 重新提取会得到相同结果。
+该路径只用于恢复旧版本创建的标记；新的 session commit 依赖 QueueFS 和
+archive 标记。
 
 ## 一致性问题与解决方案
 
@@ -107,7 +118,7 @@ VectorDB 删除失败 -> 直接抛异常，锁自动释放，文件和索引都�
 
 | 问题 | 方案 |
 |------|------|
-| 文件移到新路径但索引指向旧路径 -> 搜索返回旧路径（不存在） | 先 copy 再更新索引，失败时清理副本 |
+| 文件移到新路径但索引指向旧路径 -> 搜索返回旧路径（不存在） | 先 copy，再逐项尽力更新索引 URI，然后删除源路径 |
 
 **加锁策略**（通过 `lock_mode="mv"` 自动处理）：
 - 移动**目录**：源路径加 TreeLock，目标路径加 ExactPathLock
@@ -120,11 +131,15 @@ VectorDB 删除失败 -> 直接抛异常，锁自动释放，文件和索引都�
 2. 获取 mv 锁（内部根据 src_is_dir 选择 TreeLock 或 ExactPathLock）
 3. Copy 到新位置（源还在，安全）
 4. 如果是目录，删除副本中被 cp 带过去的锁文件
-5. 更新 VectorDB 中的 URI
-   - 失败 -> 清理副本，源和旧索引都在，一致状态
+5. 逐项更新 VectorDB 中的 URI 映射
+   - 单个 URI 更新失败时记录 warning，并继续处理
 6. 删除源
 7. 释放锁
 ```
+
+**当前限制：** copy 失败时源路径仍然保留；但单个 VectorDB URI 更新失败不会中止
+移动，因此源路径可能已经删除，而部分索引仍指向旧路径。看到这类 warning 后，需要
+对目标路径重新索引或进行其他修复。
 
 ### add_resource
 
@@ -199,34 +214,41 @@ viking://user/default/memories/preferences/editor.md
 
 | 问题 | 方案 |
 |------|------|
-| 消息已清空但 archive 未写入 -> 对话数据丢失 | Phase 1 无锁（archive 不完整无副作用）+ Phase 2 RedoLog |
+| 过期 session 实例改写实时消息根，同时另一个 worker 正在追加消息 | Phase 1 在 session ExactPathLock 下重新加载并发布权威消息状态 |
+| 进程在归档消息后、开始 memory 提取前退出 | Phase 1 先持久化恢复意图、原始消息和 QueueFS 任务，再发布 `phase1.status=ready` |
 
-LLM 调用耗时不可控（5s~60s+），不能放在持锁操作内。设计拆为两个阶段：
+LLM 调用耗时不可控（5s~60s+），不能延长 Phase 1 的临界区。设计把短时间的
+加锁状态转换与可重启的后台处理拆开：
 
 ```
-Phase 1 — 归档（无锁）：
-  1. 生成归档摘要（LLM）
-  2. 写 archive（history/archive_N/messages.jsonl + 摘要）
-  3. 清空 messages.jsonl
-  4. 清空内存中的消息列表
+Phase 1 — Archive 交接（session ExactPathLock）：
+  1. 重新加载权威的实时消息和 session 元数据
+  2. 把消息拆分为归档集合和保留集合
+  3. 持久化 phase1.status=preparing 和完整恢复意图
+  4. 写入 history/archive_N/messages.jsonl
+  5. 把持久化 SessionCommit 任务加入 QueueFS
+  6. 发布保留消息和更新后的 session 元数据
+  7. 发布 phase1.status=ready，然后释放锁
 
-Phase 2 — 记忆提取 + 写入（RedoLog）：
-  1. 写 redo 标记（archive_uri、session_uri、用户身份信息）
-  2. 从归档消息提取 memories（LLM）
-  3. 写当前消息状态
-  4. 写 relations
-  5. 直接 enqueue SemanticQueue
-  6. 删除 redo 标记
+Phase 2 — 摘要和 memory 处理（QueueFS worker；LLM 工作在 session 锁外）：
+  1. 验证 phase1.status=ready，或协调被中断的 Phase 1
+  2. 生成 archive 摘要（LLM）
+  3. 提取并写入配置的 memories 和 relations（LLM）
+  4. 入队并等待必要的语义/索引任务
+  5. 更新 commit 元数据
+  6. 最后写入 .done；终态错误写入 .failed.json
 ```
 
 **崩溃恢复分析**：
 
 | 崩溃时间点 | 状态 | 恢复动作 |
 |-----------|------|---------|
-| Phase 1 写 archive 中途 | 无标记 | archive 不完整，下次 commit 从 history/ 扫描 index，不受影响 |
-| Phase 1 archive 完成但 messages 未清空 | 无标记 | archive 完整 + messages 仍在 = 数据冗余但安全 |
-| Phase 2 记忆提取/写入中途 | redo 标记存在 | 启动恢复：从 archive 重做提取+写入+入队 |
-| Phase 2 完成 | redo 标记已删 | 无需恢复 |
+| QueueFS 任务持久化之前 | Phase 1 抛出异常并记录 `.failed.json`；实时消息根尚未改写 | 调用方可以重试，原始消息不会丢失 |
+| QueueFS 任务已持久化，但实时消息根尚未改写 | `phase1.status=preparing`；实时消息根仍包含被归档消息 | Worker 获取同一把 session 锁，把 archive 标记为失败且不处理该任务 |
+| 实时消息根已改写，但尚未发布 `phase1.status=ready` | 持久化意图和实时消息根可以证明改写是否完成 | Worker 协调元数据并发布 `ready`，然后进入 Phase 2 |
+| Phase 2 期间 | Worker 进程退出时 QueueFS 任务不会被 ACK | QueueFS 恢复任务；已完成步骤和 archive 标记约束重放范围 |
+| Phase 2 完成 | `.done` 已存在 | 恢复出的重复任务跳过已完成工作 |
+| Phase 2 发生终态错误 | `.failed.json` 已存在 | 该任务进入终态，后续 archive 仍可继续 |
 
 ## LockContext
 
@@ -297,7 +319,7 @@ ExactPathLock(文件或未创建路径) -> {parent}/.exact.ovlock.<name>.<hash>
 ### 获取锁流程（EXACT 模式）
 
 ```
-循环直到超时（轮询间隔：200ms）：
+循环直到超时（轮询间隔：100ms）：
     1. 检查目标路径是否被其他操作锁定
        - 陈旧锁？ -> 移除后重试
        - 活跃锁？ -> 等待
@@ -319,7 +341,7 @@ ExactPathLock(文件或未创建路径) -> {parent}/.exact.ovlock.<name>.<hash>
 ### 获取锁流程（TREE 模式）
 
 ```
-循环直到超时（轮询间隔：200ms）：
+循环直到超时（轮询间隔：100ms）：
     1. 检查目标路径是否被其他操作锁定
        - 陈旧锁？ -> 移除后重试
        - 活跃锁？ -> 等待
@@ -378,11 +400,13 @@ fencing token 校验通过的一方成功持有 `TreeLock(java-guide)`；失败�
 
 ## 崩溃恢复
 
-`LockManager.start()` 启动时自动扫描 `/local/_system/redo/` 目录中的遗留标记：
+QueueFS worker 启动后恢复持久化任务。启用 `redo_recovery_enabled` 时，
+`LockManager.start()` 还会扫描 `/local/_system/redo/` 中的旧版兼容标记：
 
 | 场景 | 恢复方式 |
 |------|---------|
-| session_memory 提取中途崩溃 | 从 archive 重做记忆提取 + 写入 + enqueue |
+| 当前 `session.commit` Phase 2 worker 退出 | QueueFS 重新投递未 ACK 的 `SessionCommit` 任务；archive 标记保证重放可安全恢复 |
+| 遗留旧版 session-memory redo 标记 | 启用兼容恢复时，LockManager 重放旧版标记 |
 | 锁持有期间崩溃 | 锁文件留在 AGFS，下次获取时 stale 检测自动清理（默认 1800s / 30 分钟过期）|
 | enqueue 后 worker 处理前崩溃 | QueueFS SQLite 持久化，worker 重启后自动拉取 |
 | 孤儿索引 | L2 按需加载时清理 |
@@ -393,7 +417,8 @@ fencing token 校验通过的一方成功持有 `TreeLock(java-guide)`；失败�
 |---------|------|---------|
 | 操作中途崩溃 | 锁自动过期 + stale 检测 | 下次获取同路径锁时 |
 | add_resource 语义处理中途崩溃 | 生命周期锁过期 + SemanticProcessor 重启时重新获取 | worker 重启后 |
-| session.commit Phase 2 崩溃 | RedoLog 标记 + 重做 | 重启时 |
+| session.commit Phase 1 崩溃 | 可恢复意图 + 在 session 锁下协调权威实时消息根 | QueueFS worker |
+| session.commit Phase 2 崩溃 | 持久化 SessionCommit 任务 + archive `.done` / `.failed.json` 标记 | QueueFS 恢复 |
 | enqueue 后 worker 处理前崩溃 | QueueFS SQLite 持久化 | worker 重启后 |
 | 孤儿索引 | L2 按需加载时清理 | 用户访问时 |
 
@@ -406,7 +431,8 @@ fencing token 校验通过的一方成功持有 `TreeLock(java-guide)`；失败�
   "storage": {
     "transaction": {
       "lock_timeout": 5.0,
-      "lock_expire": 1800.0
+      "lock_expire": 1800.0,
+      "redo_recovery_enabled": true
     }
   }
 }
@@ -416,10 +442,12 @@ fencing token 校验通过的一方成功持有 `TreeLock(java-guide)`；失败�
 |------|------|------|--------|
 | `lock_timeout` | float | 获取锁的等待超时（秒）。`0` = 立即失败（默认）；`> 0` = 最多等待此时间 | `0.0` |
 | `lock_expire` | float | 锁失活阈值（秒），超过此时间未被 refresh 的锁会被视为陈旧锁并回收 | `1800.0` |
+| `redo_recovery_enabled` | bool | 启用旧版 RedoLog 标记的启动恢复。当前 session commit 使用独立的 QueueFS 恢复，不受该配置影响 | `true` |
 
 ### QueueFS 持久化
 
-路径锁机制依赖 QueueFS 使用 SQLite 后端，确保 enqueue 的任务在进程重启后可恢复。这是默认配置，无需手动设置。
+持久化后台恢复依赖 QueueFS 使用 SQLite 后端，使已入队任务可以跨进程重启存活。
+这是默认配置，无需手动设置。
 
 ## 相关文档
 
