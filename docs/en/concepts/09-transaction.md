@@ -1,6 +1,8 @@
 # Path Locks and Crash Recovery
 
-OpenViking uses two simple primitives — **path locks** and **redo log** — to protect the consistency of core write operations (`rm`, `mv`, `add_resource`, `session.commit`), ensuring that VikingFS, VectorDB, and QueueManager remain consistent even when failures occur.
+OpenViking combines **path locks**, durable **QueueFS** work, and operation-specific
+recovery markers to protect core write operations (`rm`, `mv`, `add_resource`,
+`session.commit`) across VikingFS, VectorDB, and background processing.
 
 ## Design Philosophy
 
@@ -10,11 +12,11 @@ OpenViking is a context database where FS is the source of truth and VectorDB is
 
 ## Design Principles
 
-1. **Write-exclusive**: Path locks ensure only one write operation can operate on a path at a time
-2. **On by default**: All data operations automatically acquire locks; no extra configuration needed
+1. **Write-exclusive where required**: Protected state transitions use path locks to exclude conflicting writes
+2. **Internal by default**: Operations that need transaction protection acquire their own locks; callers do not configure lock scopes
 3. **Lock as protection**: LockContext acquires locks on entry, releases on exit — no undo/journal/commit semantics
-4. **Only session_memory needs crash recovery**: RedoLog re-executes memory extraction after a process crash
-5. **Queue operations run outside locks**: SemanticQueue/EmbeddingQueue enqueue operations are idempotent and retriable
+4. **Operation-specific crash recovery**: QueueFS replays durable background work, while archive and task markers distinguish completed, failed, and interrupted work
+5. **Keep slow work outside short critical sections**: A durable queue handoff may occur while a lock is held to close a crash window, but LLM and embedding work runs asynchronously; resource lifecycle locks may deliberately survive that handoff
 
 ## Architecture
 
@@ -57,7 +59,7 @@ class LockHandle:
 **LockManager** is a global singleton managing lock lifecycle:
 - Creates/releases LockHandles
 - Background cleanup of leaked locks (in-process safety net)
-- Executes RedoLog recovery on startup
+- Executes legacy RedoLog compatibility recovery on startup
 
 **LockContext** is an async context manager encapsulating the lock/unlock lifecycle:
 
@@ -70,15 +72,27 @@ async with LockContext(get_lock_manager(), [path], lock_mode="exact") as handle:
 # Lock automatically released on exit (including exceptions)
 ```
 
-### Component 2: RedoLog (Crash Recovery)
+### Component 2: QueueFS + Archive Markers (Crash Recovery)
 
-Used only for the memory extraction phase of `session.commit`. Writes a marker before the operation, deletes it after success, and scans for leftover markers on startup to redo.
+Current `session.commit` recovery uses the persistent `SessionCommit` QueueFS queue
+plus archive-local state:
 
-```
+- Phase 1 stores its recoverable intent in the archive metadata before rewriting
+  the live message root.
+- The raw archive is durable before archived messages disappear from the live root.
+- Phase 2 writes `.done` last. A replay that sees `.done` skips completed work.
+- Terminal failures write `.failed.json`, including the failed stage and any
+  completed memory steps.
+
+`LockManager` still scans the legacy RedoLog location on startup when compatibility
+recovery is enabled:
+
+```text
 /local/_system/redo/{task_id}/redo.json
 ```
 
-Memory extraction is idempotent — re-extracting from the same archive produces the same result.
+That path recovers markers created by older versions; new session commits rely on
+QueueFS and archive markers instead.
 
 ## Consistency Issues and Solutions
 
@@ -108,7 +122,7 @@ VectorDB deletion fails -> exception thrown, lock auto-released, file and index 
 
 | Problem | Solution |
 |---------|----------|
-| File moved to new path but index points to old path -> search returns old path (doesn't exist) | Copy first then update index; clean up copy on failure |
+| File moved to new path but index points to old path -> search returns old path (doesn't exist) | Copy first, then best-effort update index URIs before deleting the source |
 
 **Locking strategy** (handled automatically via `lock_mode="mv"`):
 - Moving a **directory**: TreeLock on the source path and ExactPathLock on the destination path
@@ -121,11 +135,16 @@ Operation flow:
 2. Acquire mv lock (internally chooses TreeLock or ExactPathLock based on src_is_dir)
 3. Copy to new location (source still intact, safe)
 4. If directory, remove the lock file carried over by cp into the copy
-5. Update VectorDB URIs
-   - Failure -> clean up copy, source and old index intact, consistent state
+5. Update each VectorDB URI mapping
+   - Per-URI failures are logged and processing continues
 6. Delete source
 7. Release lock
 ```
+
+**Current limitation:** A copy failure leaves the source intact. However, failures while
+updating individual VectorDB URIs do not abort the move, so the source can be deleted while
+some index entries still point to the old path. Reindex or otherwise repair the destination
+after such a warning.
 
 ### add_resource
 
@@ -204,34 +223,42 @@ hold separate ExactPathLocks for the two source files. Refreshing `preferences/.
 
 | Problem | Solution |
 |---------|----------|
-| Messages cleared but archive not written -> conversation data lost | Phase 1 without lock (incomplete archive has no side effects) + Phase 2 with RedoLog |
+| A stale session instance rewrites the live root while another worker appends messages | Phase 1 reloads and publishes the authoritative message state under the session's ExactPathLock |
+| Process exits between archiving messages and starting memory extraction | Phase 1 persists recovery intent, raw messages, and a durable QueueFS item before publishing `phase1.status=ready` |
 
-LLM calls have unpredictable latency (5s~60s+) and cannot be inside a lock-holding operation. The design splits into two phases:
+LLM calls have unpredictable latency (5s~60s+) and must not extend the Phase 1
+critical section. The design separates a short, locked state transition from
+restart-safe background processing:
 
 ```
-Phase 1 — Archive (no lock):
-  1. Generate archive summary (LLM)
-  2. Write archive (history/archive_N/messages.jsonl + summaries)
-  3. Clear messages.jsonl
-  4. Clear in-memory message list
+Phase 1 — Archive handoff (session ExactPathLock):
+  1. Reload the authoritative live messages and session metadata
+  2. Split messages into archive and retained sets
+  3. Persist phase1.status=preparing and the exact recovery intent
+  4. Write history/archive_N/messages.jsonl
+  5. Enqueue the persistent SessionCommit QueueFS item
+  6. Publish retained messages and updated session metadata
+  7. Publish phase1.status=ready, then release the lock
 
-Phase 2 — Memory extraction + write (RedoLog):
-  1. Write redo marker (archive_uri, session_uri, user identity)
-  2. Extract memories from archived messages (LLM)
-  3. Write current message state
-  4. Write relations
-  5. Directly enqueue SemanticQueue
-  6. Delete redo marker
+Phase 2 — Summary and memory processing (QueueFS worker; LLM work outside the session lock):
+  1. Verify phase1.status=ready or reconcile an interrupted Phase 1
+  2. Generate the archive summary (LLM)
+  3. Extract and write configured memories and relations (LLM)
+  4. Enqueue and await required semantic/index work
+  5. Update commit metadata
+  6. Write .done last; terminal errors write .failed.json
 ```
 
 **Crash recovery analysis**:
 
 | Failure moment | State | Recovery action |
 |------------|-------|----------------|
-| During Phase 1 archive write | No marker | Incomplete archive; next commit scans history/ for index, unaffected |
-| Phase 1 archive complete but messages not cleared | No marker | Archive complete + messages still present = redundant but safe |
-| During Phase 2 memory extraction/write | Redo marker exists | On startup: redo extraction + write + enqueue from archive |
-| Phase 2 complete | Redo marker deleted | No recovery needed |
+| Before the QueueFS item is durable | Phase 1 raises and records `.failed.json`; the live root has not been rewritten | Caller may retry without losing the original messages |
+| QueueFS item durable, root rewrite not completed | `phase1.status=preparing`; live root still contains archived messages | Worker takes the same session lock, marks the archive failed, and does not process it |
+| Root rewrite durable, `phase1.status=ready` not published | Persisted intent and live root prove whether the rewrite completed | Worker reconciles metadata and publishes `ready` before Phase 2 |
+| During Phase 2 | QueueFS item is not acknowledged if the worker process exits | QueueFS recovers the item; completed steps and archive markers bound replay |
+| Phase 2 complete | `.done` exists | A recovered duplicate skips completed work |
+| Phase 2 reaches a terminal error | `.failed.json` exists | The task is terminal and later archives may continue |
 
 ## LockContext
 
@@ -302,7 +329,7 @@ Where `lock_type` is `E` (EXACT) or `T` (TREE).
 ### Lock Acquisition (EXACT mode)
 
 ```
-loop until timeout (poll interval: 200ms):
+loop until timeout (poll interval: 100ms):
     1. Check if target path is locked by another operation
        - Stale lock? -> remove and retry
        - Active lock? -> wait
@@ -324,7 +351,7 @@ Timeout (default 0 = no-wait) raises LockAcquisitionError
 ### Lock Acquisition (TREE mode)
 
 ```
-loop until timeout (poll interval: 200ms):
+loop until timeout (poll interval: 100ms):
     1. Check if target directory is locked by another operation
        - Stale lock? -> remove and retry
        - Active lock? -> wait
@@ -369,11 +396,14 @@ for conflicts first:
 
 ## Crash Recovery
 
-`LockManager.start()` automatically scans for leftover markers in `/local/_system/redo/` on startup:
+QueueFS workers resume durable work on startup. `LockManager.start()` also scans
+`/local/_system/redo/` for legacy compatibility markers when
+`redo_recovery_enabled` is true:
 
 | Scenario | Recovery action |
 |----------|----------------|
-| session_memory extraction crash | Redo memory extraction + write + enqueue from archive |
+| Current `session.commit` Phase 2 worker exits | QueueFS re-delivers the unacknowledged `SessionCommit` item; archive markers make replay restart-safe |
+| Legacy session-memory redo marker remains | LockManager replays the legacy marker when compatibility recovery is enabled |
 | Crash while holding lock | Lock file remains in AGFS; stale detection auto-cleans on next acquisition (default 1800s / 30-minute expiry) |
 | Crash after enqueue, before worker processes | QueueFS SQLite persistence; worker auto-pulls after restart |
 | Orphan index | Cleaned on L2 on-demand load |
@@ -384,7 +414,8 @@ for conflicts first:
 |-----------------|--------|-----------------|
 | Crash during operation | Lock auto-expires + stale detection | Next acquisition of same path lock |
 | Crash during add_resource semantic processing | Lifecycle lock expires + SemanticProcessor re-acquires on restart | Worker restart |
-| Crash during session.commit Phase 2 | RedoLog marker + redo | On restart |
+| Crash during session.commit Phase 1 | Recoverable intent + authoritative live root reconciliation under the session lock | QueueFS worker |
+| Crash during session.commit Phase 2 | Persistent SessionCommit item + archive `.done` / `.failed.json` markers | QueueFS recovery after restart |
 | Crash after enqueue, before worker | QueueFS SQLite persistence | Worker restart |
 | Orphan index | L2 on-demand load cleanup | When user accesses |
 
@@ -397,7 +428,8 @@ Path locks are enabled by default with no extra configuration needed. **The defa
   "storage": {
     "transaction": {
       "lock_timeout": 5.0,
-      "lock_expire": 1800.0
+      "lock_expire": 1800.0,
+      "redo_recovery_enabled": true
     }
   }
 }
@@ -407,10 +439,13 @@ Path locks are enabled by default with no extra configuration needed. **The defa
 |-----------|------|-------------|---------|
 | `lock_timeout` | float | Lock acquisition timeout (seconds). `0` = fail immediately if locked (default). `> 0` = wait/retry up to this many seconds. | `0.0` |
 | `lock_expire` | float | Lock inactivity threshold (seconds). Locks not refreshed within this window are treated as stale and reclaimed. | `1800.0` |
+| `redo_recovery_enabled` | bool | Enable startup recovery of legacy RedoLog markers. Current session commits use QueueFS recovery independently of this setting. | `true` |
 
 ### QueueFS Persistence
 
-The lock mechanism relies on QueueFS using the SQLite backend to ensure enqueued tasks survive process restarts. This is the default configuration and requires no manual setup.
+Durable background recovery relies on QueueFS using the SQLite backend so enqueued
+tasks survive process restarts. This is the default configuration and requires no
+manual setup.
 
 ## Related Documentation
 
