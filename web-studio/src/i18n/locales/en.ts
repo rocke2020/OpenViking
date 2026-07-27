@@ -1007,6 +1007,8 @@ const en = {
         update: 'Updated',
         delete: 'Deleted',
       },
+      allTypes: 'All',
+      filterByType: 'Filter by memory type',
       before: 'Before',
       after: 'After',
       addedContent: 'Added content',
@@ -1113,7 +1115,6 @@ const en = {
       },
     },
     agent: {
-      autoRetrieve: 'The Agent retrieves on its own from messages and tools',
       history: 'Session history',
       newSession: 'New session',
       creating: 'Creating Playground session...',
@@ -1147,6 +1148,12 @@ const en = {
       },
     },
     terminal: {
+      header: 'Terminal',
+      history: 'Command history',
+      historyTitle: 'Command history',
+      historyDescription: 'Review commands run in this browser.',
+      clearHistory: 'Clear command history',
+      noHistory: 'No command history',
       welcomeTitle: 'Terminal connected to the context tree',
       welcomeBody:
         'Run /status, /ls, /search, /read, /add-resource. /search is global by default; add --scope . to use the current directory, or --scope viking://resources/... to limit it to a directory.',

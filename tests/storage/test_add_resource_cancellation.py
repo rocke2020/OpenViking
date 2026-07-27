@@ -684,7 +684,7 @@ async def test_deferred_target_resolution_updates_rollback_ownership():
         task_id="task-1",
     )
     service = ResourceService()
-    service.add_resource = AsyncMock(
+    service._execute_resource_ingestion = AsyncMock(
         return_value={
             "status": "success",
             "root_uri": "viking://resources/resolved",
@@ -728,7 +728,7 @@ async def test_execute_job_does_not_repeat_durable_rollback_target_update():
     service = ResourceService()
     ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
 
-    async def add_resource(**_kwargs):
+    async def execute_resource_ingestion(**_kwargs):
         await service._persist_add_resource_rollback_target(
             "task-1",
             {"root_uri": "viking://resources/resolved"},
@@ -741,7 +741,7 @@ async def test_execute_job_does_not_repeat_durable_rollback_target_update():
             "_target_created": True,
         }
 
-    service.add_resource = AsyncMock(side_effect=add_resource)
+    service._execute_resource_ingestion = AsyncMock(side_effect=execute_resource_ingestion)
     msg = AddResourceMsg(
         task_id="task-1",
         root_uri="viking://resources/placeholder",
@@ -809,12 +809,12 @@ async def test_deferred_target_is_persisted_before_next_cancellation_stage():
         raise AddResourceTaskCancelled
 
     with pytest.raises(AddResourceTaskCancelled):
-        await service.add_resource(
+        await service._execute_resource_ingestion(
             path="/tmp/demo.txt",
             ctx=ctx,
             to="viking://resources/placeholder",
             wait=True,
-            skip_watch_management=True,
+            manage_watch=False,
             source_task_id="task-1",
             stage_callback=cancel_at_processing_queue,
         )
@@ -834,7 +834,7 @@ async def test_deferred_target_resolution_survives_restart_for_rollback(monkeypa
     service = ResourceService()
     ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
 
-    async def add_resource(**_kwargs):
+    async def execute_resource_ingestion(**_kwargs):
         await service._persist_add_resource_rollback_target(
             "task-1",
             {"root_uri": "viking://resources/resolved"},
@@ -847,7 +847,7 @@ async def test_deferred_target_resolution_survives_restart_for_rollback(monkeypa
             "_target_created": True,
         }
 
-    service.add_resource = AsyncMock(side_effect=add_resource)
+    service._execute_resource_ingestion = AsyncMock(side_effect=execute_resource_ingestion)
     msg = AddResourceMsg(
         task_id="task-1",
         root_uri="viking://resources/placeholder",
@@ -921,7 +921,7 @@ async def test_recovered_deferred_target_replays_exact_persisted_uri():
         user_id="alice",
     )
     service = ResourceService()
-    service.add_resource = AsyncMock(
+    service._execute_resource_ingestion = AsyncMock(
         return_value={
             "status": "success",
             "root_uri": "viking://resources/resolved",
@@ -946,8 +946,10 @@ async def test_recovered_deferred_target_replays_exact_persisted_uri():
         stage_callback=AsyncMock(),
     )
 
-    assert service.add_resource.await_args.kwargs["to"] == "viking://resources/resolved"
-    assert service.add_resource.await_args.kwargs["parent"] is None
+    assert (
+        service._execute_resource_ingestion.await_args.kwargs["to"] == "viking://resources/resolved"
+    )
+    assert service._execute_resource_ingestion.await_args.kwargs["parent"] is None
 
 
 @pytest.mark.asyncio
@@ -976,7 +978,7 @@ async def test_recovered_pending_materialization_replays_under_tree_lock():
         user_id="alice",
     )
     service = ResourceService()
-    service.add_resource = AsyncMock(
+    service._execute_resource_ingestion = AsyncMock(
         return_value={
             "status": "success",
             "root_uri": "viking://resources/resolved",
@@ -1001,9 +1003,10 @@ async def test_recovered_pending_materialization_replays_under_tree_lock():
         stage_callback=AsyncMock(),
     )
 
-    assert service.add_resource.await_args.kwargs["to"] == "viking://resources/resolved"
-    assert service.add_resource.await_args.kwargs["target_created"] is None
-    assert service.add_resource.await_args.kwargs["target_materialization_pending"] is True
+    call = service._execute_resource_ingestion.await_args
+    assert call.kwargs["to"] == "viking://resources/resolved"
+    assert call.kwargs["target_created"] is None
+    assert call.kwargs["target_materialization_pending"] is True
     assert msg.target_created is None
 
 

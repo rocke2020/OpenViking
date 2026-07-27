@@ -973,6 +973,8 @@ const zhCN = {
         update: '更新',
         delete: '删除',
       },
+      allTypes: '全部',
+      filterByType: '按记忆分类筛选',
       before: '变更前',
       after: '变更后',
       addedContent: '新增内容',
@@ -1072,7 +1074,6 @@ const zhCN = {
       },
     },
     agent: {
-      autoRetrieve: 'Agent 会根据消息和工具自主检索',
       history: '历史会话',
       newSession: '新建会话',
       creating: '正在创建 Playground 会话...',
@@ -1105,6 +1106,12 @@ const zhCN = {
       },
     },
     terminal: {
+      header: '终端',
+      history: '命令历史',
+      historyTitle: '命令历史',
+      historyDescription: '查看当前浏览器中执行过的命令。',
+      clearHistory: '清空命令历史',
+      noHistory: '暂无命令历史',
       welcomeTitle: 'Terminal 已连接上下文目录',
       welcomeBody:
         '可执行 /status、/ls、/search、/read、/add-resource。/search 默认全局检索，可通过 --scope . 使用当前目录，或通过 --scope viking://resources/... 指定目录。',

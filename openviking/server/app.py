@@ -223,6 +223,10 @@ def create_app(
         if callable(usage_reporter_setter):
             usage_reporter_setter(_get_usage_reporter())
 
+        agent_evolution_setter = getattr(sessions, "set_agent_evolution_config", None)
+        if callable(agent_evolution_setter):
+            agent_evolution_setter(config.agent_evolution)
+
     if service is not None:
         _configure_session_runtime(service)
 
