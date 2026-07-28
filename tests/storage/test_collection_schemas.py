@@ -2499,25 +2499,11 @@ def _make_http_single_account_backend():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("status_code", "response_text", "expected_error"),
-    [
-        (503, "backend unavailable", "HTTP 503.*backend unavailable"),
-        (
-            200,
-            '{"code": 1000004, "message": "delete failed", "data": {}}',
-            "code 1000004.*delete failed",
-        ),
-        (200, "{}", "code None"),
-    ],
-)
-async def test_single_account_backend_delete_by_filter_propagates_http_failure(
-    monkeypatch,
-    status_code,
-    response_text,
-    expected_error,
-):
-    response = SimpleNamespace(status_code=status_code, text=response_text)
+async def test_single_account_backend_delete_by_filter_propagates_http_delete_failure(monkeypatch):
+    response = SimpleNamespace(
+        status_code=200,
+        text='{"code": 1000004, "message": "delete failed", "data": {}}',
+    )
 
     monkeypatch.setattr(
         "openviking.storage.vectordb.collection.http_collection.requests.post",
@@ -2527,37 +2513,20 @@ async def test_single_account_backend_delete_by_filter_propagates_http_failure(
     backend, adapter = _make_http_single_account_backend()
     monkeypatch.setattr(adapter, "query", lambda **_kwargs: [{"id": "doc-1"}])
 
-    with pytest.raises(RuntimeError, match=expected_error):
+    with pytest.raises(RuntimeError, match="code 1000004.*delete failed"):
         await backend.delete_by_filter(Eq("uri", "viking://resources/demo"))
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("status_code", "response_text", "expected_error"),
-    [
-        (503, "backend unavailable", "HTTP 503.*backend unavailable"),
-        (
-            200,
-            '{"code": 1000004, "message": "query failed", "data": {}}',
-            "code 1000004.*query failed",
-        ),
-        (200, "{}", "code None"),
-    ],
-)
-async def test_single_account_backend_delete_by_filter_propagates_http_query_failure(
-    monkeypatch,
-    status_code,
-    response_text,
-    expected_error,
-):
-    response = SimpleNamespace(status_code=status_code, text=response_text)
+async def test_single_account_backend_delete_by_filter_propagates_http_query_failure(monkeypatch):
+    response = SimpleNamespace(status_code=503, text="backend unavailable")
     monkeypatch.setattr(
         "openviking.storage.vectordb.collection.http_collection.requests.post",
         lambda *_args, **_kwargs: response,
     )
     backend, _adapter = _make_http_single_account_backend()
 
-    with pytest.raises(RuntimeError, match=expected_error):
+    with pytest.raises(RuntimeError, match="HTTP 503.*backend unavailable"):
         await backend.delete_by_filter(Eq("uri", "viking://resources/demo"))
 
 

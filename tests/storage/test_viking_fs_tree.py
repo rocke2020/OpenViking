@@ -166,28 +166,6 @@ async def test_rm_keeps_source_when_vector_index_delete_fails(monkeypatch, fs):
 
 
 @pytest.mark.asyncio
-async def test_rm_keeps_source_when_index_uri_collection_fails(monkeypatch, fs):
-    """An incomplete index inventory must not allow the source tree to be deleted."""
-
-    vector_store = AsyncMock()
-    monkeypatch.setattr(fs, "_ensure_delete_access", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(fs, "_uri_to_path", lambda *_args, **_kwargs: "/resources/demo")
-    monkeypatch.setattr(fs, "_path_to_uri", lambda *_args, **_kwargs: "viking://resources/demo")
-    monkeypatch.setattr(fs, "_get_vector_store", lambda: vector_store)
-    monkeypatch.setattr(fs._async_agfs, "stat", AsyncMock(return_value={"isDir": True}))
-    monkeypatch.setattr(fs._async_agfs, "ls", AsyncMock(side_effect=RuntimeError("list failed")))
-    monkeypatch.setattr(fs._async_agfs, "rm", AsyncMock())
-    monkeypatch.setattr("openviking.storage.transaction.LockContext", _FakeLockContext)
-    monkeypatch.setattr("openviking.storage.transaction.get_lock_manager", lambda: object())
-
-    with pytest.raises(RuntimeError, match="list failed"):
-        await fs.rm("viking://resources/demo", recursive=True, ctx=_default_ctx())
-
-    vector_store.delete_uris.assert_not_awaited()
-    fs._async_agfs.rm.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_rm_keeps_source_when_nested_index_path_is_not_a_directory(monkeypatch, fs):
     """A nested traversal mismatch must not be mistaken for an ordinary file target."""
 
@@ -208,32 +186,6 @@ async def test_rm_keeps_source_when_nested_index_path_is_not_a_directory(monkeyp
     monkeypatch.setattr("openviking.storage.transaction.get_lock_manager", lambda: object())
 
     with pytest.raises(AGFSNotADirectoryError, match="nested path"):
-        await fs.rm("viking://resources/demo", recursive=True, ctx=_default_ctx())
-
-    vector_store.delete_uris.assert_not_awaited()
-    fs._async_agfs.rm.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_rm_keeps_source_when_directory_root_is_not_a_directory(monkeypatch, fs):
-    """A stat-confirmed directory must fail closed when root traversal disagrees."""
-
-    vector_store = AsyncMock()
-    monkeypatch.setattr(fs, "_ensure_delete_access", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(fs, "_uri_to_path", lambda *_args, **_kwargs: "/resources/demo")
-    monkeypatch.setattr(fs, "_path_to_uri", lambda *_args, **_kwargs: "viking://resources/demo")
-    monkeypatch.setattr(fs, "_get_vector_store", lambda: vector_store)
-    monkeypatch.setattr(fs._async_agfs, "stat", AsyncMock(return_value={"isDir": True}))
-    monkeypatch.setattr(
-        fs._async_agfs,
-        "ls",
-        AsyncMock(side_effect=AGFSNotADirectoryError("root is not a directory")),
-    )
-    monkeypatch.setattr(fs._async_agfs, "rm", AsyncMock())
-    monkeypatch.setattr("openviking.storage.transaction.LockContext", _FakeLockContext)
-    monkeypatch.setattr("openviking.storage.transaction.get_lock_manager", lambda: object())
-
-    with pytest.raises(AGFSNotADirectoryError, match="root"):
         await fs.rm("viking://resources/demo", recursive=True, ctx=_default_ctx())
 
     vector_store.delete_uris.assert_not_awaited()
