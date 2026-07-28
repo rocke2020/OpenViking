@@ -58,7 +58,6 @@ class LockHandle:
 **LockManager** 是全局单例，管理锁生命周期：
 - 创建/释放 LockHandle
 - 后台清理泄漏的锁（进程内安全网）
-- 启动时执行旧版 RedoLog 的兼容恢复
 
 **LockContext** 是异步上下文管理器，封装加锁/解锁生命周期：
 
@@ -81,14 +80,7 @@ async with LockContext(get_lock_manager(), [path], lock_mode="exact") as handle:
 - Phase 2 最后写入 `.done`；重放看到 `.done` 时跳过已完成任务。
 - 终态失败写入 `.failed.json`，其中包含失败阶段和已经完成的 memory 步骤。
 
-启用兼容恢复时，`LockManager` 启动后仍会扫描旧版 RedoLog 路径：
-
-```text
-/local/_system/redo/{task_id}/redo.json
-```
-
-该路径只用于恢复旧版本创建的标记；新的 session commit 依赖 QueueFS 和
-archive 标记。
+崩溃恢复不使用 redo log，而是依赖 QueueFS 重新投递和上述 archive 标记。
 
 ## 一致性问题与解决方案
 
@@ -400,13 +392,11 @@ fencing token 校验通过的一方成功持有 `TreeLock(java-guide)`；失败�
 
 ## 崩溃恢复
 
-QueueFS worker 启动后恢复持久化任务。启用 `redo_recovery_enabled` 时，
-`LockManager.start()` 还会扫描 `/local/_system/redo/` 中的旧版兼容标记：
+QueueFS worker 启动后恢复持久化任务：
 
 | 场景 | 恢复方式 |
 |------|---------|
 | 当前 `session.commit` Phase 2 worker 退出 | QueueFS 重新投递未 ACK 的 `SessionCommit` 任务；archive 标记保证重放可安全恢复 |
-| 遗留旧版 session-memory redo 标记 | 启用兼容恢复时，LockManager 重放旧版标记 |
 | 锁持有期间崩溃 | 锁文件留在 AGFS，下次获取时 stale 检测自动清理（默认 1800s / 30 分钟过期）|
 | enqueue 后 worker 处理前崩溃 | QueueFS SQLite 持久化，worker 重启后自动拉取 |
 | 孤儿索引 | L2 按需加载时清理 |
@@ -431,8 +421,7 @@ QueueFS worker 启动后恢复持久化任务。启用 `redo_recovery_enabled` �
   "storage": {
     "transaction": {
       "lock_timeout": 5.0,
-      "lock_expire": 1800.0,
-      "redo_recovery_enabled": true
+      "lock_expire": 1800.0
     }
   }
 }
@@ -442,7 +431,7 @@ QueueFS worker 启动后恢复持久化任务。启用 `redo_recovery_enabled` �
 |------|------|------|--------|
 | `lock_timeout` | float | 获取锁的等待超时（秒）。`0` = 立即失败（默认）；`> 0` = 最多等待此时间 | `0.0` |
 | `lock_expire` | float | 锁失活阈值（秒），超过此时间未被 refresh 的锁会被视为陈旧锁并回收 | `1800.0` |
-| `redo_recovery_enabled` | bool | 启用旧版 RedoLog 标记的启动恢复。当前 session commit 使用独立的 QueueFS 恢复，不受该配置影响 | `true` |
+| `redo_recovery_enabled` | bool | 已弃用且无实际效果的兼容字段；session commit 使用持久化 QueueFS 任务恢复 | `true` |
 
 ### QueueFS 持久化
 

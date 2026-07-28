@@ -59,7 +59,6 @@ class LockHandle:
 **LockManager** is a global singleton managing lock lifecycle:
 - Creates/releases LockHandles
 - Background cleanup of leaked locks (in-process safety net)
-- Executes legacy RedoLog compatibility recovery on startup
 
 **LockContext** is an async context manager encapsulating the lock/unlock lifecycle:
 
@@ -84,15 +83,8 @@ plus archive-local state:
 - Terminal failures write `.failed.json`, including the failed stage and any
   completed memory steps.
 
-`LockManager` still scans the legacy RedoLog location on startup when compatibility
-recovery is enabled:
-
-```text
-/local/_system/redo/{task_id}/redo.json
-```
-
-That path recovers markers created by older versions; new session commits rely on
-QueueFS and archive markers instead.
+Crash recovery does not use a redo log. It relies on QueueFS redelivery and the
+archive markers above.
 
 ## Consistency Issues and Solutions
 
@@ -396,14 +388,11 @@ for conflicts first:
 
 ## Crash Recovery
 
-QueueFS workers resume durable work on startup. `LockManager.start()` also scans
-`/local/_system/redo/` for legacy compatibility markers when
-`redo_recovery_enabled` is true:
+QueueFS workers resume durable work on startup:
 
 | Scenario | Recovery action |
 |----------|----------------|
 | Current `session.commit` Phase 2 worker exits | QueueFS re-delivers the unacknowledged `SessionCommit` item; archive markers make replay restart-safe |
-| Legacy session-memory redo marker remains | LockManager replays the legacy marker when compatibility recovery is enabled |
 | Crash while holding lock | Lock file remains in AGFS; stale detection auto-cleans on next acquisition (default 1800s / 30-minute expiry) |
 | Crash after enqueue, before worker processes | QueueFS SQLite persistence; worker auto-pulls after restart |
 | Orphan index | Cleaned on L2 on-demand load |
@@ -428,8 +417,7 @@ Path locks are enabled by default with no extra configuration needed. **The defa
   "storage": {
     "transaction": {
       "lock_timeout": 5.0,
-      "lock_expire": 1800.0,
-      "redo_recovery_enabled": true
+      "lock_expire": 1800.0
     }
   }
 }
@@ -439,7 +427,7 @@ Path locks are enabled by default with no extra configuration needed. **The defa
 |-----------|------|-------------|---------|
 | `lock_timeout` | float | Lock acquisition timeout (seconds). `0` = fail immediately if locked (default). `> 0` = wait/retry up to this many seconds. | `0.0` |
 | `lock_expire` | float | Lock inactivity threshold (seconds). Locks not refreshed within this window are treated as stale and reclaimed. | `1800.0` |
-| `redo_recovery_enabled` | bool | Enable startup recovery of legacy RedoLog markers. Current session commits use QueueFS recovery independently of this setting. | `true` |
+| `redo_recovery_enabled` | bool | Deprecated compatibility field with no effect; session commit recovery uses persistent QueueFS tasks | `true` |
 
 ### QueueFS Persistence
 
