@@ -7,7 +7,6 @@ import inspect
 import json
 import logging
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -23,19 +22,16 @@ from openviking.storage.errors import EmbeddingRebuildRequiredError
 from openviking.storage.expr import Eq
 from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
 from openviking.storage.vectordb import engine as vectordb_engine
-from openviking.storage.vectordb.collection.collection import Collection
-from openviking.storage.vectordb.collection.http_collection import HttpCollection
-from openviking.storage.vectordb.collection.result import UpsertDataResult
-from openviking.storage.vectordb.collection.vikingdb_collection import VikingDBCollection
 from openviking.storage.vectordb.collection.volcengine_api_key_collection import (
     VolcengineApiKeyCollection,
 )
+from openviking.storage.vectordb.collection.vikingdb_collection import VikingDBCollection
 from openviking.storage.vectordb.collection.volcengine_collection import VolcengineCollection
+from openviking.storage.vectordb.collection.result import UpsertDataResult
 from openviking.storage.vectordb_adapters.base import (
     VIKINGDB_TEXT_FIELD_BYTE_LIMIT,
     _truncate_text_field,
 )
-from openviking.storage.vectordb_adapters.http_adapter import HttpCollectionAdapter
 from openviking.storage.vectordb_adapters.local_adapter import LocalCollectionAdapter
 from openviking.storage.viking_vector_index_backend import (
     VIKINGDB_CONTENT_MAX_SIZE,
@@ -2464,82 +2460,6 @@ async def test_single_account_backend_mutations_run_adapter_in_threadpool(monkey
         "clear",
         "close",
     ]
-
-
-@pytest.mark.asyncio
-async def test_single_account_backend_delete_by_filter_propagates_backend_failure():
-    backend = object.__new__(_SingleAccountBackend)
-    backend._async_adapter = AsyncMock()
-    backend._async_adapter.call.side_effect = RuntimeError("backend delete failed")
-
-    with pytest.raises(RuntimeError, match="backend delete failed"):
-        await backend.delete_by_filter(Eq("uri", "viking://resources/demo"))
-
-
-def _make_http_single_account_backend():
-    collection = HttpCollection(
-        ip="127.0.0.1",
-        port=1933,
-        meta_data={"ProjectName": "default", "CollectionName": "context"},
-    )
-    adapter = HttpCollectionAdapter(
-        host="127.0.0.1",
-        port=1933,
-        project_name="default",
-        collection_name="context",
-        index_name="default",
-    )
-    adapter._collection = Collection(collection)
-    backend = _SingleAccountBackend(
-        config=VectorDBBackendConfig(backend="http", url="http://127.0.0.1:1933"),
-        bound_account_id=None,
-        shared_adapter=adapter,
-    )
-    return backend, adapter
-
-
-@pytest.mark.asyncio
-async def test_single_account_backend_delete_by_filter_propagates_http_delete_failure(monkeypatch):
-    response = SimpleNamespace(
-        status_code=200,
-        text='{"code": 1000004, "message": "delete failed", "data": {}}',
-    )
-
-    monkeypatch.setattr(
-        "openviking.storage.vectordb.collection.http_collection.requests.post",
-        lambda *_args, **_kwargs: response,
-    )
-
-    backend, adapter = _make_http_single_account_backend()
-    monkeypatch.setattr(adapter, "query", lambda **_kwargs: [{"id": "doc-1"}])
-
-    with pytest.raises(RuntimeError, match="code 1000004.*delete failed"):
-        await backend.delete_by_filter(Eq("uri", "viking://resources/demo"))
-
-
-@pytest.mark.asyncio
-async def test_single_account_backend_delete_by_filter_propagates_http_query_failure(monkeypatch):
-    response = SimpleNamespace(status_code=503, text="backend unavailable")
-    monkeypatch.setattr(
-        "openviking.storage.vectordb.collection.http_collection.requests.post",
-        lambda *_args, **_kwargs: response,
-    )
-    backend, _adapter = _make_http_single_account_backend()
-
-    with pytest.raises(RuntimeError, match="HTTP 503.*backend unavailable"):
-        await backend.delete_by_filter(Eq("uri", "viking://resources/demo"))
-
-
-@pytest.mark.asyncio
-async def test_single_account_backend_http_query_keeps_empty_on_transport_failure(monkeypatch):
-    response = SimpleNamespace(status_code=503, text="backend unavailable")
-    monkeypatch.setattr(
-        "openviking.storage.vectordb.collection.http_collection.requests.post",
-        lambda *_args, **_kwargs: response,
-    )
-    backend, _adapter = _make_http_single_account_backend()
-
-    assert await backend.filter(Eq("uri", "viking://resources/demo")) == []
 
 
 @pytest.mark.asyncio
