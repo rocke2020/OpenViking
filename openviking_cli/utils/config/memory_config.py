@@ -69,6 +69,21 @@ class MemoryConfig(BaseModel):
             "stateless deployments."
         ),
     )
+    phase2_window_max_tokens: int = Field(
+        default=12_000,
+        ge=256,
+        description=(
+            "Maximum estimated tokens in one loss-preserving session commit Phase 2 input window."
+        ),
+    )
+    extraction_request_max_tokens: int = Field(
+        default=32_768,
+        ge=256,
+        description=(
+            "Maximum estimated input tokens allowed immediately before a "
+            "Phase 2 memory model request."
+        ),
+    )
     session_skill_extraction_enabled: bool = Field(
         default=False,
         description=(
@@ -106,6 +121,15 @@ class MemoryConfig(BaseModel):
                     "use session memory_policy.working_memory.enabled to control archive summaries"
                 )
         return data
+
+    @model_validator(mode="after")
+    def validate_phase2_request_budget(self) -> "MemoryConfig":
+        if self.extraction_request_max_tokens < self.phase2_window_max_tokens:
+            raise ValueError(
+                "memory.extraction_request_max_tokens must be greater than or equal to "
+                "memory.phase2_window_max_tokens"
+            )
+        return self
 
     @field_validator("version", mode="before")
     @classmethod

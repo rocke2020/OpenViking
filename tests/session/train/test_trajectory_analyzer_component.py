@@ -155,6 +155,7 @@ async def test_trajectory_rollout_analyzer_extracts_and_persists_trajectory(monk
             account_id="default",
         ),
         source_archive_uri="viking://user/u/sessions/s1/history/archive_001",
+        request_max_tokens=321,
     )
 
     analysis = await analyzer.analyze(_rollout(), context)
@@ -162,7 +163,9 @@ async def test_trajectory_rollout_analyzer_extracts_and_persists_trajectory(monk
     assert FakeExtractLoop.created
     created_loop = FakeExtractLoop.created[0]
     assert created_loop._transaction_handle is None
+    assert created_loop.kwargs["request_max_tokens"] == 321
     provider = created_loop.kwargs["context_provider"]
+    assert provider._request_max_tokens == 321
     assert provider._transaction_handle is None
     assert [
         schema.memory_type for schema in provider.get_memory_schemas(context.request_context)

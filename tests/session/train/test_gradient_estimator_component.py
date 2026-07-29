@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
-import asyncio
 import pytest
 
 from openviking.session.memory.dataclass import MemoryFile
@@ -78,7 +78,11 @@ def _experience_set() -> ExperienceSet:
 
 
 def _context() -> ExperienceGradientContext:
-    return ExperienceGradientContext(request_context=SimpleNamespace(), messages=[])
+    return ExperienceGradientContext(
+        request_context=SimpleNamespace(),
+        messages=[],
+        request_max_tokens=321,
+    )
 
 
 @pytest.mark.asyncio
@@ -263,8 +267,10 @@ async def test_experience_gradient_estimator_runs_extract_loop(monkeypatch):
         "messages": context.messages,
         "trajectory_summary": analysis.trajectories[0].content,
         "trajectory_uri": analysis.trajectories[0].uri,
+        "request_max_tokens": 321,
     }
     assert captured["request_context"] is context.request_context
     assert captured["allowed_memory_types"] == {"experiences"}
     assert captured["prepare_messages_called"] is True
     assert captured["extract_loop_kwargs"]["context_provider"]._isolation_handler is not None
+    assert captured["extract_loop_kwargs"]["request_max_tokens"] == 321

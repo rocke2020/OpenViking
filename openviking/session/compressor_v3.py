@@ -79,6 +79,7 @@ from openviking.session.train import (
 )
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.telemetry import tracer
+from openviking_cli.exceptions import NotFoundError
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config import get_openviking_config
 
@@ -92,6 +93,10 @@ _TRAINING_CASE_SPEC_PROTOCOL = "openviking.batch_train.case_spec.v1"
 _TRAINING_CASE_SPEC_HEADER = "# OpenViking Batch Training CaseSpec v1"
 _TRAINING_FAST_PATH_MEMORY_TYPES = frozenset({"cases", "trajectories", "experiences"})
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+
+
+def _request_budget_kwargs(request_max_tokens: Optional[int]) -> dict[str, int]:
+    return {"request_max_tokens": request_max_tokens} if request_max_tokens is not None else {}
 
 
 async def _commit_experience_snapshot(
@@ -160,6 +165,7 @@ class SessionCompressorV3:
         latest_archive_overview: str = "",
         isolation_handler: Optional[MemoryIsolationHandler] = None,
         transaction_handle=None,
+        request_max_tokens: Optional[int] = None,
     ) -> ExtractLoop:
         config = get_openviking_config()
         vlm = config.vlm.get_vlm_instance()
@@ -171,6 +177,7 @@ class SessionCompressorV3:
             ctx=ctx,
             viking_fs=viking_fs,
             transaction_handle=transaction_handle,
+            request_max_tokens=request_max_tokens,
         )
         return ExtractLoop(
             vlm=vlm,
@@ -178,6 +185,7 @@ class SessionCompressorV3:
             ctx=ctx,
             context_provider=context_provider,
             isolation_handler=isolation_handler,
+            request_max_tokens=request_max_tokens,
         )
 
     def _get_or_create_updater(self, registry, transaction_handle=None) -> MemoryUpdater:
@@ -302,6 +310,8 @@ class SessionCompressorV3:
         agent_evolution_enabled: bool = True,
         allow_self_memory: bool = True,
         allowed_peer_ids: Optional[set[str]] = None,
+        request_max_tokens: Optional[int] = None,
+        publish_memory_diff: bool = True,
     ):
         if not agent_evolution_enabled:
             effective_types = (
@@ -323,6 +333,8 @@ class SessionCompressorV3:
                 strict_extract_errors=strict_extract_errors,
                 agent_evolution_enabled=agent_evolution_enabled,
                 allowed_memory_types=allowed_memory_types,
+                request_max_tokens=request_max_tokens,
+                publish_memory_diff=publish_memory_diff,
             )
 
         result = await self._extract_user_memories(
@@ -336,6 +348,7 @@ class SessionCompressorV3:
             allowed_memory_types=allowed_memory_types,
             allow_self_memory=allow_self_memory,
             allowed_peer_ids=allowed_peer_ids,
+            request_max_tokens=request_max_tokens,
         )
         agent_memory_types = _allowed_agent_memory_types(allowed_memory_types)
         cases_allowed = allowed_memory_types is None or _CASES_MEMORY_TYPE in allowed_memory_types
@@ -355,6 +368,7 @@ class SessionCompressorV3:
                 strict_extract_errors=strict_extract_errors,
                 collect_memory_diff=True,
                 allowed_memory_types=agent_memory_types,
+                request_max_tokens=request_max_tokens,
             )
         elif not agent_evolution_enabled and allow_self_memory and session_skills_enabled:
             train_result = await self.extract_session_skills(
@@ -362,6 +376,7 @@ class SessionCompressorV3:
                 ctx=ctx,
                 archive_uri=archive_uri or "",
                 strict_extract_errors=strict_extract_errors,
+                request_max_tokens=request_max_tokens,
             )
         else:
             train_result = {
@@ -373,18 +388,24 @@ class SessionCompressorV3:
                     else "memory_types_filtered"
                 ),
             }
-        await self._write_final_memory_diff(
+        memory_diff = await self._write_final_memory_diff(
             archive_uri=archive_uri or "",
             ctx=ctx,
             memory_diffs=[
                 getattr(result, "memory_diff", None),
                 train_result.get("memory_diff"),
             ],
+            publish=publish_memory_diff,
         )
-        return _v3_extraction_response(
+        response = _v3_extraction_response(
             contexts=result.contexts,
             train_result=train_result,
             archive_uri=archive_uri or "",
+        )
+        return (
+            response
+            if publish_memory_diff
+            else _v3_response_with_memory_diff(response, memory_diff)
         )
 
     async def _commit_training_case_fast_path(
@@ -398,6 +419,8 @@ class SessionCompressorV3:
         strict_extract_errors: bool,
         agent_evolution_enabled: bool,
         allowed_memory_types: Optional[set[str]],
+        request_max_tokens: Optional[int],
+        publish_memory_diff: bool,
     ) -> dict[str, Any]:
         if ctx is None:
             logger.warning("No RequestContext provided, skipping training case fast path")
@@ -421,6 +444,7 @@ class SessionCompressorV3:
                 strict_extract_errors=strict_extract_errors,
                 collect_memory_diff=True,
                 allowed_memory_types=agent_memory_types,
+                request_max_tokens=request_max_tokens,
             )
         else:
             train_result = {
@@ -428,18 +452,24 @@ class SessionCompressorV3:
                 "submitted": 0,
                 "reason": "agent_evolution_disabled",
             }
-        await self._write_final_memory_diff(
+        memory_diff = await self._write_final_memory_diff(
             archive_uri=archive_uri,
             ctx=ctx,
             memory_diffs=[
                 _applied_memory_diff(case_write),
                 train_result.get("memory_diff"),
             ],
+            publish=publish_memory_diff,
         )
-        return _v3_extraction_response(
+        response = _v3_extraction_response(
             contexts=contexts,
             train_result=train_result,
             archive_uri=archive_uri,
+        )
+        return (
+            response
+            if publish_memory_diff
+            else _v3_response_with_memory_diff(response, memory_diff)
         )
 
     @tracer("train.compressor_v3.fast_path.write_case", ignore_result=True, ignore_args=True)
@@ -529,6 +559,7 @@ class SessionCompressorV3:
         allowed_memory_types: Optional[set[str]] = None,
         allow_self_memory: bool = True,
         allowed_peer_ids: Optional[set[str]] = None,
+        request_max_tokens: Optional[int] = None,
     ) -> "_V3ExtractionResult":
         del user
         if not messages:
@@ -566,6 +597,7 @@ class SessionCompressorV3:
             latest_archive_overview=latest_archive_overview,
             isolation_handler=isolation_handler,
             transaction_handle=None,
+            request_max_tokens=request_max_tokens,
         )
         operations, _tools_used = await orchestrator.run()
         if operations is None:
@@ -587,6 +619,7 @@ class SessionCompressorV3:
                 messages=list(messages),
                 ctx=ctx,
                 strict_extract_errors=strict_extract_errors,
+                request_max_tokens=request_max_tokens,
                 isolation_options={
                     "allowed_memory_types": allowed_memory_types,
                     "allow_self": allow_self_memory,
@@ -642,6 +675,7 @@ class SessionCompressorV3:
         ctx: Optional[RequestContext],
         archive_uri: str = "",
         strict_extract_errors: bool = False,
+        request_max_tokens: Optional[int] = None,
     ) -> dict[str, Any]:
         """Extract reusable skills without producing Agent Evolution memories."""
         if not messages or ctx is None:
@@ -665,6 +699,7 @@ class SessionCompressorV3:
                 include_trajectories=False,
                 include_session_skills=True,
                 source_archive_uri=archive_uri,
+                **_request_budget_kwargs(request_max_tokens),
             )
             skill_gradients = [
                 gradient
@@ -686,8 +721,12 @@ class SessionCompressorV3:
                 messages=messages,
                 strict_extract_errors=strict_extract_errors,
                 archive_uri=archive_uri,
+                request_max_tokens=request_max_tokens,
             )
-            training_result = await skill_trainer.submit_gradients(skill_gradients)
+            training_result = await skill_trainer.submit_gradients(
+                skill_gradients,
+                **_request_budget_kwargs(request_max_tokens),
+            )
             apply_result = getattr(training_result, "apply_result", None)
             skill_uris = [
                 str(uri) for uri in list(getattr(apply_result, "written_uris", []) or []) if uri
@@ -712,6 +751,7 @@ class SessionCompressorV3:
         messages: list[Message],
         strict_extract_errors: bool,
         archive_uri: str,
+        request_max_tokens: Optional[int],
     ) -> Any:
         skill_root_uri = _skill_root_uri(ctx)
         skill_policy_set = await SkillSetLoader(viking_fs=viking_fs).load(
@@ -723,6 +763,7 @@ class SessionCompressorV3:
             strict_extract_errors=strict_extract_errors,
             include_session_skills=True,
             source_archive_uri=archive_uri,
+            request_max_tokens=request_max_tokens,
         )
         return await get_streaming_policy_trainer(
             key=_skill_trainer_key(ctx),
@@ -745,9 +786,11 @@ class SessionCompressorV3:
                     request_context=ctx,
                     messages=list(messages),
                     strict_extract_errors=strict_extract_errors,
+                    request_max_tokens=request_max_tokens,
                 ),
                 optimization_context=PatchMergePolicyOptimizerContext(
                     request_context=ctx,
+                    request_max_tokens=request_max_tokens,
                 ),
                 apply_context=ctx,
             ),
@@ -767,6 +810,7 @@ class SessionCompressorV3:
         strict_extract_errors: bool = False,
         collect_memory_diff: bool = False,
         allowed_memory_types: Optional[set[str]] = None,
+        request_max_tokens: Optional[int] = None,
     ) -> dict[str, Any]:
         if not messages or ctx is None:
             return {"case_count": 0, "submitted": 0, "reason": "missing_messages_or_ctx"}
@@ -794,17 +838,22 @@ class SessionCompressorV3:
                 exp_root_uri,
                 ctx=ctx,
             )
-            optimizer_context = PatchMergePolicyOptimizerContext(request_context=ctx)
+            optimizer_context = PatchMergePolicyOptimizerContext(
+                request_context=ctx,
+                request_max_tokens=request_max_tokens,
+            )
             gradient_context = ExperienceGradientContext(
                 request_context=ctx,
                 messages=list(messages),
                 strict_extract_errors=strict_extract_errors,
+                request_max_tokens=request_max_tokens,
             )
             analysis_context = TrajectoryAnalyzerContext(
                 request_context=ctx,
                 strict_extract_errors=strict_extract_errors,
                 include_session_skills=skill_enabled,
                 source_archive_uri=archive_uri or "",
+                request_max_tokens=request_max_tokens,
             )
             exp_trainer = await get_streaming_policy_trainer(
                 key=make_streaming_policy_trainer_key(
@@ -839,6 +888,7 @@ class SessionCompressorV3:
                     messages=messages,
                     strict_extract_errors=strict_extract_errors,
                     archive_uri=archive_uri,
+                    request_max_tokens=request_max_tokens,
                 )
 
             submitted = 0
@@ -879,6 +929,7 @@ class SessionCompressorV3:
                         exp_gradients,
                         analysis=analysis,
                         rollout=rollout,
+                        **_request_budget_kwargs(request_max_tokens),
                     )
                 if case_uri:
                     await self._link_case_to_training_outputs(
@@ -910,6 +961,7 @@ class SessionCompressorV3:
                             skill_gradients,
                             analysis=analysis,
                             rollout=rollout,
+                            **_request_budget_kwargs(request_max_tokens),
                         )
                         skill_submitted += 1
                         apply_result = getattr(skill_training_result, "apply_result", None)
@@ -1087,20 +1139,56 @@ class SessionCompressorV3:
         archive_uri: str,
         ctx: Optional[RequestContext],
         memory_diffs: list[Any],
-    ) -> None:
-        if not archive_uri or ctx is None:
-            return
+        publish: bool = True,
+    ) -> dict[str, Any]:
         merged = _merge_memory_diffs(
             [diff for diff in memory_diffs if isinstance(diff, dict)],
             archive_uri=archive_uri,
         )
+        if not publish or not archive_uri or ctx is None:
+            return merged
         viking_fs = get_viking_fs()
         if viking_fs is None:
-            return
+            return merged
         await viking_fs.write_file(
             uri=f"{archive_uri.rstrip('/')}/memory_diff.json",
             content=json.dumps(merged, ensure_ascii=False, indent=4),
             ctx=ctx,
+        )
+        return merged
+
+    async def publish_memory_diffs(
+        self,
+        *,
+        archive_uri: str,
+        ctx: Optional[RequestContext],
+        memory_diffs: list[Any],
+    ) -> dict[str, Any]:
+        """Append completed-window diffs to the persisted archive audit."""
+
+        persisted_diff: dict[str, Any] | None = None
+        viking_fs = get_viking_fs()
+        if archive_uri and ctx is not None and viking_fs is not None:
+            diff_uri = f"{archive_uri.rstrip('/')}/memory_diff.json"
+            try:
+                exists = getattr(viking_fs, "exists", None)
+                if not callable(exists) or await exists(diff_uri, ctx=ctx):
+                    raw = await viking_fs.read_file(diff_uri, ctx=ctx)
+                    if raw:
+                        parsed = json.loads(raw)
+                        if not isinstance(parsed, dict):
+                            raise ValueError("Existing memory_diff.json must contain an object")
+                        persisted_diff = parsed
+            except (FileNotFoundError, NotFoundError):
+                persisted_diff = None
+        return await self._write_final_memory_diff(
+            archive_uri=archive_uri,
+            ctx=ctx,
+            memory_diffs=[
+                *([persisted_diff] if persisted_diff is not None else []),
+                *memory_diffs,
+            ],
+            publish=True,
         )
 
 
@@ -1853,6 +1941,20 @@ def _v3_extraction_response(
     return {"contexts": contexts, "session_skills": skill_dicts}
 
 
+def _v3_response_with_memory_diff(
+    response: list[Context] | dict[str, Any],
+    memory_diff: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach an unpublished per-window diff without changing the default API."""
+
+    if isinstance(response, dict):
+        deferred = dict(response)
+    else:
+        deferred = {"contexts": list(response), "session_skills": []}
+    deferred["memory_diff"] = memory_diff
+    return deferred
+
+
 def _make_memory_diff(
     *,
     archive_uri: str,
@@ -1885,7 +1987,7 @@ def _merge_memory_diffs(
     adds: list[dict[str, Any]] = []
     updates: list[dict[str, Any]] = []
     deletes: list[dict[str, Any]] = []
-    trace_id = tracer.get_trace_id() or None
+    trace_id = None
     for diff in diffs:
         if not isinstance(diff, dict):
             continue
@@ -1903,7 +2005,7 @@ def _merge_memory_diffs(
         updates=updates,
         deletes=deletes,
     )
-    merged["trace_id"] = trace_id
+    merged["trace_id"] = trace_id or tracer.get_trace_id() or None
     return merged
 
 

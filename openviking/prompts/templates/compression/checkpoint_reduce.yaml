@@ -1,0 +1,36 @@
+metadata:
+  id: "compression.checkpoint_reduce"
+  name: "Checkpoint Summary Reduction"
+  description: "Merge two adjacent checkpoint notes into one continuation note."
+  version: "1.0.0"
+  language: "en"
+  category: "compression"
+
+variables:
+  - name: "accumulated_summary"
+    type: "string"
+    description: "Checkpoint note accumulated from earlier Phase 2 windows"
+    required: true
+  - name: "next_summary"
+    type: "string"
+    description: "Checkpoint note from the next Phase 2 window"
+    required: true
+
+template: |
+  Merge these adjacent continuation notes into one compact continuation note.
+  Preserve every concrete decision, tool action and result, conclusion, error,
+  correction, and unfinished task. Remove only repetition and wording overhead.
+  Do not mention summaries, windows, checkpoints, archiving, or this instruction.
+
+  <accumulated_note>
+  {{ accumulated_summary }}
+  </accumulated_note>
+
+  <next_note>
+  {{ next_summary }}
+  </next_note>
+
+  Output only the merged continuation note.
+
+llm_config:
+  temperature: 0.0

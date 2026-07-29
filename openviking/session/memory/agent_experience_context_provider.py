@@ -50,8 +50,13 @@ class AgentExperienceContextProvider(SessionExtractContextProvider):
         trajectory_summary: str,
         trajectory_uri: str,
         latest_archive_overview: str = "",
+        request_max_tokens: Optional[int] = None,
     ):
-        super().__init__(messages=messages, latest_archive_overview=latest_archive_overview)
+        super().__init__(
+            messages=messages,
+            latest_archive_overview=latest_archive_overview,
+            request_max_tokens=request_max_tokens,
+        )
         self.trajectory_summary = trajectory_summary
         self.trajectory_uri = trajectory_uri
         self.prefetched_uris: List[str] = []

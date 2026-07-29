@@ -79,6 +79,64 @@ class TestCommit:
         # Wait for semantic/embedding queues
         await client.wait_processed(timeout=60.0)
 
+    async def test_commit_windows_oversized_phase2_input_without_losing_authored_text(
+        self,
+        session_with_messages: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        config = MagicMock()
+        config.memory.extraction_enabled = True
+        config.memory.session_skill_extraction_enabled = False
+        config.memory.phase2_window_max_tokens = 40
+        config.memory.extraction_request_max_tokens = 300
+        monkeypatch.setattr("openviking.session.session.get_openviking_config", lambda: config)
+
+        session_with_messages.messages[0].peer_id = "peer-before"
+        authored_text = "authored-window-content-" * 120
+        session_with_messages.add_message("user", [TextPart(authored_text)])
+        session_with_messages.messages[-1].peer_id = "peer-authored"
+        source_message_id = session_with_messages.messages[-1].id
+        extractor = AsyncMock(
+            return_value={
+                "contexts": [],
+                "session_skills": [],
+                "memory_diff": {
+                    "adds": [],
+                    "updates": [],
+                    "deletes": [],
+                },
+            }
+        )
+        session_with_messages._session_compressor.extract_long_term_memories = extractor
+        publisher = AsyncMock(return_value={})
+        session_with_messages._session_compressor.publish_memory_diffs = publisher
+
+        result = await session_with_messages.commit_async(
+            memory_policy={
+                "peer": {"enabled": True},
+                "working_memory": {"enabled": False},
+            }
+        )
+        task_result = await _wait_for_task(result["task_id"])
+
+        assert task_result["status"] == "completed"
+        assert extractor.await_count > 1
+        source_fragments = []
+        for call in extractor.await_args_list:
+            assert call.kwargs["request_max_tokens"] == 300
+            assert call.kwargs["publish_memory_diff"] is False
+            window_peer_ids = {
+                message.peer_id for message in call.kwargs["messages"] if message.peer_id
+            }
+            assert call.kwargs["allowed_peer_ids"] == window_peer_ids
+            for message in call.kwargs["messages"]:
+                if source_message_id in (message.source_message_ids or [message.id]):
+                    source_fragments.extend(
+                        part.text for part in message.parts if isinstance(part, TextPart)
+                    )
+        assert "".join(source_fragments) == authored_text
+        publisher.assert_awaited()
+
     async def test_commit_default_disables_agent_memory_but_keeps_archive(
         self, session_with_messages: Session
     ):

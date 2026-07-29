@@ -35,6 +35,7 @@ class ExperienceGradientContext:
     messages: list[Message]
     strict_extract_errors: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+    request_max_tokens: int | None = None
 
 
 @dataclass(slots=True)
@@ -107,6 +108,7 @@ class ExperienceGradientEstimator:
             messages=context.messages,
             trajectory_summary=trajectory.content,
             trajectory_uri=trajectory.uri,
+            request_max_tokens=context.request_max_tokens,
         )
         if hasattr(provider, "get_extract_context"):
             extract_context = provider.get_extract_context()
@@ -130,6 +132,7 @@ class ExperienceGradientEstimator:
             context_provider=provider,
             isolation_handler=isolation_handler,
             thinking=True,
+            request_max_tokens=context.request_max_tokens,
         )
         operations, _ = await orchestrator.run()
         return operations
@@ -146,6 +149,7 @@ def _context_with_analysis_messages(
         request_context=context.request_context,
         messages=list(messages),
         strict_extract_errors=context.strict_extract_errors,
+        request_max_tokens=context.request_max_tokens,
         metadata=dict(context.metadata),
     )
 

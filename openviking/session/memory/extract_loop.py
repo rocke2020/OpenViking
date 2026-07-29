@@ -7,6 +7,7 @@ Reference: bot/vikingbot/agent/loop.py AgentLoop structure
 """
 
 import asyncio
+import inspect
 import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -22,6 +23,7 @@ from openviking.session.memory.dataclass import (
 )
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 from openviking.session.memory.merge_op import MergeOp
+from openviking.session.memory.request_budget import prepare_bounded_model_request
 from openviking.session.memory.schema_model_generator import SchemaModelGenerator
 from openviking.session.memory.tools import (
     MEMORY_TOOLS_REGISTRY,
@@ -100,6 +102,7 @@ class ExtractLoop:
         context_provider: Optional[Any] = None,  # ExtractContextProvider
         isolation_handler: MemoryIsolationHandler = None,
         thinking: bool = False,
+        request_max_tokens: Optional[int] = None,
     ):
         """
         Initialize the ExtractLoop.
@@ -112,6 +115,7 @@ class ExtractLoop:
             ctx: Request context
             context_provider: ExtractContextProvider - 必须提供（由 provider 加载 schema）
             thinking: Whether to explicitly enable model thinking for this extraction loop.
+            request_max_tokens: Optional estimated input cap applied at the provider boundary.
         """
         self.vlm = vlm
         self.viking_fs = viking_fs or get_viking_fs()
@@ -120,6 +124,7 @@ class ExtractLoop:
         self.ctx = ctx
         self.context_provider = context_provider
         self.thinking = bool(thinking)
+        self.request_max_tokens = request_max_tokens
         # Use provided isolation_handler or create one in run()
         self._isolation_handler = isolation_handler
         # Track format error retry (max 1 retry)
@@ -157,6 +162,14 @@ class ExtractLoop:
         # Reset format retry counter for each run
         self._format_retry_count = 0
         patch_repair_count = 0
+
+        prepare_messages = getattr(
+            self.context_provider,
+            "prepare_extraction_messages",
+            None,
+        )
+        if inspect.iscoroutinefunction(prepare_messages):
+            await prepare_messages()
 
         # 从 provider 获取 schemas（内部自动加载 registry）
         schemas = self.context_provider.get_memory_schemas(self.ctx)
@@ -630,10 +643,20 @@ The final output of the model must strictly follow the JSON Schema format shown 
         if not self._disable_tools_for_iteration and self._tool_schemas:
             tools = self._tool_schemas
             tool_choice = "auto"
-        with bind_telemetry_stage("memory_extract"):
-            response = await self.vlm.get_completion_async(
+        request_messages = messages
+        request_tools = tools
+        if self.request_max_tokens is not None:
+            bounded_request = prepare_bounded_model_request(
                 messages=messages,
                 tools=tools,
+                max_tokens=self.request_max_tokens,
+            )
+            request_messages = bounded_request.messages
+            request_tools = bounded_request.tools
+        with bind_telemetry_stage("memory_extract"):
+            response = await self.vlm.get_completion_async(
+                messages=request_messages,
+                tools=request_tools,
                 tool_choice=tool_choice,
                 thinking=self.thinking,
             )

@@ -140,6 +140,7 @@ class SessionCompressorV2:
         isolation_handler: Optional[MemoryIsolationHandler] = None,
         transaction_handle=None,
         context_provider: Optional[Any] = None,
+        request_max_tokens: Optional[int] = None,
     ) -> ExtractLoop:
         """Create new ExtractLoop instance with current ctx.
 
@@ -163,6 +164,7 @@ class SessionCompressorV2:
                 ctx=ctx,
                 viking_fs=viking_fs,
                 transaction_handle=transaction_handle,
+                request_max_tokens=request_max_tokens,
             )
 
         return ExtractLoop(
@@ -171,6 +173,7 @@ class SessionCompressorV2:
             ctx=ctx,
             context_provider=context_provider,
             isolation_handler=isolation_handler,
+            request_max_tokens=request_max_tokens,
         )
 
     def _get_or_create_updater(self, registry, transaction_handle=None) -> MemoryUpdater:
@@ -232,6 +235,7 @@ class SessionCompressorV2:
         allowed_memory_types: Optional[set[str]] = None,
         allow_self_memory: bool = True,
         allowed_peer_ids: Optional[set[str]] = None,
+        request_max_tokens: Optional[int] = None,
     ) -> List[Context]:
         """Extract long-term memories from messages using v2 templating system.
 
@@ -307,6 +311,7 @@ class SessionCompressorV2:
                 ctx=ctx,
                 viking_fs=viking_fs,
                 transaction_handle=transaction_handle,
+                request_max_tokens=request_max_tokens,
             )
             await context_provider.prepare_extraction_messages()
             extract_context = context_provider.get_extract_context()
@@ -328,6 +333,7 @@ class SessionCompressorV2:
                 isolation_handler=isolation_handler,
                 transaction_handle=transaction_handle,
                 context_provider=context_provider,
+                request_max_tokens=request_max_tokens,
             )
             read_scope = isolation_handler.get_read_scope()
             if lock_manager:
@@ -503,6 +509,7 @@ class SessionCompressorV2:
         archive_uri: str = "",
         allowed_memory_types: Optional[set[str]] = None,
         include_session_skills: Optional[bool] = None,
+        request_max_tokens: Optional[int] = None,
     ) -> Dict[str, List[Any]]:
         """Extract trajectory, experience, and session-skill memories from execution context."""
         config = get_openviking_config()
@@ -539,6 +546,7 @@ class SessionCompressorV2:
             latest_archive_overview=latest_archive_overview,
             include_trajectories=include_trajectories,
             include_session_skills=include_session_skills,
+            request_max_tokens=request_max_tokens,
         )
         traj_result = await self._run_extract_phase(
             provider=traj_provider,
@@ -548,6 +556,7 @@ class SessionCompressorV2:
             phase_label="trajectory",
             allowed_memory_types=allowed_execution_types,
             thinking=True,
+            request_max_tokens=request_max_tokens,
         )
         if traj_result is None:
             return empty_result
@@ -586,6 +595,7 @@ class SessionCompressorV2:
                 messages=messages,
                 trajectory_summary=traj_content,
                 trajectory_uri=traj_uri,
+                request_max_tokens=request_max_tokens,
             )
             exp_dir = exp_provider._render_experience_dir(ctx)
 
@@ -624,6 +634,7 @@ class SessionCompressorV2:
                 post_apply=_append_sources_before_unlock,
                 allowed_memory_types=allowed_execution_types,
                 thinking=True,
+                request_max_tokens=request_max_tokens,
             )
             if exp_result is None:
                 fallback_uris = await self._single_existing_experience_uris(
@@ -722,6 +733,7 @@ class SessionCompressorV2:
         post_apply: Optional[ExtractPostApply] = None,
         allowed_memory_types: Optional[set[str]] = None,
         thinking: bool = False,
+        request_max_tokens: Optional[int] = None,
     ):
         """Run one ExtractLoop phase with its own lock scope, then apply operations.
 
@@ -762,6 +774,7 @@ class SessionCompressorV2:
             context_provider=provider,
             isolation_handler=isolation_handler,
             thinking=thinking,
+            request_max_tokens=request_max_tokens,
         )
 
         lock_manager = None

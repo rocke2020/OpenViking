@@ -24,7 +24,13 @@ from openviking.session.memory.constants import (
     AGENT_EVOLUTION_MEMORY_TYPES,
     EXECUTION_MEMORY_TYPES,
 )
+from openviking.session.memory.request_budget import ensure_model_request_within_budget
 from openviking.session.memory_policy import MemoryPolicy
+from openviking.session.phase2_input import (
+    Phase2InputPlan,
+    Phase2Window,
+    build_phase2_input_plan,
+)
 from openviking.session.retention import (
     RETENTION_MODE_TURN_BUDGET,
     RetentionPlan,
@@ -52,6 +58,7 @@ from openviking.utils.token_estimation import estimate_text_tokens, truncate_tex
 from openviking_cli.exceptions import (
     FailedPreconditionError,
     NotFoundError,
+    ResourceExhaustedError,
 )
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger, run_async
@@ -74,6 +81,15 @@ _MEMORY_EXTRACTION_RETRY_MAX_DELAY_SECONDS = 8.0
 _AGENT_TRAINING_REQUIRED_MEMORY_TYPES = frozenset({"cases", "trajectories"})
 _SESSION_PHASE1_LOCK_TIMEOUT_SECONDS = 30.0
 _MEMORY_STEP_NAMES = ("long_term", "execution")
+
+
+def _positive_memory_config_int(memory_config: Any, name: str, default: int) -> int:
+    """Read a positive integer while tolerating legacy test/config doubles."""
+
+    value = getattr(memory_config, name, default)
+    return (
+        value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else default
+    )
 
 
 class _ArchiveMessagesCorruptError(ValueError):
@@ -167,6 +183,59 @@ def _message_peer_ids(messages: List[Message]) -> set[str]:
         for message in messages
         if (peer_id := safe_peer_id(getattr(message, "peer_id", None)))
     }
+
+
+def _phase2_window_peer_ids(
+    allowed_peer_ids: set[str],
+    messages: List[Message],
+) -> set[str]:
+    """Restrict one Phase 2 request to peers evidenced in that window."""
+
+    return allowed_peer_ids.intersection(_message_peer_ids(messages))
+
+
+def _phase2_message_is_completed(
+    message: Message,
+    completed_ids: set[str],
+) -> bool:
+    """Match either the current fragment or its fully covered source message."""
+
+    return message.id in completed_ids or any(
+        source_id in completed_ids for source_id in (message.source_message_ids or [message.id])
+    )
+
+
+def _record_fully_completed_phase2_sources(
+    plan: Phase2InputPlan,
+    completed_ids: set[str],
+) -> None:
+    """Record source IDs once every derived fragment that covers them is complete."""
+
+    fragment_ids_by_source: Dict[str, set[str]] = {}
+    for window in plan.windows:
+        for message in window.messages:
+            for source_id in message.source_message_ids or [message.id]:
+                fragment_ids_by_source.setdefault(source_id, set()).add(message.id)
+    completed_ids.update(
+        source_id
+        for source_id, fragment_ids in fragment_ids_by_source.items()
+        if fragment_ids.issubset(completed_ids)
+    )
+
+
+def _v2_phase2_request_budget_kwargs(
+    compressor: Any,
+    request_max_tokens: int,
+) -> Dict[str, int]:
+    """Pass the hard cap only to the retained v2-compatible implementation."""
+
+    from openviking.session.compressor_v2 import SessionCompressorV2
+
+    return (
+        {"request_max_tokens": request_max_tokens}
+        if isinstance(compressor, SessionCompressorV2)
+        else {}
+    )
 
 
 @dataclass(frozen=True)
@@ -2153,6 +2222,16 @@ class Session:
         )
         return await reporter.extract_and_report(messages=messages, context=context)
 
+    async def _usage_reporting_messages(
+        self,
+        messages: List[Message],
+    ) -> List[Message]:
+        """Hydrate a usage-only copy without changing Phase 2 model input."""
+
+        if getattr(self, "_usage_reporter", None) is None:
+            return messages
+        return await self._hydrate_tool_outputs_for_extraction(messages)
+
     @tracer("session.commit.phase2", ignore_result=True, ignore_args=True)
     async def _run_memory_extraction(
         self,
@@ -2227,12 +2306,30 @@ class Session:
                         if working_memory_enabled
                         else ""
                     )
-                    extraction_messages = await self._hydrate_tool_outputs_for_extraction(messages)
+                    phase2_window_max_tokens = _positive_memory_config_int(
+                        getattr(ov_config, "memory", None),
+                        "phase2_window_max_tokens",
+                        12_000,
+                    )
+                    extraction_request_max_tokens = _positive_memory_config_int(
+                        getattr(ov_config, "memory", None),
+                        "extraction_request_max_tokens",
+                        32_768,
+                    )
+                    phase2_plan = build_phase2_input_plan(
+                        messages,
+                        window_max_tokens=phase2_window_max_tokens,
+                    )
+                    phase2_windows = phase2_plan.windows
+                    extraction_messages = [
+                        message for window in phase2_windows for message in window.messages
+                    ]
+                    usage_messages = await self._usage_reporting_messages(messages)
                     usage_events_extracted = len(
                         await self._run_usage_reporting(
                             task_id=task_id,
                             archive_uri=archive_uri,
-                            messages=extraction_messages,
+                            messages=usage_messages,
                         )
                     )
 
@@ -2248,8 +2345,9 @@ class Session:
                         }
                         if checkpoint_requests:
                             summary_kwargs["checkpoint_requests"] = checkpoint_requests
-                        generated = await self._generate_archive_summary_async(
-                            extraction_messages,
+                        generated = await self._generate_archive_summary_for_phase2_windows(
+                            phase2_windows,
+                            request_max_tokens=extraction_request_max_tokens,
                             **summary_kwargs,
                         )
                         summary_result = (
@@ -2316,6 +2414,10 @@ class Session:
                         completed_memory_steps.setdefault(step, set()).update(
                             message.id for message in step_messages
                         )
+                        _record_fully_completed_phase2_sources(
+                            phase2_plan,
+                            completed_memory_steps[step],
+                        )
                         # Persist progress before waiting for sibling Phase 2
                         # tasks. A process restart or a sibling failure can then
                         # resume without applying this memory step twice.
@@ -2360,12 +2462,18 @@ class Session:
                     long_term_messages = [
                         message
                         for message in extraction_messages
-                        if message.id not in completed_memory_steps.get("long_term", set())
+                        if not _phase2_message_is_completed(
+                            message,
+                            completed_memory_steps.get("long_term", set()),
+                        )
                     ]
                     execution_messages = [
                         message
                         for message in extraction_messages
-                        if message.id not in completed_memory_steps.get("execution", set())
+                        if not _phase2_message_is_completed(
+                            message,
+                            completed_memory_steps.get("execution", set()),
+                        )
                     ]
 
                     long_term_has_work = (
@@ -2405,28 +2513,100 @@ class Session:
                                 # surface so _run_retryable_phase2_step can retry them
                                 # (and so a final failure is recorded as a skipped
                                 # archive instead of silently dropping the memory).
-                                return await self._session_compressor.extract_long_term_memories(
-                                    messages=long_term_messages,
-                                    user=self.user,
-                                    session_id=self.session_id,
-                                    ctx=self.ctx,
-                                    strict_extract_errors=True,
-                                    latest_archive_overview=latest_archive_overview,
-                                    archive_uri=archive_uri,
-                                    allowed_memory_types=long_term_memory_types,
-                                    agent_evolution_enabled=agent_evolution_enabled,
-                                    allow_self_memory=self_memory_enabled,
-                                    allowed_peer_ids=allowed_peer_ids,
-                                )
+                                from openviking.session.compressor_v3 import SessionCompressorV3
 
-                            extraction_tasks.append(
-                                _run_recorded_memory_step(
-                                    "long_term_memory_extraction",
-                                    "long_term",
-                                    long_term_messages,
-                                    _run_long_term_memory_extraction,
-                                )
-                            )
+                                if not isinstance(
+                                    self._session_compressor,
+                                    SessionCompressorV3,
+                                ):
+                                    request_budget_kwargs = _v2_phase2_request_budget_kwargs(
+                                        self._session_compressor,
+                                        extraction_request_max_tokens,
+                                    )
+                                    return (
+                                        await self._session_compressor.extract_long_term_memories(
+                                            messages=long_term_messages,
+                                            user=self.user,
+                                            session_id=self.session_id,
+                                            ctx=self.ctx,
+                                            strict_extract_errors=True,
+                                            latest_archive_overview=latest_archive_overview,
+                                            archive_uri=archive_uri,
+                                            allowed_memory_types=long_term_memory_types,
+                                            agent_evolution_enabled=agent_evolution_enabled,
+                                            allow_self_memory=self_memory_enabled,
+                                            allowed_peer_ids=allowed_peer_ids,
+                                            **request_budget_kwargs,
+                                        )
+                                    )
+
+                                contexts: list[Any] = []
+                                session_skills: list[Any] = []
+                                for window_index, window in enumerate(phase2_windows):
+                                    pending_messages = [
+                                        message
+                                        for message in window.messages
+                                        if not _phase2_message_is_completed(
+                                            message,
+                                            completed_memory_steps.get("long_term", set()),
+                                        )
+                                    ]
+                                    if not pending_messages:
+                                        continue
+
+                                    async def _extract_window(
+                                        window_messages: List[Message] = pending_messages,
+                                    ) -> Any:
+                                        result = await (
+                                            self._session_compressor.extract_long_term_memories(
+                                                messages=window_messages,
+                                                user=self.user,
+                                                session_id=self.session_id,
+                                                ctx=self.ctx,
+                                                strict_extract_errors=True,
+                                                latest_archive_overview=latest_archive_overview,
+                                                archive_uri=archive_uri,
+                                                allowed_memory_types=long_term_memory_types,
+                                                agent_evolution_enabled=(agent_evolution_enabled),
+                                                allow_self_memory=self_memory_enabled,
+                                                allowed_peer_ids=_phase2_window_peer_ids(
+                                                    allowed_peer_ids,
+                                                    window_messages,
+                                                ),
+                                                request_max_tokens=(extraction_request_max_tokens),
+                                                publish_memory_diff=False,
+                                            )
+                                        )
+                                        window_diff = (
+                                            result.get("memory_diff")
+                                            if isinstance(result, dict)
+                                            else None
+                                        )
+                                        if isinstance(window_diff, dict):
+                                            await self._session_compressor.publish_memory_diffs(
+                                                archive_uri=archive_uri,
+                                                ctx=self.ctx,
+                                                memory_diffs=[window_diff],
+                                            )
+                                        return result
+
+                                    result = await _run_recorded_memory_step(
+                                        (f"long_term_memory_extraction.window_{window_index + 1}"),
+                                        "long_term",
+                                        pending_messages,
+                                        _extract_window,
+                                    )
+                                    if isinstance(result, dict):
+                                        contexts.extend(result.get("contexts", []))
+                                        session_skills.extend(result.get("session_skills", []))
+                                    else:
+                                        contexts.extend(result or [])
+                                return {
+                                    "contexts": contexts,
+                                    "session_skills": session_skills,
+                                }
+
+                            extraction_tasks.append(_run_long_term_memory_extraction())
                             extraction_labels.append("long_term")
 
                         if has_execution_memory and execution_memory_has_work:
@@ -2434,6 +2614,10 @@ class Session:
                             async def _run_execution_memory_extraction() -> Any:
                                 # See _run_long_term_memory_extraction: surface errors
                                 # so retries can engage and final failures are visible.
+                                request_budget_kwargs = _v2_phase2_request_budget_kwargs(
+                                    self._session_compressor,
+                                    extraction_request_max_tokens,
+                                )
                                 return await self._session_compressor.extract_execution_memories(
                                     messages=execution_messages,
                                     ctx=self.ctx,
@@ -2442,6 +2626,7 @@ class Session:
                                     archive_uri=archive_uri,
                                     allowed_memory_types=execution_memory_types,
                                     include_session_skills=session_skill_extraction_enabled,
+                                    **request_budget_kwargs,
                                 )
 
                             extraction_tasks.append(
@@ -3749,11 +3934,162 @@ class Session:
             )
         return tuple(raw)
 
+    @staticmethod
+    def _checkpoint_requests_for_phase2_window(
+        window: Phase2Window,
+        checkpoint_requests: List[_CheckpointRequest],
+    ) -> tuple[List[_CheckpointRequest], List[int]]:
+        local_requests: List[_CheckpointRequest] = []
+        original_indexes: List[int] = []
+        for index, request in enumerate(checkpoint_requests):
+            source_ids = set(request.source_message_ids)
+            matching = [
+                message
+                for message in window.messages
+                if source_ids.intersection(message.source_message_ids or [message.id])
+            ]
+            if not matching:
+                continue
+            anchor = next(
+                (
+                    message.id
+                    for message in window.messages
+                    if request.turn_anchor_message_id
+                    in (message.source_message_ids or [message.id])
+                ),
+                request.turn_anchor_message_id,
+            )
+            local_requests.append(
+                _CheckpointRequest(
+                    turn_anchor_message_id=anchor,
+                    source_message_ids=tuple(message.id for message in matching),
+                    retained_message_token_budget=request.retained_message_token_budget,
+                    estimated_active_tokens=request.estimated_active_tokens,
+                )
+            )
+            original_indexes.append(index)
+        return local_requests, original_indexes
+
+    async def _generate_archive_summary_for_phase2_windows(
+        self,
+        windows: List[Phase2Window],
+        *,
+        latest_archive_overview: str = "",
+        checkpoint_requests: Optional[List[_CheckpointRequest]] = None,
+        request_max_tokens: int,
+    ) -> str | _ArchiveSummaryResult:
+        """Fold bounded Phase 2 windows into one Working Memory document."""
+
+        if not windows:
+            return ""
+        checkpoint_requests = list(checkpoint_requests or [])
+        if len(windows) == 1:
+            local_requests, original_indexes = self._checkpoint_requests_for_phase2_window(
+                windows[0],
+                checkpoint_requests,
+            )
+            if original_indexes != list(range(len(checkpoint_requests))):
+                raise ValueError("A checkpoint source is missing from its Phase 2 window")
+            kwargs: Dict[str, Any] = {
+                "latest_archive_overview": latest_archive_overview,
+            }
+            if local_requests:
+                kwargs["checkpoint_requests"] = local_requests
+            return await self._generate_archive_summary_async(
+                windows[0].messages,
+                request_max_tokens=request_max_tokens,
+                **kwargs,
+            )
+
+        overview = latest_archive_overview
+        partial_checkpoint_summaries: List[List[str]] = [[] for _request in checkpoint_requests]
+        for window in windows:
+            local_requests, original_indexes = self._checkpoint_requests_for_phase2_window(
+                window,
+                checkpoint_requests,
+            )
+            generated = await self._generate_archive_summary_async(
+                window.messages,
+                latest_archive_overview=overview,
+                checkpoint_requests=local_requests or None,
+                strict=True,
+                request_max_tokens=request_max_tokens,
+            )
+            result = (
+                generated
+                if isinstance(generated, _ArchiveSummaryResult)
+                else _ArchiveSummaryResult(overview=str(generated or ""))
+            )
+            overview = result.overview
+            for original_index, partial in zip(
+                original_indexes,
+                result.checkpoint_summaries,
+                strict=True,
+            ):
+                if partial.strip():
+                    partial_checkpoint_summaries[original_index].append(partial.strip())
+
+        if not checkpoint_requests:
+            return overview
+        reduced_checkpoint_summaries = []
+        for partials in partial_checkpoint_summaries:
+            reduced_checkpoint_summaries.append(
+                await self._reduce_checkpoint_summaries(
+                    partials,
+                    request_max_tokens=request_max_tokens,
+                )
+            )
+        return _ArchiveSummaryResult(
+            overview=overview,
+            checkpoint_summaries=tuple(reduced_checkpoint_summaries),
+        )
+
+    async def _reduce_checkpoint_summaries(
+        self,
+        partials: List[str],
+        *,
+        request_max_tokens: int,
+    ) -> str:
+        """Fold window-local checkpoint notes without concatenating them into one prompt."""
+
+        normalized = [partial.strip() for partial in partials if partial.strip()]
+        if not normalized:
+            raise ValueError("Working Memory output contains no checkpoint summary")
+        merged = normalized[0]
+        if len(normalized) == 1:
+            return merged
+
+        from openviking.prompts import render_prompt
+
+        vlm = get_openviking_config().vlm
+        for partial in normalized[1:]:
+            prompt = render_prompt(
+                "compression.checkpoint_reduce",
+                {
+                    "accumulated_summary": merged,
+                    "next_summary": partial,
+                },
+            )
+            request = {"prompt": prompt}
+            ensure_model_request_within_budget(
+                request,
+                max_tokens=request_max_tokens,
+                request_name="Phase 2 checkpoint reduction request",
+            )
+            response = await vlm.get_completion_async(**request)
+            merged = str(getattr(response, "content", response) or "").strip()
+            if not merged:
+                raise ValueError("Checkpoint reduction returned an empty summary")
+        return merged
+
     async def _generate_archive_summary_async(
         self,
         messages: List[Message],
         latest_archive_overview: str = "",
         checkpoint_requests: Optional[List[_CheckpointRequest]] = None,
+        *,
+        strict: bool = False,
+        request_max_tokens: Optional[int] = None,
     ) -> str | _ArchiveSummaryResult:
         """Generate Working Memory document for the current archive (async).
 
@@ -3780,10 +4116,26 @@ class Session:
         formatted = self._format_messages_for_wm(messages, checkpoint_requests)
         checkpoint_instructions = self._checkpoint_prompt_instructions(len(checkpoint_requests))
 
-        vlm = get_openviking_config().vlm
+        ov_config = get_openviking_config()
+        vlm = ov_config.vlm
+        if request_max_tokens is None:
+            request_max_tokens = _positive_memory_config_int(
+                getattr(ov_config, "memory", None),
+                "extraction_request_max_tokens",
+                32_768,
+            )
+
+        async def _complete(**request: Any) -> Any:
+            ensure_model_request_within_budget(
+                request,
+                max_tokens=request_max_tokens,
+                request_name="Working Memory request",
+            )
+            return await vlm.get_completion_async(**request)
+
         if not (vlm and vlm.is_available()):
-            if checkpoint_requests:
-                raise ValueError("A configured VLM is required to generate checkpoint summaries")
+            if checkpoint_requests or strict:
+                raise ValueError("A configured VLM is required for strict Working Memory")
             turn_count = len([m for m in messages if is_user_query(m)])
             return (
                 f"# Session Summary\n\n**Overview**: {turn_count} turns, {len(messages)} messages"
@@ -3792,7 +4144,7 @@ class Session:
         try:
             from openviking.prompts import render_prompt
         except Exception as e:
-            if checkpoint_requests:
+            if checkpoint_requests or strict:
                 raise RuntimeError("Prompt module is required to generate checkpoints") from e
             logger.warning(f"Prompt module unavailable: {e}")
             turn_count = len([m for m in messages if is_user_query(m)])
@@ -3821,7 +4173,7 @@ class Session:
                     },
                 )
                 if checkpoint_requests:
-                    response = await vlm.get_completion_async(
+                    response = await _complete(
                         prompt=prompt,
                         tools=[WM_CREATE_WITH_CHECKPOINTS_TOOL],
                         tool_choice={
@@ -3844,6 +4196,8 @@ class Session:
                     working_memory = args.get("working_memory")
                     if not isinstance(working_memory, str) or not working_memory.strip():
                         raise ValueError("create_working_memory.working_memory is empty")
+                    if strict:
+                        self._validate_strict_working_memory(working_memory)
                     return _ArchiveSummaryResult(
                         overview=working_memory,
                         checkpoint_summaries=self._parse_required_checkpoint_summaries(
@@ -3851,11 +4205,16 @@ class Session:
                             len(checkpoint_requests),
                         ),
                     )
-                return await vlm.get_completion_async(prompt)
+                working_memory = await _complete(prompt=prompt)
+                if strict:
+                    self._validate_strict_working_memory(working_memory)
+                return working_memory
+            except ResourceExhaustedError:
+                raise
             except Exception as e:
                 _wm_debug(f"creation failed: {e}")
                 logger.warning(f"WM creation failed: {e}")
-                if checkpoint_requests:
+                if checkpoint_requests or strict:
                     raise
                 turn_count = len([m for m in messages if is_user_query(m)])
                 return (
@@ -3878,7 +4237,7 @@ class Session:
                     "checkpoint_instructions": checkpoint_instructions,
                 },
             )
-            resp = await vlm.get_completion_async(
+            resp = await _complete(
                 prompt=update_prompt,
                 tools=[WM_UPDATE_TOOL],
                 tool_choice={
@@ -3886,15 +4245,20 @@ class Session:
                     "function": {"name": "update_working_memory"},
                 },
             )
+        except ResourceExhaustedError:
+            raise
         except Exception as e:
             import traceback as _tb
 
             _wm_debug(f"tool_call raised: {type(e).__name__}: {e} tb={_tb.format_exc()[-400:]}")
-            if checkpoint_requests:
+            if checkpoint_requests or strict:
                 raise
             logger.warning("WM update tool_call failed (%s); falling back to creation prompt", e)
             return await self._fallback_generate_wm_creation(
-                formatted, messages, latest_archive_overview
+                formatted,
+                messages,
+                latest_archive_overview,
+                request_max_tokens=request_max_tokens,
             )
 
         has_tc = bool(getattr(resp, "has_tool_calls", False) and getattr(resp, "tool_calls", None))
@@ -3907,11 +4271,14 @@ class Session:
         )
 
         if not has_tc:
-            if checkpoint_requests:
+            if checkpoint_requests or strict:
                 raise ValueError("Working Memory update returned no tool call for checkpoints")
             logger.warning("WM update: LLM returned no tool_call; falling back to creation prompt")
             return await self._fallback_generate_wm_creation(
-                formatted, messages, latest_archive_overview
+                formatted,
+                messages,
+                latest_archive_overview,
+                request_max_tokens=request_max_tokens,
             )
 
         checkpoint_summaries: tuple[str, ...] = ()
@@ -4004,7 +4371,12 @@ class Session:
                     len(salvaged),
                     len(WM_SEVEN_SECTIONS),
                 )
-                return self._merge_wm_sections(latest_archive_overview, salvaged)
+                overview = self._merge_wm_sections(latest_archive_overview, salvaged)
+                if strict:
+                    self._validate_strict_working_memory(overview)
+                return overview
+            if strict:
+                raise
             _wm_debug("regex recovery salvaged 0 sections; falling back to creation prompt")
             logger.warning(
                 "WM update: tool_call arguments parse failed (%s); "
@@ -4012,7 +4384,10 @@ class Session:
                 e,
             )
             return await self._fallback_generate_wm_creation(
-                formatted, messages, latest_archive_overview
+                formatted,
+                messages,
+                latest_archive_overview,
+                request_max_tokens=request_max_tokens,
             )
 
         _wm_debug(
@@ -4020,6 +4395,8 @@ class Session:
             f"ops_summary={[(k, v.get('op') if isinstance(v, dict) else type(v).__name__) for k, v in ops.items()][:7]}"
         )
         overview = self._merge_wm_sections(latest_archive_overview, ops)
+        if strict:
+            self._validate_strict_working_memory(overview)
         if checkpoint_requests:
             return _ArchiveSummaryResult(
                 overview=overview,
@@ -4027,11 +4404,22 @@ class Session:
             )
         return overview
 
+    @staticmethod
+    def _validate_strict_working_memory(overview: Any) -> None:
+        if not isinstance(overview, str) or not overview.strip():
+            raise ValueError("Strict Working Memory output is empty")
+        missing = [section for section in WM_SEVEN_SECTIONS if f"## {section}" not in overview]
+        if missing:
+            raise ValueError(
+                "Strict Working Memory output is missing required sections: " + ", ".join(missing)
+            )
+
     async def _fallback_generate_wm_creation(
         self,
         formatted_messages: str,
         messages: List[Message],
         prior_overview: str = "",
+        request_max_tokens: Optional[int] = None,
     ) -> str:
         """Re-run WM creation prompt when the update tool_call path fails.
 
@@ -4053,7 +4441,21 @@ class Session:
                     "checkpoint_instructions": "",
                 },
             )
-            return await get_openviking_config().vlm.get_completion_async(prompt)
+            ov_config = get_openviking_config()
+            effective_request_max_tokens = request_max_tokens or _positive_memory_config_int(
+                getattr(ov_config, "memory", None),
+                "extraction_request_max_tokens",
+                32_768,
+            )
+            request = {"prompt": prompt}
+            ensure_model_request_within_budget(
+                request,
+                max_tokens=effective_request_max_tokens,
+                request_name="Working Memory fallback request",
+            )
+            return await ov_config.vlm.get_completion_async(**request)
+        except ResourceExhaustedError:
+            raise
         except Exception as e:
             logger.warning(f"WM creation fallback failed: {e}")
             turn_count = len([m for m in messages if is_user_query(m)])

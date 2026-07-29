@@ -1362,6 +1362,8 @@ openviking-server --config /path/to/ov.conf
 | `version` | 已废弃且会被忽略。OpenViking 始终使用 v3 记忆抽取链路；已有配置中保留该字段仍可正常加载，不会报错。 | `"v3"` |
 | `custom_templates_dir` | 自定义 memory templates 目录。设置后会在内置模板之外加载该目录中的模板。 | `""` |
 | `extraction_enabled` | session commit 时是否执行长期记忆抽取。 | `true` |
+| `phase2_window_max_tokens` | 单个无损 Phase 2 抽取窗口中，归档来源内容的最大估算 token 数。 | `12000` |
+| `extraction_request_max_tokens` | 单次 Phase 2 模型请求的最大估算序列化输入 token 数；必须不小于 `phase2_window_max_tokens`。 | `32768` |
 | `session_skill_extraction_enabled` | session commit 时是否同时抽取可复用 skill 到当前用户的 skill 目录。 | `false` |
 | `link_enabled` | 记忆抽取是否写入和解析 memory links。 | `false` |
 

@@ -1397,6 +1397,8 @@ For memory-related settings, add a `memory` section in `ov.conf`:
 | `version` | Deprecated and ignored. OpenViking always uses the v3 memory extraction pipeline; existing configs that set this field still load without error. | `"v3"` |
 | `custom_templates_dir` | Custom memory templates directory. If set, templates from this directory are loaded in addition to built-in templates. | `""` |
 | `extraction_enabled` | Whether session commit runs long-term memory extraction. | `true` |
+| `phase2_window_max_tokens` | Maximum estimated archive-derived tokens in one loss-preserving Phase 2 extraction window. | `12000` |
+| `extraction_request_max_tokens` | Maximum estimated serialized input tokens in one Phase 2 model request. Must be at least `phase2_window_max_tokens`. | `32768` |
 | `session_skill_extraction_enabled` | Whether session commit also extracts reusable skills into the current user's skill directory. | `false` |
 | `link_enabled` | Whether memory extraction writes and resolves memory links. | `false` |
 

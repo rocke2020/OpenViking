@@ -171,6 +171,34 @@ class TestSessionConversationToolFiltering:
         assert "input={'reservation_id': 'EHGLP3'}" in conversation
         assert "output=available" in conversation
 
+    def test_agent_provider_preserves_tool_output_head_and_tail(self):
+        from openviking.session.memory.agent_trajectory_context_provider import (
+            AgentTrajectoryContextProvider,
+        )
+
+        tool_output = "HEAD-" + ("middle-" * 2_000) + "-TAIL"
+        messages = [
+            Message(
+                id="m1",
+                role="assistant",
+                parts=[
+                    ToolPart(
+                        tool_id="tool_1",
+                        tool_name="read",
+                        tool_output=tool_output,
+                        tool_status="completed",
+                    )
+                ],
+            )
+        ]
+        provider = AgentTrajectoryContextProvider(messages=messages)
+
+        conversation = provider._assemble_conversation(messages)
+
+        assert "output=HEAD-" in conversation
+        assert conversation.rstrip().endswith("-TAIL")
+        assert "middle omitted from extraction prompt" in conversation
+
     def test_assemble_conversation_uses_peer_id_when_present(self):
         messages = [
             Message(

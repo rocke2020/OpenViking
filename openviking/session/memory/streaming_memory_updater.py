@@ -45,6 +45,7 @@ from openviking.session.memory.patch_merge_context_provider import (
     PatchMergeContextProvider,
     PatchMergePatch,
 )
+from openviking.session.memory.request_budget import strictest_request_budget
 from openviking.session.memory.session_extract_context_provider import SessionExtractContextProvider
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils, next_memory_version
 from openviking.session.memory.utils.streaming_batcher import (
@@ -104,6 +105,7 @@ class MemoryUpdateRequest:
     strict_extract_errors: bool = False
     isolation_options: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    request_max_tokens: int | None = None
 
 
 @dataclass(slots=True)
@@ -475,6 +477,9 @@ class StreamingMemoryUpdater:
             ctx=requests[0].ctx,
             registry=self.registry or create_default_registry(),
             strict_extract_errors=any(request.strict_extract_errors for request in requests),
+            request_max_tokens=strictest_request_budget(
+                *(request.request_max_tokens for request in requests)
+            ),
             trace_console=self.config.trace_console,
         )
 
@@ -573,6 +578,7 @@ async def merge_memory_operations(
     ctx: RequestContext,
     registry: MemoryTypeRegistry | None = None,
     strict_extract_errors: bool = False,
+    request_max_tokens: int | None = None,
     trace_console: bool = False,
 ) -> ResolvedOperations:
     """Merge resolved memory operations by memory type/URI using patch context."""
@@ -635,6 +641,7 @@ async def merge_memory_operations(
                 ctx=ctx,
                 registry=registry,
                 peer_id=peer_id,
+                request_max_tokens=request_max_tokens,
                 trace_console=trace_console,
             )
             for (peer_id, memory_type) in all_group_keys
@@ -719,6 +726,7 @@ async def merge_one_memory_type_operations(
     ctx: RequestContext,
     registry: MemoryTypeRegistry | None = None,
     peer_id: str | None = None,
+    request_max_tokens: int | None = None,
     trace_console: bool = False,
 ) -> ResolvedOperations:
     registry = registry or create_default_registry()
@@ -875,6 +883,7 @@ async def merge_one_memory_type_operations(
         context_provider=provider,
         isolation_handler=isolation_handler,
         max_iterations=1,
+        request_max_tokens=request_max_tokens,
     )
     merged, _ = await orchestrator.run()
     merged = merged or ResolvedOperations(upsert_operations=[], delete_file_contents=[], errors=[])
@@ -1450,6 +1459,7 @@ def clone_memory_update_request(
         messages=list(request.messages or []),
         ctx=request.ctx,
         strict_extract_errors=request.strict_extract_errors,
+        request_max_tokens=request.request_max_tokens,
         isolation_options=dict(request.isolation_options or {}),
         metadata=dict(request.metadata or {}),
     )

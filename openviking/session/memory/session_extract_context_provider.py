@@ -33,6 +33,7 @@ from openviking.session.memory.vision_message_normalizer import (
 from openviking.storage.viking_fs import VikingFS
 from openviking.telemetry import tracer
 from openviking.utils.time_utils import parse_iso_datetime
+from openviking.utils.token_estimation import truncate_text_to_token_budget
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config import get_openviking_config
 
@@ -45,6 +46,8 @@ _PREFETCH_SEARCH_QUERY_MAX_CHARS = 5000
 _PREFETCH_SEARCH_TEXT_PART_MAX_CHARS = 1000
 _PREFETCH_SEARCH_ASSISTANT_TEXT_PART_MAX_CHARS = 500
 _PREFETCH_SEARCH_TOOL_FIELD_MAX_CHARS = 500
+_EXTRACTION_TOOL_OUTPUT_MAX_TOKENS = 512
+_EXTRACTION_TOOL_OUTPUT_MARKER = "\n… [middle omitted from extraction prompt] …\n"
 _RESOURCE_REASON_LANGUAGE_RE = re.compile(
     r"(?im)^\s*(?:User reason|用户说明|用户原因|用户理由)[:：]\s*(.+?)\s*$"
 )
@@ -64,6 +67,7 @@ class SessionExtractContextProvider(ExtractContextProvider):
         ctx: RequestContext = None,
         viking_fs: VikingFS = None,
         transaction_handle=None,
+        request_max_tokens: Optional[int] = None,
     ):
         self.messages = list(messages) if isinstance(messages, list) else messages
         self.latest_archive_overview = latest_archive_overview
@@ -83,6 +87,7 @@ class SessionExtractContextProvider(ExtractContextProvider):
         self._link_enabled = config.memory.link_enabled if config.memory else False
         self._vision_messages_prepared = False
         self._vision_vlm = None
+        self._request_max_tokens = request_max_tokens
 
     @property
     def read_file_contents(self) -> Dict[str, MemoryFile]:
@@ -121,6 +126,7 @@ class SessionExtractContextProvider(ExtractContextProvider):
                 self.messages,
                 get_vlm=self._get_vision_vlm,
                 logger=logger,
+                request_max_tokens=self._request_max_tokens,
             )
             self._extract_context = None
             self._output_language = self._detect_language()
@@ -313,7 +319,15 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
                     if part.tool_input:
                         fields.append(f"input={part.tool_input}")
                     if part.tool_output:
-                        fields.append(f"output={part.tool_output[:500]}")
+                        fields.append(
+                            "output="
+                            + truncate_text_to_token_budget(
+                                part.tool_output,
+                                _EXTRACTION_TOOL_OUTPUT_MAX_TOKENS,
+                                marker=_EXTRACTION_TOOL_OUTPUT_MARKER,
+                                head_ratio=0.5,
+                            )
+                        )
                     if part.duration_ms is not None:
                         fields.append(f"duration_ms={part.duration_ms}")
                     if part.skill_uri:

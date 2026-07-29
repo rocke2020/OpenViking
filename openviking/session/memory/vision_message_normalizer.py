@@ -7,6 +7,8 @@ from typing import Any, Dict, List
 
 from openviking.message import Message
 from openviking.message.part import ImagePart, TextPart
+from openviking.session.memory.request_budget import ensure_model_request_within_budget
+from openviking_cli.exceptions import ResourceExhaustedError
 
 IMAGE_DESCRIPTION_PROMPT = (
     "Describe this image for later memory extraction. Focus on durable, user-relevant "
@@ -58,17 +60,27 @@ async def describe_image_message(
     *,
     vlm: Any,
     logger: Any = None,
+    request_max_tokens: int | None = None,
 ) -> str:
     if vlm is None:
         return fallback_image_description(message)
 
     try:
-        response = await vlm.get_vision_completion_async(
-            messages=build_vision_description_messages(message),
-            thinking=False,
-        )
+        request = {
+            "messages": build_vision_description_messages(message),
+            "thinking": False,
+        }
+        if request_max_tokens is not None:
+            ensure_model_request_within_budget(
+                request,
+                max_tokens=request_max_tokens,
+                request_name="Phase 2 image description request",
+            )
+        response = await vlm.get_vision_completion_async(**request)
         description = normalize_vision_response(response)
         return description or fallback_image_description(message)
+    except ResourceExhaustedError:
+        raise
     except Exception as exc:
         if logger is not None:
             logger.warning("Failed to describe image message %s: %s", message.id, exc)
@@ -80,6 +92,7 @@ async def replace_image_parts_with_descriptions(
     *,
     get_vlm: Callable[[], Any],
     logger: Any = None,
+    request_max_tokens: int | None = None,
 ) -> List[Message]:
     prepared_messages: List[Message] = []
     for message in messages:
@@ -91,6 +104,7 @@ async def replace_image_parts_with_descriptions(
             message,
             vlm=get_vlm(),
             logger=logger,
+            request_max_tokens=request_max_tokens,
         )
         parts = _original_text_parts(message)
         if description:

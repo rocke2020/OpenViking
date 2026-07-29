@@ -11,10 +11,12 @@ case rollout execution.
 from __future__ import annotations
 
 import asyncio
+import copy
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Hashable
 
+from openviking.session.memory.request_budget import strictest_request_budget
 from openviking.session.memory.utils.streaming_batcher import (
     StreamingBatcher,
     StreamingBatcherConfig,
@@ -153,7 +155,7 @@ class StreamingPolicyTrainer:
     _closed: bool = field(init=False, default=False, repr=False)
 
     def __post_init__(self) -> None:
-        self.context = _coerce_pipeline_context(self.context)
+        self.context = _unscoped_pipeline_context(_coerce_pipeline_context(self.context))
         self._core = PolicyTrainingEngine(
             rollout_analyzer=self.rollout_analyzer,
             gradient_estimator=self.gradient_estimator,
@@ -250,6 +252,7 @@ class StreamingPolicyTrainer:
         *,
         analysis: RolloutAnalysis | None = None,
         rollout: Rollout | None = None,
+        request_max_tokens: int | None = None,
     ) -> RolloutTrainingResult | ScopedRolloutTrainingResult:
         """Submit pre-computed gradients directly to the streaming trainer.
 
@@ -283,6 +286,7 @@ class StreamingPolicyTrainer:
             gradients=list(gradients),
             analysis=analysis,
             rollout=rollout,
+            request_max_tokens=request_max_tokens,
         )
         result = await self._batcher.submit(buffered)
         self._last_apply_result = result.apply_result
@@ -340,7 +344,10 @@ class StreamingPolicyTrainer:
             plan, apply_result = await self._core.plan_and_apply(
                 gradients=gradient_chunk,
                 policy_set=self.policy_set,
-                ctx=self.context,
+                ctx=_pipeline_context_with_request_budget(
+                    self.context,
+                    chunk.request_max_tokens,
+                ),
             )
             self.policy_set = apply_result.updated_policy_set
             plans.append(plan)
@@ -394,18 +401,69 @@ def _chunks_buffered_items_by_gradient_count(
     if size <= 0:
         raise ValueError("chunk size must be > 0")
 
-    all_gradients: list[SemanticGradient] = []
+    all_gradients: list[tuple[SemanticGradient, int | None]] = []
     for item in items:
-        all_gradients.extend(item.gradients)
+        all_gradients.extend((gradient, item.request_max_tokens) for gradient in item.gradients)
 
     if not all_gradients:
         return [_BufferedRolloutTrainingChunk(gradients=[])]
 
     chunks: list[_BufferedRolloutTrainingChunk] = []
     for start in range(0, len(all_gradients), size):
-        chunk_gradients = all_gradients[start : start + size]
-        chunks.append(_BufferedRolloutTrainingChunk(gradients=chunk_gradients))
+        chunk_items = all_gradients[start : start + size]
+        chunks.append(
+            _BufferedRolloutTrainingChunk(
+                gradients=[gradient for gradient, _budget in chunk_items],
+                request_max_tokens=strictest_request_budget(
+                    *[budget for _gradient, budget in chunk_items]
+                ),
+            )
+        )
     return chunks
+
+
+def _pipeline_context_with_request_budget(
+    context: PipelineContext,
+    request_max_tokens: int | None,
+) -> PipelineContext:
+    """Copy one worker context and scope its optimizer to this buffered chunk."""
+
+    if request_max_tokens is None:
+        return context
+    scoped = copy.copy(context)
+    optimization_context = copy.copy(context.optimization_context)
+    if optimization_context is None or not hasattr(
+        optimization_context,
+        "request_max_tokens",
+    ):
+        raise ValueError(
+            "A request-scoped streaming policy update requires an optimization "
+            "context with request_max_tokens"
+        )
+    optimization_context.request_max_tokens = strictest_request_budget(
+        optimization_context.request_max_tokens,
+        request_max_tokens,
+    )
+    scoped.optimization_context = optimization_context
+    return scoped
+
+
+def _unscoped_pipeline_context(context: PipelineContext) -> PipelineContext:
+    """Remove request-local budgets before storing a process-global context."""
+
+    unscoped = copy.copy(context)
+    for field_name in (
+        "analysis_context",
+        "gradient_context",
+        "optimization_context",
+    ):
+        component = getattr(context, field_name)
+        if component is None or not hasattr(component, "request_max_tokens"):
+            continue
+        component_copy = copy.copy(component)
+        component_copy.request_max_tokens = None
+        setattr(unscoped, field_name, component_copy)
+    return unscoped
 
 
 def _combine_update_plans(plans: list[PolicyUpdatePlan]) -> PolicyUpdatePlan:
@@ -594,11 +652,13 @@ class _BufferedRolloutTraining:
     gradients: list[SemanticGradient]
     analysis: RolloutAnalysis | None = None
     rollout: Rollout | None = None
+    request_max_tokens: int | None = None
 
 
 @dataclass(slots=True)
 class _BufferedRolloutTrainingChunk:
     gradients: list[SemanticGradient]
+    request_max_tokens: int | None = None
 
 
 _streaming_policy_trainer_registry: dict[Hashable, StreamingPolicyTrainer] = {}

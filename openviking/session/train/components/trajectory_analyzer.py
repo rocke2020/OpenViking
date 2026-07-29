@@ -55,6 +55,7 @@ class TrajectoryAnalyzerContext:
     inject_evaluation_feedback: bool = True
     include_session_skills: bool = False
     source_archive_uri: str = ""
+    request_max_tokens: int | None = None
 
 
 @dataclass(slots=True)
@@ -94,6 +95,7 @@ class TrajectoryRolloutAnalyzer:
             include_session_skills=context.include_session_skills,
             case_name=getattr(rollout.case, "name", ""),
             source_archive_uri=context.source_archive_uri,
+            request_max_tokens=context.request_max_tokens,
         )
         contexts = list((result or {}).get("contexts", []))
         skill_gradients = list((result or {}).get("skill_gradients", []))
@@ -143,6 +145,7 @@ class TrajectoryRolloutAnalyzer:
         include_session_skills: bool = False,
         case_name: str = "",
         source_archive_uri: str = "",
+        request_max_tokens: int | None = None,
     ) -> dict[str, list[Any]]:
         """Extract trajectory and/or reusable skill operations from rollout messages.
 
@@ -163,6 +166,7 @@ class TrajectoryRolloutAnalyzer:
             latest_archive_overview=latest_archive_overview,
             include_trajectories=include_trajectories,
             include_session_skills=include_session_skills,
+            request_max_tokens=request_max_tokens,
         )
         phase_result = await self._run_trajectory_extract_phase(
             provider=provider,
@@ -173,6 +177,7 @@ class TrajectoryRolloutAnalyzer:
             include_session_skills=include_session_skills,
             case_name=case_name,
             source_archive_uri=source_archive_uri,
+            request_max_tokens=request_max_tokens,
         )
         if phase_result is None:
             return empty_result
@@ -191,6 +196,7 @@ class TrajectoryRolloutAnalyzer:
         include_session_skills: bool = False,
         case_name: str = "",
         source_archive_uri: str = "",
+        request_max_tokens: int | None = None,
     ) -> tuple[list[str], list[str], list[Context], list[PatchSemanticGradient]] | None:
         config = get_openviking_config()
         vlm = self.vlm or config.vlm.get_vlm_instance()
@@ -222,6 +228,7 @@ class TrajectoryRolloutAnalyzer:
             context_provider=provider,
             isolation_handler=isolation_handler,
             thinking=True,
+            request_max_tokens=request_max_tokens,
         )
 
         try:

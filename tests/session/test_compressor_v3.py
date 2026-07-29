@@ -3,15 +3,20 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from openviking.message import Message, TextPart
+from openviking.message import ImagePart, Message, TextPart
 from openviking.server.identity import RequestContext, Role
 from openviking.session import create_session_compressor
-from openviking.session.compressor_v3 import SessionCompressorV3, _experience_root_uri
+from openviking.session.compressor_v3 import (
+    SessionCompressorV3,
+    _experience_root_uri,
+    _merge_memory_diffs,
+)
 from openviking.session.memory.dataclass import (
     MemoryFile,
     ResolvedOperation,
@@ -36,6 +41,7 @@ from openviking.session.train import (
     Trajectory,
 )
 from openviking.session.train.components.session_commit import _case_spec_message_to_request
+from openviking_cli.exceptions import ResourceExhaustedError
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -86,6 +92,161 @@ def test_factory_ignores_deprecated_memory_version():
         create_session_compressor(vikingdb=None, memory_version="unsupported"),
         SessionCompressorV3,
     )
+
+
+@pytest.mark.asyncio
+async def test_v3_prepares_images_through_the_guarded_provider_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecordingVLM:
+        called = False
+        model = "test-model"
+
+        async def get_vision_completion_async(self, **kwargs):
+            self.called = True
+            return "unused"
+
+    class VLMConfig:
+        def __init__(self, vlm) -> None:
+            self.vlm = vlm
+
+        def is_available(self) -> bool:
+            return True
+
+        def get_vlm_instance(self):
+            return self.vlm
+
+    class Registry:
+        async def initialize_memory_files(self, *args, **kwargs):
+            return None
+
+    vlm = RecordingVLM()
+    config = SimpleNamespace(
+        vlm=VLMConfig(vlm),
+        memory=SimpleNamespace(
+            eager_prefetch=False,
+            prefetch_search_topn=5,
+            link_enabled=False,
+        ),
+    )
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_openviking_config",
+        lambda: config,
+    )
+    monkeypatch.setattr(
+        "openviking.session.memory.session_extract_context_provider.get_openviking_config",
+        lambda: config,
+    )
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_viking_fs",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.create_default_registry",
+        Registry,
+    )
+    compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=object())
+    messages = [
+        Message(
+            id="image-message",
+            role="user",
+            parts=[ImagePart(url="data:image/png;base64," + ("A" * 10_000))],
+        )
+    ]
+
+    with pytest.raises(ResourceExhaustedError, match="image description"):
+        await compressor._extract_user_memories(
+            messages,
+            ctx=_ctx(),
+            request_max_tokens=100,
+        )
+
+    assert vlm.called is False
+    assert isinstance(messages[0].parts[0], ImagePart)
+
+
+def test_merge_memory_diffs_keeps_first_available_trace_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.tracer.get_trace_id",
+        lambda: "retry-trace",
+    )
+
+    merged = _merge_memory_diffs(
+        [
+            {
+                "trace_id": "first-window-trace",
+                "operations": {"adds": [], "updates": [], "deletes": []},
+            },
+            {
+                "trace_id": "retry-trace",
+                "operations": {"adds": [], "updates": [], "deletes": []},
+            },
+        ],
+        archive_uri="viking://user/u/session/s/archive_1",
+    )
+
+    assert merged["trace_id"] == "first-window-trace"
+
+
+@pytest.mark.asyncio
+async def test_publish_memory_diffs_preserves_completed_windows_on_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MemoryDiffFS:
+        def __init__(self) -> None:
+            self.files = {}
+
+        async def exists(self, uri, ctx=None):
+            return uri in self.files
+
+        async def read_file(self, uri, ctx=None):
+            return self.files[uri]
+
+        async def write_file(self, uri, content, ctx=None):
+            self.files[uri] = content
+
+    viking_fs = MemoryDiffFS()
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_viking_fs",
+        lambda: viking_fs,
+    )
+    archive_uri = "viking://user/u/session/s/archive_1"
+    first_window = {
+        "operations": {
+            "adds": [{"uri": "viking://user/u/memories/profile.md"}],
+            "updates": [],
+            "deletes": [],
+        }
+    }
+    retry_window = {
+        "operations": {
+            "adds": [],
+            "updates": [{"uri": "viking://user/u/memories/preferences.md"}],
+            "deletes": [],
+        }
+    }
+
+    await SessionCompressorV3(vikingdb=None).publish_memory_diffs(
+        archive_uri=archive_uri,
+        ctx=_ctx(),
+        memory_diffs=[first_window],
+    )
+    await SessionCompressorV3(vikingdb=None).publish_memory_diffs(
+        archive_uri=archive_uri,
+        ctx=_ctx(),
+        memory_diffs=[retry_window],
+    )
+
+    persisted = json.loads(viking_fs.files[f"{archive_uri}/memory_diff.json"])
+    assert persisted["summary"] == {
+        "total_adds": 1,
+        "total_updates": 1,
+        "total_deletes": 0,
+    }
+    assert persisted["operations"]["adds"] == first_window["operations"]["adds"]
+    assert persisted["operations"]["updates"] == retry_window["operations"]["updates"]
 
 
 @pytest.mark.asyncio

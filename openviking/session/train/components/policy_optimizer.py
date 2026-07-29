@@ -39,6 +39,7 @@ class PatchMergePolicyOptimizerContext:
 
     request_context: RequestContext
     messages: list[Message] = field(default_factory=list)
+    request_max_tokens: int | None = None
 
 
 @dataclass(slots=True)
@@ -162,6 +163,7 @@ class PatchMergePolicyOptimizer:
             isolation_handler=isolation_handler,
             max_iterations=1,
             thinking=self.memory_type in {"trajectories", "experiences"},
+            request_max_tokens=context.request_max_tokens,
         )
         operations, _ = await orchestrator.run()
         return operations
