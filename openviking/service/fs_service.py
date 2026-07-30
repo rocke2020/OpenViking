@@ -431,9 +431,7 @@ class FSService:
             rollback_resource=lambda: viking_fs.mv(to_uri, from_uri, ctx=ctx),
         )
 
-    async def _sync_watch_after_rm(
-        self, uri: str, *, account_id: str, context_type: str
-    ) -> None:
+    async def _sync_watch_after_rm(self, uri: str, *, account_id: str, context_type: str) -> None:
         if context_type != "resource":
             return
         if is_watch_task_control_uri(uri):
@@ -587,6 +585,27 @@ class FSService:
             timeout=timeout,
         )
 
+    async def batch_write(
+        self,
+        *,
+        root_uri: str,
+        operations: list[dict[str, Any]],
+        ctx: RequestContext,
+        wait: bool = True,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Apply a preconditioned multi-file write and aggregate downstream refresh."""
+        root_uri = validate_viking_uri(root_uri, field_name="root_uri")
+        viking_fs = self._ensure_initialized()
+        coordinator = ContentWriteCoordinator(viking_fs=viking_fs, vikingdb=self._vikingdb)
+        return await coordinator.batch_write(
+            root_uri=root_uri,
+            operations=operations,
+            ctx=ctx,
+            wait=wait,
+            timeout=timeout,
+        )
+
     async def set_tags(
         self,
         uri: str,
@@ -619,9 +638,7 @@ class FSService:
     ) -> Dict[str, Any]:
         """Forward to VikingFS.commit. See viking_fs.commit for semantics."""
         viking_fs = self._ensure_initialized()
-        validated = (
-            [validate_viking_uri(p) for p in paths] if paths is not None else None
-        )
+        validated = [validate_viking_uri(p) for p in paths] if paths is not None else None
         return await viking_fs.commit(
             message=message,
             paths=validated,
@@ -718,9 +735,7 @@ class FSService:
         viking_fs = self._ensure_initialized()
         return await viking_fs.get_gitignore(ctx=ctx)
 
-    async def set_gitignore(
-        self, *, content: str, ctx: RequestContext
-    ) -> None:
+    async def set_gitignore(self, *, content: str, ctx: RequestContext) -> None:
         """Forward to VikingFS.set_gitignore. Writes the account .ovgitignore
         control file (validates the size limit)."""
         viking_fs = self._ensure_initialized()

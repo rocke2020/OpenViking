@@ -5,7 +5,6 @@
 import asyncio
 import concurrent.futures
 import json
-from contextlib import suppress
 from typing import Any, Dict, Optional
 
 from openviking.observability.context import bind_execution_context
@@ -15,10 +14,11 @@ from openviking.service.task_tracker import (
     TaskStatus,
     get_task_tracker,
 )
+from openviking.service.task_work_index import bind_task_context, extract_task_metadata
 from openviking.storage.queuefs.add_resource_msg import AddResourceMsg
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
-from openviking.telemetry import bind_telemetry, resolve_telemetry
-from openviking.telemetry.resource_summary import summarize_queue_errors
+from openviking.telemetry import bind_telemetry, resolve_telemetry, unregister_telemetry
+from openviking.telemetry.resource_summary import record_resource_queue_metrics
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.logger import get_logger
 
@@ -37,28 +37,41 @@ class AddResourceProcessor(DequeueHandlerBase):
         resource_service: Any,
         service_loop: asyncio.AbstractEventLoop,
         queue_name: str,
+        viking_fs: Any,
     ):
         self._resource_service = resource_service
         self._service_loop = service_loop
         self._queue_name = queue_name
+        self._viking_fs = viking_fs
 
     async def _load_lock(self, msg: AddResourceMsg, ctx: RequestContext) -> Any:
+        """Adopt a pathlock handoff ref, returning an owned lease dict."""
         if msg.lock_handoff is None:
+            msg._lock_handoff_adopted = False
             return None
-        from openviking.storage.transaction.lock_lease import LockHandoffRef, OwnedLockLease
-
-        ref = LockHandoffRef.from_value(msg.lock_handoff)
-        if ref is None:
-            raise ValueError("Invalid lock_handoff")
         try:
-            return await OwnedLockLease.from_handoff(ref)
+            lock = await self._viking_fs._async_agfs.pathlock_adopt(msg.lock_handoff)
+            msg._lock_handoff_adopted = True
+            return lock
         except Exception as handoff_error:
             try:
-                return await self._resource_service.reacquire_add_resource_job_lock(
+                lock = await self._resource_service.reacquire_add_resource_job_lock(
                     msg.root_uri,
                     ctx,
+                    materialization_pending=msg.target_materialization_pending,
                 )
-            except Exception:
+                msg._lock_handoff_adopted = False
+                return lock
+            except Exception as reacquire_error:
+                if msg.target_materialization_pending:
+                    from openviking.storage.errors import ResourceBusyError
+
+                    raise ResourceBusyError(
+                        f"Resource reservation is still busy: {msg.root_uri}",
+                        uri=msg.root_uri,
+                        conflict_type="path_busy",
+                        retryable=True,
+                    ) from reacquire_error
                 raise handoff_error
 
     async def _requeue_lock_handoff(self, msg: AddResourceMsg, exc: Exception) -> bool:
@@ -79,6 +92,32 @@ class AddResourceProcessor(DequeueHandlerBase):
         self.report_success()
         return True
 
+    async def _release_final_lock(self, resource_lock: Dict[str, Any]) -> None:
+        """Release a completion lock, retrying one transient backend failure."""
+        try:
+            await self._viking_fs._async_agfs.pathlock_release(resource_lock)
+        except Exception as first_error:
+            logger.warning(
+                "[AddResource] Retrying final lock release after transient failure: %s",
+                first_error,
+            )
+            await self._viking_fs._async_agfs.pathlock_release(resource_lock)
+
+    async def _release_terminal_handoff(self, msg: AddResourceMsg) -> None:
+        """Drain a legacy terminal message's still-live handoff before ACK."""
+        if msg.lock_handoff is None:
+            return
+        try:
+            resource_lock = await self._viking_fs._async_agfs.pathlock_adopt(msg.lock_handoff)
+        except Exception as exc:
+            error = str(exc)
+            if "handoff/adopt failed:" in error and (
+                "is no longer owned by" in error or "changed while adopting owner" in error
+            ):
+                return
+            raise
+        await self._viking_fs._async_agfs.pathlock_release(resource_lock)
+
     @staticmethod
     def _restore_rollback_target(msg: AddResourceMsg, task: Any) -> None:
         resource_id = getattr(task, "resource_id", None)
@@ -88,6 +127,7 @@ class AddResourceProcessor(DequeueHandlerBase):
         materialization_pending = bool(
             getattr(task, "rollback_target_materialization_pending", False)
         )
+        lock_handoff = getattr(task, "rollback_lock_handoff", None)
         if type(rollback_target_created) is not bool and not materialization_pending:
             return
         msg.root_uri = resource_id
@@ -95,6 +135,8 @@ class AddResourceProcessor(DequeueHandlerBase):
             rollback_target_created if type(rollback_target_created) is bool else None
         )
         msg.target_materialization_pending = materialization_pending
+        if isinstance(lock_handoff, dict):
+            msg.lock_handoff = dict(lock_handoff)
         msg.defer_target_resolution = False
 
     async def _rollback_cancelled(
@@ -132,7 +174,10 @@ class AddResourceProcessor(DequeueHandlerBase):
             account_id=ctx.account_id,
             user_id=ctx.user.user_id,
         )
-        if current_task is None or current_task.status != TaskStatus.CANCELLED:
+        if current_task is None or current_task.status not in (
+            TaskStatus.CANCELLING,
+            TaskStatus.CANCELLED,
+        ):
             await tracker.fail(
                 msg.task_id,
                 error,
@@ -144,7 +189,10 @@ class AddResourceProcessor(DequeueHandlerBase):
                 account_id=ctx.account_id,
                 user_id=ctx.user.user_id,
             )
-        if current_task is None or current_task.status != TaskStatus.CANCELLED:
+        if current_task is None or current_task.status not in (
+            TaskStatus.CANCELLING,
+            TaskStatus.CANCELLED,
+        ):
             return False
         await self._rollback_cancelled(
             msg,
@@ -155,6 +203,7 @@ class AddResourceProcessor(DequeueHandlerBase):
         return True
 
     async def _process(self, msg: AddResourceMsg, data: Dict[str, Any]) -> None:
+        telemetry_id = msg.telemetry_id or ""
         ctx = RequestContext(
             user=UserIdentifier(msg.account_id, msg.user_id),
             role=Role(msg.role),
@@ -168,21 +217,38 @@ class AddResourceProcessor(DequeueHandlerBase):
             user_id=ctx.user.user_id,
             task_id=msg.task_id,
             cancel_protocol_version=ADD_RESOURCE_CANCEL_PROTOCOL_VERSION,
+            meta={"source_path": msg.source_path},
         )
         self._restore_rollback_target(msg, task)
         if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+            try:
+                await self._release_terminal_handoff(msg)
+            finally:
+                unregister_telemetry(telemetry_id)
             self.report_success()
             return None
         resource_lock = None
+        finalizing_completion = False
         try:
             resource_lock = await self._load_lock(msg, ctx)
         except Exception as exc:
+            from openviking.storage.errors import ResourceBusyError
+
+            if (
+                isinstance(exc, ResourceBusyError)
+                and msg.target_materialization_pending
+                and exc.retryable
+            ):
+                raise
             current_task = await tracker.get(
                 msg.task_id,
                 account_id=ctx.account_id,
                 user_id=ctx.user.user_id,
             )
-            if current_task is not None and current_task.status == TaskStatus.CANCELLED:
+            if current_task is not None and current_task.status in (
+                TaskStatus.CANCELLING,
+                TaskStatus.CANCELLED,
+            ):
                 await self._rollback_cancelled(
                     msg,
                     ctx=ctx,
@@ -204,9 +270,10 @@ class AddResourceProcessor(DequeueHandlerBase):
                 self.report_success()
                 return None
             self.report_error(error, data)
+            unregister_telemetry(telemetry_id)
             return None
 
-        if task.status == TaskStatus.CANCELLED:
+        if task.status in (TaskStatus.CANCELLING, TaskStatus.CANCELLED):
             try:
                 await self._rollback_cancelled(
                     msg,
@@ -216,11 +283,12 @@ class AddResourceProcessor(DequeueHandlerBase):
                 )
             finally:
                 if resource_lock is not None:
-                    await resource_lock.close()
+                    await self._viking_fs._async_agfs.pathlock_release(resource_lock)
+                    resource_lock = None
             self.report_success()
+            unregister_telemetry(telemetry_id)
             return None
 
-        telemetry_id = msg.telemetry_id or ""
         telemetry = resolve_telemetry(telemetry_id) if telemetry_id else None
         if telemetry is None:
             from openviking.telemetry.operation import OperationTelemetry
@@ -239,8 +307,13 @@ class AddResourceProcessor(DequeueHandlerBase):
                 user_id=ctx.user.user_id,
             )
 
-        with bind_execution_context(), bind_telemetry(telemetry):
+        with (
+            bind_execution_context(),
+            bind_telemetry(telemetry),
+            bind_task_context(msg.task_id, ctx.account_id, ctx.user.user_id),
+        ):
             try:
+                metadata = extract_task_metadata(data)
                 await tracker.start(
                     msg.task_id,
                     account_id=ctx.account_id,
@@ -253,12 +326,17 @@ class AddResourceProcessor(DequeueHandlerBase):
                     resource_lock=resource_lock,
                     stage_callback=_set_stage,
                 )
+                if result.pop("_resource_lock_transferred", False):
+                    resource_lock = None
                 current_task = await tracker.get(
                     msg.task_id,
                     account_id=ctx.account_id,
                     user_id=ctx.user.user_id,
                 )
-                if current_task is not None and current_task.status == TaskStatus.CANCELLED:
+                if current_task is not None and current_task.status in (
+                    TaskStatus.CANCELLING,
+                    TaskStatus.CANCELLED,
+                ):
                     await self._rollback_cancelled(
                         msg,
                         ctx=ctx,
@@ -281,40 +359,72 @@ class AddResourceProcessor(DequeueHandlerBase):
                         return None
                     self.report_error("resource processing failed", data)
                     return None
-                queue_errors = summarize_queue_errors(result.get("queue_status"))
-                if queue_errors:
-                    error = "queue processing failed: " + "; ".join(queue_errors)
-                    if await self._fail_or_rollback_cancelled(
+                await tracker.wait_for_descendants(msg.task_id, metadata.work_id)
+                record_resource_queue_metrics(
+                    telemetry=telemetry,
+                    telemetry_id=telemetry_id,
+                    root_uri=result.get("root_uri"),
+                )
+                await self._resource_service._link_resource_reason_memory(
+                    result=result,
+                    ctx=ctx,
+                    reason=msg.reason,
+                    source_name=msg.source_name,
+                    timeout=msg.timeout,
+                )
+                current_task = await tracker.get(
+                    msg.task_id,
+                    account_id=ctx.account_id,
+                    user_id=ctx.user.user_id,
+                )
+                if current_task is not None and current_task.status in (
+                    TaskStatus.CANCELLING,
+                    TaskStatus.CANCELLED,
+                ):
+                    await self._rollback_cancelled(
                         msg,
-                        error,
                         ctx=ctx,
                         tracker=tracker,
                         resource_lock=resource_lock,
-                    ):
-                        self.report_success()
-                        return None
-                    self.report_error("queue processing failed", data)
+                    )
+                    self.report_success()
                     return None
-                completed = await tracker.complete(
+                finalizing_completion = True
+                if resource_lock is not None:
+                    await self._release_final_lock(resource_lock)
+                    resource_lock = None
+                await tracker.update_add_resource_rollback_target(
+                    msg.task_id,
+                    result.get("root_uri") or msg.root_uri,
+                    msg.target_created,
+                    account_id=ctx.account_id,
+                    user_id=ctx.user.user_id,
+                    materialization_pending=False,
+                    lock_handoff=None,
+                )
+                await tracker.complete(
                     msg.task_id,
                     result,
                     account_id=ctx.account_id,
                     user_id=ctx.user.user_id,
                     resource_id=result.get("root_uri"),
                 )
-                if not completed:
-                    current_task = await tracker.get(
-                        msg.task_id,
-                        account_id=ctx.account_id,
-                        user_id=ctx.user.user_id,
+                finalizing_completion = False
+                current_task = await tracker.get(
+                    msg.task_id,
+                    account_id=ctx.account_id,
+                    user_id=ctx.user.user_id,
+                )
+                if current_task is not None and current_task.status in (
+                    TaskStatus.CANCELLING,
+                    TaskStatus.CANCELLED,
+                ):
+                    await self._rollback_cancelled(
+                        msg,
+                        ctx=ctx,
+                        tracker=tracker,
+                        resource_lock=resource_lock,
                     )
-                    if current_task is not None and current_task.status == TaskStatus.CANCELLED:
-                        await self._rollback_cancelled(
-                            msg,
-                            ctx=ctx,
-                            tracker=tracker,
-                            resource_lock=resource_lock,
-                        )
                 self.report_success()
                 return None
             except AddResourceTaskCancelled:
@@ -326,10 +436,9 @@ class AddResourceProcessor(DequeueHandlerBase):
                 )
                 self.report_success()
                 return None
-            except asyncio.CancelledError:
-                # Leave both task and QueueFS message active; RecoverStale owns restart recovery.
-                raise
             except Exception as exc:
+                if finalizing_completion:
+                    raise
                 from openviking.storage.errors import ResourceBusyError
                 from openviking.utils.resource_processor import (
                     RollbackTargetPersistenceError,
@@ -356,9 +465,23 @@ class AddResourceProcessor(DequeueHandlerBase):
                 self.report_error(str(exc), data)
                 return None
             finally:
-                with suppress(Exception):
-                    if resource_lock is not None:
-                        await resource_lock.close()
+                unregister_telemetry(telemetry_id)
+                if resource_lock is not None and not finalizing_completion:
+                    await self._viking_fs._async_agfs.pathlock_release(resource_lock)
+
+    async def on_cancelled(self, data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Release an enqueue-time lock before ACKing cancelled work."""
+        try:
+            payload = data.get("data", data) if isinstance(data, dict) else data
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            msg = AddResourceMsg.from_dict(payload)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            self.report_error(str(exc), data)
+            return None
+        future = asyncio.run_coroutine_threadsafe(self._process(msg, payload), self._service_loop)
+        await asyncio.wrap_future(future)
+        return None
 
     async def on_dequeue(self, data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not data:

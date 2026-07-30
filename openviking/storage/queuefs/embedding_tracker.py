@@ -82,36 +82,43 @@ class EmbeddingTaskTracker:
             owner_loop and not owner_loop.is_closed() and owner_loop_running
         )
 
-        try:
-            if owner_loop and owner_loop is not current_loop:
-                if not owner_loop_available:
+        if owner_loop and owner_loop is not current_loop:
+            if not owner_loop_available:
+                logger.warning(
+                    "Owner loop unavailable before completion callback for %s; "
+                    "running callback in current loop",
+                    semantic_msg_id,
+                )
+            else:
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(
+                        self._execute_callback(on_complete),
+                        owner_loop,
+                    )
+                except RuntimeError:
                     logger.warning(
-                        "Owner loop unavailable before completion callback for %s; "
+                        "Owner loop stopped before completion callback for %s; "
                         "running callback in current loop",
                         semantic_msg_id,
                     )
                 else:
-                    try:
-                        fut = asyncio.run_coroutine_threadsafe(
-                            self._execute_callback(on_complete),
-                            owner_loop,
-                        )
-                    except RuntimeError:
-                        logger.warning(
-                            "Owner loop stopped before completion callback for %s; "
-                            "running callback in current loop",
-                            semantic_msg_id,
-                        )
-                    else:
-                        await asyncio.wrap_future(fut)
-                        return
+                    await asyncio.wrap_future(fut)
+                    return
 
-            await self._execute_callback(on_complete)
-        except Exception as e:
-            logger.error(
-                f"Error in completion callback for {semantic_msg_id}: {e}",
-                exc_info=True,
-            )
+        await self._execute_callback(on_complete)
+
+    async def _finalize_record(
+        self,
+        semantic_msg_id: str,
+        record: _EmbeddingTaskRecord,
+    ) -> None:
+        """Run completion and restore retry ownership if the callback fails."""
+        try:
+            await self._run_on_complete(semantic_msg_id, record)
+        except Exception:
+            with self._lock:
+                self._tasks.setdefault(semantic_msg_id, record)
+            raise
 
     @classmethod
     def get_instance(cls) -> "EmbeddingTaskTracker":
@@ -166,7 +173,7 @@ class EmbeddingTaskTracker:
                 )
 
         if record_to_finalize is not None:
-            await self._run_on_complete(semantic_msg_id, record_to_finalize)
+            await self._finalize_record(semantic_msg_id, record_to_finalize)
 
     async def decrement(self, semantic_msg_id: str) -> Optional[int]:
         """Decrement the remaining task count for a SemanticMsg.
@@ -198,7 +205,7 @@ class EmbeddingTaskTracker:
                 )
 
         if record_to_finalize is not None:
-            await self._run_on_complete(semantic_msg_id, record_to_finalize)
+            await self._finalize_record(semantic_msg_id, record_to_finalize)
         return remaining
 
     async def cancel(self, semantic_msg_id: str) -> bool:
@@ -207,5 +214,5 @@ class EmbeddingTaskTracker:
             record = self._tasks.pop(semantic_msg_id, None)
         if record is None:
             return False
-        await self._run_on_complete(semantic_msg_id, record)
+        await self._finalize_record(semantic_msg_id, record)
         return True

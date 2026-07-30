@@ -5,6 +5,7 @@
 
 import asyncio
 import json
+import threading
 import time
 from copy import deepcopy
 from dataclasses import asdict
@@ -16,6 +17,7 @@ from openviking.server.identity import RequestContext, Role
 from openviking.service.session_service import SessionService
 from openviking.service.task_store import PersistentTaskStore
 from openviking.service.task_tracker import (
+    ADD_RESOURCE_CANCEL_PROTOCOL_VERSION,
     TaskStatus,
     TaskTracker,
     _sanitize_error,
@@ -47,6 +49,13 @@ def _owner_kwargs(account_id: str = "acme", user_id: str = "alice"):
     }
 
 
+def _cancellable_task_kwargs():
+    return {
+        **_owner_kwargs(),
+        "cancel_protocol_version": ADD_RESOURCE_CANCEL_PROTOCOL_VERSION,
+    }
+
+
 def _make_ctx(account_id: str = "acme", user_id: str = "alice") -> RequestContext:
     return RequestContext(
         user=UserIdentifier(account_id, user_id),
@@ -64,6 +73,8 @@ class _FakeAgfs:
     def __init__(self):
         self.files = {}
         self.dirs = {"/", "/local"}
+        self._pathlock_guard = threading.Lock()
+        self._next_pathlock_id = 0
 
     def mkdir(self, path: str, mode: str = "755"):
         self.dirs.add(path.rstrip("/") or "/")
@@ -116,6 +127,33 @@ class _FakeAgfs:
                     children[name] = {"name": name, "path": f"{prefix}/{name}", "is_dir": False}
         return list(children.values())
 
+    def pathlock_acquire_exact(
+        self,
+        _ctx,
+        path,
+        timeout_secs=0.0,
+        owner_lease_ref=None,
+    ):
+        del owner_lease_ref
+        if timeout_secs == float("inf"):
+            acquired = self._pathlock_guard.acquire()
+        else:
+            acquired = self._pathlock_guard.acquire(timeout=max(0.0, timeout_secs))
+        if not acquired:
+            raise TimeoutError(path)
+        self._next_pathlock_id += 1
+        lock_id = f"test-lock-{self._next_pathlock_id}"
+        return {
+            "lease_ref": lock_id,
+            "ownership_ref": lock_id,
+            "owner_id": lock_id,
+            "lock_paths": [path],
+            "covered_paths": [{"path": path, "kind": "exact"}],
+        }
+
+    def pathlock_release(self, _ctx, _owned_lease_ref):
+        self._pathlock_guard.release()
+
 
 class _FakeAgfsExistingDir(_FakeAgfs):
     def mkdir(self, path: str, mode: str = "755"):
@@ -124,6 +162,22 @@ class _FakeAgfsExistingDir(_FakeAgfs):
             raise AGFSAlreadyExistsError(f"already exists: {path}")
         self.dirs.add(normalized)
         return {"message": "created", "mode": mode}
+
+
+class _LeaseContextAgfs(_FakeAgfs):
+    def __init__(self):
+        super().__init__()
+        self.last_acquired_lease = None
+        self.write_contexts = []
+
+    def write(self, path: str, data, ctx=None):
+        self.write_contexts.append(ctx)
+        return super().write(path, data)
+
+    def pathlock_acquire_exact(self, *args, **kwargs):
+        lease = super().pathlock_acquire_exact(*args, **kwargs)
+        self.last_acquired_lease = lease
+        return lease
 
 
 # ── Basic CRUD ──
@@ -148,7 +202,7 @@ async def test_start_task(tracker: TaskTracker):
 async def test_cancel_running_task_is_terminal_and_persistent():
     agfs = _FakeAgfs()
     tracker = TaskTracker(store=PersistentTaskStore(agfs))
-    task = await tracker.create("add_resource", **_owner_kwargs())
+    task = await tracker.create("add_resource", **_cancellable_task_kwargs())
     await tracker.start(task.task_id, **_owner_kwargs())
 
     cancelled = await tracker.cancel(task.task_id, **_owner_kwargs())
@@ -169,7 +223,7 @@ async def test_cancelled_task_is_not_reported_as_running(tracker: TaskTracker):
     task = await tracker.create(
         "add_resource",
         resource_id="viking://resources/demo",
-        **_owner_kwargs(),
+        **_cancellable_task_kwargs(),
     )
     await tracker.start(task.task_id, **_owner_kwargs())
     await tracker.cancel(task.task_id, **_owner_kwargs())
@@ -185,13 +239,13 @@ async def test_persisted_cancellation_wins_over_stale_cached_completion():
     agfs = _FakeAgfs()
     worker_tracker = TaskTracker(store=PersistentTaskStore(agfs))
     api_tracker = TaskTracker(store=PersistentTaskStore(agfs))
-    task = await worker_tracker.create("add_resource", **_owner_kwargs())
+    task = await worker_tracker.create("add_resource", **_cancellable_task_kwargs())
     await worker_tracker.start(task.task_id, **_owner_kwargs())
 
     await api_tracker.cancel(task.task_id, **_owner_kwargs())
     completed = await worker_tracker.complete(task.task_id, {}, **_owner_kwargs())
 
-    assert completed is False
+    assert completed is None
     persisted = await TaskTracker(store=PersistentTaskStore(agfs)).get(
         task.task_id,
         **_owner_kwargs(),
@@ -218,7 +272,7 @@ async def test_concurrent_cancel_cannot_be_overwritten_by_late_completion():
             async with self.lock:
                 if self.payload["status"] not in expected_statuses:
                     return False
-                if task.status == TaskStatus.CANCELLED:
+                if task.status == TaskStatus.CANCELLING:
                     self.cancel_write_started.set()
                     await self.release_cancel_write.wait()
                 self.payload = self._payload(task)
@@ -242,7 +296,7 @@ async def test_concurrent_cancel_cannot_be_overwritten_by_late_completion():
     store = PausingTaskStore()
     worker_tracker = TaskTracker(store=store)
     api_tracker = TaskTracker(store=store)
-    task = await worker_tracker.create("add_resource", **_owner_kwargs())
+    task = await worker_tracker.create("add_resource", **_cancellable_task_kwargs())
     await worker_tracker.start(task.task_id, **_owner_kwargs())
 
     cancelling = asyncio.create_task(api_tracker.cancel(task.task_id, **_owner_kwargs()))
@@ -254,13 +308,13 @@ async def test_concurrent_cancel_cannot_be_overwritten_by_late_completion():
 
     assert cancelled is not None
     assert cancelled.status == TaskStatus.CANCELLED
-    assert completed is False
+    assert completed is None
     assert store.payload["status"] == TaskStatus.CANCELLED.value
     assert worker_tracker.is_cancelled(task.task_id) is True
 
 
 async def test_update_stage(tracker: TaskTracker):
-    task = await tracker.create("add_resource", **_owner_kwargs())
+    task = await tracker.create("add_resource", **_cancellable_task_kwargs())
     await tracker.start(task.task_id, stage="queued")
     await tracker.update_stage(task.task_id, "parsing")
     retrieved = await tracker.get(task.task_id)
@@ -281,7 +335,11 @@ async def test_complete_task(tracker: TaskTracker):
 
 
 async def test_complete_task_updates_resource_id(tracker: TaskTracker):
-    task = await tracker.create("add_resource", resource_id=None, **_owner_kwargs())
+    task = await tracker.create(
+        "add_resource",
+        resource_id=None,
+        **_cancellable_task_kwargs(),
+    )
 
     await tracker.complete(
         task.task_id,
@@ -596,7 +654,7 @@ async def test_run_unless_cancelled_serializes_operation_before_cancellation():
     agfs = _FakeAgfs()
     worker_tracker = TaskTracker(store=PersistentTaskStore(agfs))
     api_tracker = TaskTracker(store=PersistentTaskStore(agfs))
-    task = await worker_tracker.create("add_resource", **_owner_kwargs())
+    task = await worker_tracker.create("add_resource", **_cancellable_task_kwargs())
     await worker_tracker.start(task.task_id, **_owner_kwargs())
     operation_started = asyncio.Event()
     release_operation = asyncio.Event()
@@ -629,11 +687,9 @@ async def test_run_unless_cancelled_refreshes_lock_during_slow_operation():
     agfs = _FakeAgfs()
     worker_store = PersistentTaskStore(agfs)
     api_store = PersistentTaskStore(agfs)
-    worker_store._task_locks._lock_expire = 0.3
-    api_store._task_locks._lock_expire = 0.3
     worker_tracker = TaskTracker(store=worker_store)
     api_tracker = TaskTracker(store=api_store)
-    task = await worker_tracker.create("add_resource", **_owner_kwargs())
+    task = await worker_tracker.create("add_resource", **_cancellable_task_kwargs())
     await worker_tracker.start(task.task_id, **_owner_kwargs())
     operation_started = asyncio.Event()
     release_operation = asyncio.Event()
@@ -658,7 +714,7 @@ async def test_run_unless_cancelled_refreshes_lock_during_slow_operation():
 
 async def test_run_unless_cancelled_allows_completed_task_work():
     tracker = TaskTracker(store=PersistentTaskStore(_FakeAgfs()))
-    task = await tracker.create("add_resource", **_owner_kwargs())
+    task = await tracker.create("add_resource", **_cancellable_task_kwargs())
     await tracker.complete(task.task_id, {}, **_owner_kwargs())
 
     accepted, result = await tracker.run_unless_cancelled(
@@ -675,7 +731,7 @@ async def test_rollback_target_update_preserves_cancelled_status_across_trackers
     agfs = _FakeAgfs()
     worker_tracker = TaskTracker(store=PersistentTaskStore(agfs))
     api_tracker = TaskTracker(store=PersistentTaskStore(agfs))
-    task = await worker_tracker.create("add_resource", **_owner_kwargs())
+    task = await worker_tracker.create("add_resource", **_cancellable_task_kwargs())
     await api_tracker.cancel(task.task_id, **_owner_kwargs())
 
     updated = await worker_tracker.update_add_resource_rollback_target(
@@ -700,13 +756,14 @@ async def test_rollback_target_update_preserves_cancelled_status_across_trackers
 async def test_pending_target_materialization_survives_restart_and_cancellation():
     agfs = _FakeAgfs()
     worker_tracker = TaskTracker(store=PersistentTaskStore(agfs))
-    task = await worker_tracker.create("add_resource", **_owner_kwargs())
+    task = await worker_tracker.create("add_resource", **_cancellable_task_kwargs())
 
     pending = await worker_tracker.update_add_resource_rollback_target(
         task.task_id,
         "viking://resources/resolved",
         None,
         materialization_pending=True,
+        lock_handoff={"handoff_ref": "exact-lock"},
         **_owner_kwargs(),
     )
     await TaskTracker(store=PersistentTaskStore(agfs)).cancel(
@@ -725,7 +782,9 @@ async def test_pending_target_materialization_survives_restart_and_cancellation(
     assert recovered.resource_id == "viking://resources/resolved"
     assert recovered.rollback_target_created is None
     assert recovered.rollback_target_materialization_pending is True
+    assert recovered.rollback_lock_handoff == {"handoff_ref": "exact-lock"}
     assert "rollback_target_materialization_pending" not in recovered.to_dict()
+    assert "rollback_lock_handoff" not in recovered.to_dict()
 
 
 async def test_cancellation_preserves_concurrent_rollback_target_update():
@@ -733,7 +792,7 @@ async def test_cancellation_preserves_concurrent_rollback_target_update():
     api_store = PersistentTaskStore(agfs)
     worker_tracker = TaskTracker(store=PersistentTaskStore(agfs))
     api_tracker = TaskTracker(store=api_store)
-    task = await api_tracker.create("add_resource", **_owner_kwargs())
+    task = await api_tracker.create("add_resource", **_cancellable_task_kwargs())
     await api_tracker.start(task.task_id, **_owner_kwargs())
     cancellation_snapshot_loaded = asyncio.Event()
     release_cancellation = asyncio.Event()
@@ -765,6 +824,44 @@ async def test_cancellation_preserves_concurrent_rollback_target_update():
     assert reloaded.status == TaskStatus.CANCELLED
     assert reloaded.resource_id == "viking://resources/resolved"
     assert reloaded.rollback_target_created is True
+
+
+async def test_status_cas_write_uses_the_owned_exact_lease():
+    agfs = _LeaseContextAgfs()
+    tracker = TaskTracker(store=PersistentTaskStore(agfs))
+    task = await tracker.create("add_resource", **_cancellable_task_kwargs())
+    agfs.write_contexts.clear()
+
+    await tracker.start(task.task_id, **_owner_kwargs())
+
+    assert agfs.write_contexts == [
+        {
+            "account_id": "acme",
+            "lease_ref": agfs.last_acquired_lease["lease_ref"],
+        }
+    ]
+
+
+async def test_rollback_target_cas_write_uses_the_owned_exact_lease():
+    agfs = _LeaseContextAgfs()
+    tracker = TaskTracker(store=PersistentTaskStore(agfs))
+    task = await tracker.create("add_resource", **_cancellable_task_kwargs())
+    agfs.write_contexts.clear()
+
+    await tracker.update_add_resource_rollback_target(
+        task.task_id,
+        "viking://resources/resolved",
+        None,
+        materialization_pending=True,
+        **_owner_kwargs(),
+    )
+
+    assert agfs.write_contexts == [
+        {
+            "account_id": "acme",
+            "lease_ref": agfs.last_acquired_lease["lease_ref"],
+        }
+    ]
 
 
 async def test_persistent_store_writes_task_record_json():

@@ -9,14 +9,13 @@ from copy import deepcopy
 from typing import Any, Awaitable, Callable, Collection, Dict, List, Optional, Protocol
 
 from openviking.pyagfs import AsyncAGFSClient
+from openviking.pyagfs.async_client import fs_ctx_from_agfs_path
 from openviking.pyagfs.exceptions import AGFSAlreadyExistsError, AGFSNotFoundError
-from openviking.storage.transaction.lock_handle import LockHandle
-from openviking.storage.transaction.lock_lease import OwnedLockLease
-from openviking.storage.transaction.lock_manager import LockManager
-from openviking.storage.transaction.path_lock import PathLockEngine
+from openviking.storage.pathlock_lease import NativePathLockLease
 
 SYSTEM_TASK_ACCOUNT_ID = "_system"
 SYSTEM_TASK_USER_ID = "root"
+TASK_STORE_LOCK_TIMEOUT_SECS = 30.0
 
 
 class TaskStore(Protocol):
@@ -35,6 +34,7 @@ class TaskStore(Protocol):
         resource_id: str,
         rollback_target_created: Optional[bool],
         materialization_pending: bool = False,
+        lock_handoff: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]: ...
 
     async def run_if_status(
@@ -72,10 +72,7 @@ class PersistentTaskStore:
     TASKS_DIRNAME = "tasks"
 
     def __init__(self, agfs: Any) -> None:
-        sync_agfs = agfs._client if isinstance(agfs, AsyncAGFSClient) else agfs
         self._agfs = agfs if isinstance(agfs, AsyncAGFSClient) else AsyncAGFSClient(agfs)
-        self._task_lock_manager = LockManager(sync_agfs, redo_recovery_enabled=False)
-        self._task_locks: PathLockEngine = self._task_lock_manager._path_lock
 
     async def create(self, task: Any) -> None:
         await self._write_task(task)
@@ -90,14 +87,13 @@ class PersistentTaskStore:
     ) -> bool:
         """Update a task only while its persisted status is still expected."""
         path = self._task_path(task.account_id, task.user_id, task.task_id)
-        owner = LockHandle()
-        acquired = await self._task_locks.acquire_exact_path(
-            path,
-            owner,
-            timeout=float("inf"),
+        lease = NativePathLockLease(
+            self._agfs,
+            await self._agfs.pathlock_acquire_exact(
+                path,
+                timeout_secs=TASK_STORE_LOCK_TIMEOUT_SECS,
+            ),
         )
-        if not acquired:
-            raise RuntimeError(f"Failed to acquire task state lock: {task.task_id}")
         try:
             current = await self.get(
                 task.task_id,
@@ -110,6 +106,7 @@ class PersistentTaskStore:
             persisted_materialization_pending = bool(
                 current.get("rollback_target_materialization_pending", False)
             )
+            persisted_lock_handoff = current.get("rollback_lock_handoff")
             if type(persisted_rollback_target_created) is bool or persisted_materialization_pending:
                 task.resource_id = current.get("resource_id")
                 task.rollback_target_created = (
@@ -118,10 +115,15 @@ class PersistentTaskStore:
                     else None
                 )
                 task.rollback_target_materialization_pending = persisted_materialization_pending
-            await self._write_task(task)
+                task.rollback_lock_handoff = (
+                    deepcopy(persisted_lock_handoff)
+                    if isinstance(persisted_lock_handoff, dict)
+                    else None
+                )
+            await self._write_task(task, lease_ref=lease.ref)
             return True
         finally:
-            await self._task_locks.release(owner)
+            await lease.close()
 
     async def update_add_resource_rollback_target(
         self,
@@ -132,17 +134,17 @@ class PersistentTaskStore:
         resource_id: str,
         rollback_target_created: Optional[bool],
         materialization_pending: bool = False,
+        lock_handoff: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Persist rollback metadata without overwriting a concurrent lifecycle transition."""
         path = self._task_path(account_id, user_id, task_id)
-        owner = LockHandle()
-        acquired = await self._task_locks.acquire_exact_path(
-            path,
-            owner,
-            timeout=float("inf"),
+        lease = NativePathLockLease(
+            self._agfs,
+            await self._agfs.pathlock_acquire_exact(
+                path,
+                timeout_secs=TASK_STORE_LOCK_TIMEOUT_SECS,
+            ),
         )
-        if not acquired:
-            raise RuntimeError(f"Failed to acquire task state lock: {task_id}")
         try:
             current = await self.get(
                 task_id,
@@ -154,10 +156,11 @@ class PersistentTaskStore:
             current["resource_id"] = resource_id
             current["rollback_target_created"] = rollback_target_created
             current["rollback_target_materialization_pending"] = materialization_pending
-            await self._write_payload(path, current)
+            current["rollback_lock_handoff"] = deepcopy(lock_handoff)
+            await self._write_payload(path, current, lease_ref=lease.ref)
             return deepcopy(current)
         finally:
-            await self._task_locks.release(owner)
+            await lease.close()
 
     async def run_if_status(
         self,
@@ -170,10 +173,12 @@ class PersistentTaskStore:
     ) -> tuple[bool, Any]:
         """Run an operation while the persisted task remains in an expected state."""
         path = self._task_path(account_id, user_id, task_id)
-        lease = await OwnedLockLease.acquire_exact_paths(
-            self._task_lock_manager,
-            [path],
-            timeout=float("inf"),
+        lease = NativePathLockLease(
+            self._agfs,
+            await self._agfs.pathlock_acquire_exact(
+                path,
+                timeout_secs=TASK_STORE_LOCK_TIMEOUT_SECS,
+            ),
         )
         try:
             current = await self.get(
@@ -228,7 +233,12 @@ class PersistentTaskStore:
             return
         await self._agfs.rm(self._task_path(account_id, user_id, task_id), force=True)
 
-    async def _write_task(self, task: Any) -> None:
+    async def _write_task(
+        self,
+        task: Any,
+        *,
+        lease_ref: Optional[Dict[str, Any]] = None,
+    ) -> None:
         account_id = getattr(task, "account_id", None)
         user_id = getattr(task, "user_id", None)
         if not account_id or not user_id:
@@ -237,12 +247,26 @@ class PersistentTaskStore:
         await self._write_payload(
             self._task_path(account_id, user_id, task.task_id),
             _task_to_payload(task),
+            lease_ref=lease_ref,
         )
 
-    async def _write_payload(self, path: str, payload: Dict[str, Any]) -> None:
+    async def _write_payload(
+        self,
+        path: str,
+        payload: Dict[str, Any],
+        *,
+        lease_ref: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        fs_ctx = fs_ctx_from_agfs_path(path)
+        if lease_ref is not None:
+            opaque_ref = lease_ref.get("lease_ref")
+            if not isinstance(opaque_ref, str) or not opaque_ref:
+                raise ValueError("owned task-store lease must contain lease_ref")
+            fs_ctx["lease_ref"] = opaque_ref
         await self._agfs.write(
             path,
             json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            fs_ctx=fs_ctx,
         )
 
     async def _ensure_task_dir(self, account_id: str, user_id: str) -> None:
@@ -290,12 +314,14 @@ def _task_to_payload(task: Any) -> Dict[str, Any]:
         "resource_id": task.resource_id,
         "account_id": task.account_id,
         "user_id": task.user_id,
+        "meta": deepcopy(task.meta),
         "stage": task.stage,
         "result": deepcopy(task.result),
         "error": task.error,
         "cancel_protocol_version": task.cancel_protocol_version,
         "rollback_target_created": task.rollback_target_created,
         "rollback_target_materialization_pending": (task.rollback_target_materialization_pending),
+        "rollback_lock_handoff": deepcopy(task.rollback_lock_handoff),
     }
 
 

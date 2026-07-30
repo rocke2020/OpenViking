@@ -5,6 +5,7 @@ import asyncio
 import concurrent.futures
 import threading
 import time
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -185,3 +186,18 @@ async def test_tracker_clears_zero_task_entry_without_callback():
     await tracker.register("semantic-msg", 0, on_complete=None)
 
     assert await tracker.decrement("semantic-msg") is None
+
+
+@pytest.mark.asyncio
+async def test_tracker_retries_completion_callback_after_failure():
+    tracker = EmbeddingTaskTracker.get_instance()
+    on_complete = AsyncMock(side_effect=[RuntimeError("release failed"), None])
+    await tracker.register("semantic-msg", 1, on_complete=on_complete)
+
+    with pytest.raises(RuntimeError, match="release failed"):
+        await tracker.decrement("semantic-msg")
+
+    assert "semantic-msg" in tracker._tasks
+    assert await tracker.decrement("semantic-msg") == -1
+    assert "semantic-msg" not in tracker._tasks
+    assert on_complete.await_count == 2

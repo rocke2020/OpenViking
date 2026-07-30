@@ -3,6 +3,7 @@
 
 """Tests for multi-tenant authentication (openviking/server/auth.py)."""
 
+import threading
 import uuid
 from types import SimpleNamespace
 
@@ -25,6 +26,7 @@ from openviking.service.core import OpenVikingService
 from openviking.service.resource_service import ResourceService
 from openviking.service.task_store import PersistentTaskStore
 from openviking.service.task_tracker import (
+    ADD_RESOURCE_CANCEL_PROTOCOL_VERSION,
     TaskTracker,
     get_task_tracker,
     set_task_tracker,
@@ -41,6 +43,8 @@ class _FakeAgfs:
     def __init__(self):
         self.files = {}
         self.dirs = {"/", "/local"}
+        self._pathlock_guard = threading.Lock()
+        self._next_pathlock_id = 0
 
     def mkdir(self, path: str, mode: str = "755"):
         self.dirs.add(path.rstrip("/") or "/")
@@ -72,6 +76,33 @@ class _FakeAgfs:
     def rm(self, path: str, recursive: bool = False, force: bool = True):
         self.files.pop(path, None)
         return {"message": "deleted"}
+
+    def pathlock_acquire_exact(
+        self,
+        _ctx,
+        path,
+        timeout_secs=0.0,
+        owner_lease_ref=None,
+    ):
+        del owner_lease_ref
+        if timeout_secs == float("inf"):
+            acquired = self._pathlock_guard.acquire()
+        else:
+            acquired = self._pathlock_guard.acquire(timeout=max(0.0, timeout_secs))
+        if not acquired:
+            raise TimeoutError(path)
+        self._next_pathlock_id += 1
+        lock_id = f"test-lock-{self._next_pathlock_id}"
+        return {
+            "lease_ref": lock_id,
+            "ownership_ref": lock_id,
+            "owner_id": lock_id,
+            "lock_paths": [path],
+            "covered_paths": [{"path": path, "kind": "exact"}],
+        }
+
+    def pathlock_release(self, _ctx, _owned_lease_ref):
+        self._pathlock_guard.release()
 
 
 def _set_fake_task_tracker():
@@ -484,6 +515,7 @@ async def test_task_cancel_endpoint_cancels_owned_running_add_resource():
         resource_id="viking://resources/cancel-me",
         account_id=account_id,
         user_id="alice",
+        cancel_protocol_version=ADD_RESOURCE_CANCEL_PROTOCOL_VERSION,
     )
     await tracker.start(task.task_id, account_id=account_id, user_id="alice")
     set_service(SimpleNamespace(resources=ResourceService()))
@@ -502,7 +534,7 @@ async def test_task_cancel_endpoint_cancels_owned_running_add_resource():
     set_task_tracker(None)
 
 
-async def test_task_cancel_endpoint_rejects_other_task_types():
+async def test_task_cancel_endpoint_cancels_owned_running_session_commit():
     set_task_tracker(None)
     _set_fake_task_tracker()
     account_id = _uid()
@@ -524,8 +556,8 @@ async def test_task_cancel_endpoint_rejects_other_task_types():
     ) as client:
         response = await client.post(f"/api/v1/tasks/{task.task_id}/cancel")
 
-    assert response.status_code == 412
-    assert response.json()["error"]["code"] == "FAILED_PRECONDITION"
+    assert response.status_code == 200
+    assert response.json()["result"]["status"] == "cancelled"
     set_service(None)
     set_task_tracker(None)
 

@@ -13,9 +13,10 @@ Query background task status for APIs that return `task_id`, such as session com
 **Task Statuses:**
 - `pending`: Task waiting to execute
 - `running`: Task in progress
+- `cancelling`: Cancellation requested; waiting for the task's durable queue messages and in-process work to settle
 - `completed`: Task successfully completed
 - `failed`: Task failed
-- `cancelled`: An `add_resource` task was cancelled
+- `cancelled`: Task cancelled
 
 **Code Entries:**
 - `openviking/server/routers/tasks.py:get_task()` - HTTP route
@@ -143,36 +144,76 @@ ov task status uuid-xxx
 
 #### 1. API Implementation Introduction
 
-Cancel a pending or running `add_resource` task. The endpoint durably records `cancelled` before it
-returns; cooperative worker drain and safe rollback may still be finishing afterward.
+Request cooperative cancellation of a background task. The operation immediately prevents the task from creating new QueueFS work and asks active in-process work to stop at a safe boundary. If durable messages or in-process work remain, the operation first returns `cancelling`. The task becomes `cancelled` only after all owned work settles.
 
-Repeating cancellation for an already-cancelled task is idempotent. Tasks owned by another user
-return `NOT_FOUND`; completed, failed, and non-`add_resource` tasks return `FAILED_PRECONDITION`.
-An `add_resource` task created before durable cancellation support also returns
-`FAILED_PRECONDITION`, because its legacy queued messages cannot be stopped safely and must drain.
-Root administrators can use `ov --sudo task cancel` with the configured tenant identity.
+Repeated cancellation of a task in `cancelling` or `cancelled` is idempotent.
+
+Task types without a rollback contract keep writes that completed before cancellation. For
+`add_resource`, cancellation first drains owned semantic and embedding work, then safely rolls back
+the target only when that task created it.
+Pre-existing targets are never deleted. Legacy `add_resource` tasks without durable ownership
+metadata return `FAILED_PRECONDITION` and continue draining instead of risking data loss.
+
+**Supported Task Types:**
+- `add_resource`
+- `session_commit`
+- `admin_reindex`
+- `snapshot_restore_reindex`
 
 **Code Entries:**
 - `openviking/server/routers/tasks.py:cancel_task()` - HTTP route
-- `openviking/service/resource_service.py:ResourceService.cancel_add_resource_task()` - ownership and state validation
+- `openviking/service/task_tracker.py:TaskTracker.cancel()` - task lifecycle
+- `crates/ov_cli/src/commands/task.rs:cancel()` - CLI command
 
 #### 2. Interface and Parameter Description
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| task_id | str | Yes | - | Task ID returned by `add_resource` |
+| task_id | str | Yes | - | Background task ID to cancel |
+
+Only the current user who owns the task can cancel it. ROOT identities cannot cancel tasks.
 
 #### 3. Usage Examples
+
+**Python SDK**
+
+```python
+task = await client.cancel_task("uuid-xxx")
+print(task["status"])
+```
+
+**TypeScript SDK**
+
+```typescript
+const task = await client.cancelTask("uuid-xxx");
+console.log(task.status);
+```
+
+**Go SDK**
+
+```go
+task, err := client.CancelTask(ctx, "uuid-xxx")
+if err != nil {
+    return err
+}
+fmt.Println(task["status"])
+```
+
+**HTTP API**
 
 ```http
 POST /api/v1/tasks/{task_id}/cancel
 ```
 
 ```bash
-ov task cancel uuid-xxx
-
 curl -X POST http://localhost:1933/api/v1/tasks/uuid-xxx/cancel \
   -H "X-API-Key: your-key"
+```
+
+**CLI**
+
+```bash
+ov task cancel uuid-xxx
 ```
 
 **Response Example**
@@ -183,15 +224,23 @@ curl -X POST http://localhost:1933/api/v1/tasks/uuid-xxx/cancel \
   "result": {
     "task_id": "uuid-xxx",
     "task_type": "add_resource",
-    "status": "cancelled",
+    "status": "cancelling",
     "resource_id": "viking://resources/guide",
-    "stage": "cancelled"
+    "stage": "processing_queue",
+    "result": null,
+    "error": null
   }
 }
 ```
 
-Rollback deletes a target only when this task created it. Pre-existing targets and legacy tasks with
-unknown ownership are never deleted.
+If the task has no remaining work, the response status can be `cancelled` immediately. Otherwise, continue polling with `get_task()` until the status becomes `cancelled`.
+
+**Error Handling:**
+- `NOT_FOUND` (404): the task does not exist, has expired, or belongs to another user
+- `PERMISSION_DENIED` (403): a ROOT identity attempts to cancel a task
+- `FAILED_PRECONDITION` (412): the task type does not support cancellation, the task is
+  already `completed`/`failed`, or a legacy `add_resource` task lacks the durable cancellation
+  protocol
 
 ---
 
@@ -212,7 +261,7 @@ List background tasks visible to the current caller, supporting filtering by typ
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | task_type | str | No | None | Filter by task type, for example `session_commit` |
-| status | str | No | None | Filter by task status: `pending`, `running`, `completed`, `failed`, `cancelled` |
+| status | str | No | None | Filter by task status: `pending`, `running`, `cancelling`, `completed`, `failed`, `cancelled` |
 | resource_id | str | No | None | Filter by task resource ID, for example a session ID |
 | limit | int | No | 50 | Maximum number of task records to return |
 

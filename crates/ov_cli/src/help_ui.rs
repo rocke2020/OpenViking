@@ -89,6 +89,7 @@ const IMPORT_EXPORT_SESSIONS: &[HelpCommand] = help_commands![
 const INTERACTIVE_ADMIN: &[HelpCommand] = help_commands![
     "tui",
     "chat",
+    "compile",
     "admin",
     "system",
     "reindex",
@@ -140,6 +141,10 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
             HelpItem {
                 label: "ov add-resource https://example.com/sitemap.xml --watch-interval 1440",
                 description: "Import a whole site via sitemap/RSS and refresh it daily.",
+            },
+            HelpItem {
+                label: "ov add-resource tos://bucket/docs/ --add-type tos --to viking://resources/docs",
+                description: "Declare the Connector source type explicitly (Connector integration must be enabled).",
             },
         ],
         next_steps: &[
@@ -864,6 +869,24 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
         }],
     },
     CommandHelpSpec {
+        path: &["compile"],
+        purpose: "Use a required VikingBot Skill to compile OpenViking materials into Wiki pages or a Skill package.",
+        examples: &[
+            HelpItem {
+                label: "ov compile --from viking://resources/weekly --to viking://resources/wiki --skill viking://agent/skills/monthly_wiki --wait",
+                description: "Compile one source directory into Wiki pages.",
+            },
+            HelpItem {
+                label: "ov compile --from viking://resources/weekly --to viking://agent/skills --skill viking://agent/skills/skill-creator --wait",
+                description: "Generate or update one shared Skill package.",
+            },
+        ],
+        next_steps: &[HelpItem {
+            label: "ov tree <target-uri>",
+            description: "Inspect the generated output.",
+        }],
+    },
+    CommandHelpSpec {
         path: &["wait"],
         purpose: "Wait for queued async processing to complete.",
         examples: &[HelpItem {
@@ -892,6 +915,10 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
             HelpItem {
                 label: "ov task status <task-id>",
                 description: "Inspect one task.",
+            },
+            HelpItem {
+                label: "ov task cancel <task-id>",
+                description: "Cancel one task.",
             },
         ],
         next_steps: &[HelpItem {
@@ -2178,7 +2205,7 @@ fn localized_global_option_description<'a>(
         "compact" => "紧凑输出",
         "account" => "覆盖账户",
         "user" => "覆盖用户",
-        "sudo" => "admin、system、reindex、task status/list/cancel 使用 root API Key",
+        "sudo" => "admin、system、reindex、task status/list 使用 root API Key",
         _ => description,
     }
 }
@@ -2693,9 +2720,7 @@ mod tests {
         assert!(rendered.contains("ov tui"));
         assert!(rendered.contains("-c, --compact <true|false>"));
         assert!(
-            rendered.contains(
-                "Use root API key for admin, system, reindex, and task status/list/cancel"
-            )
+            rendered.contains("Use root API key for admin, system, reindex, and task status/list")
         );
     }
 
@@ -3098,6 +3123,7 @@ mod tests {
                 .expect("task help should render"),
         );
         assert!(task.contains("status <task-id>"));
+        assert!(task.contains("cancel <task-id>"));
         assert!(task.contains("list"));
     }
 

@@ -13,9 +13,10 @@
 **任务状态**：
 - `pending`: 任务等待执行
 - `running`: 任务执行中
+- `cancelling`: 已请求取消，正在等待该任务的持久化队列消息和进程内工作结束
 - `completed`: 任务成功完成
 - `failed`: 任务失败
-- `cancelled`: `add_resource` 任务已取消
+- `cancelled`: 任务已取消
 
 **代码入口**：
 - `openviking/server/routers/tasks.py:get_task()` - HTTP 路由
@@ -141,35 +142,75 @@ ov task status uuid-xxx
 
 #### 1. API 实现介绍
 
-取消 pending 或 running 状态的 `add_resource` 任务。端点会先持久化 `cancelled` 状态再返回；
-worker 的协作排空和安全回滚可能仍在后台收尾。
+请求协作式取消后台任务。接口会立即阻止该任务产生新的 QueueFS work，并要求仍在运行的进程内工作在安全边界停止。当任务仍有待处理的持久化消息或进程内工作时，接口先返回 `cancelling`，全部收敛后任务才进入 `cancelled`。
 
-对已取消任务重复调用是幂等的。其他用户拥有的任务返回 `NOT_FOUND`；completed、failed 或
-非 `add_resource` 任务返回 `FAILED_PRECONDITION`。在持久取消能力上线前创建的
-`add_resource` 任务同样返回 `FAILED_PRECONDITION`，因为其旧版队列消息无法安全停止，
-必须正常排空。Root 管理员可结合已配置的租户身份使用 `ov --sudo task cancel`。
+重复取消处于 `cancelling` 或 `cancelled` 状态的任务是幂等的。
+
+没有回滚契约的任务类型会保留取消前已经完成的写入。对于 `add_resource`，取消会先排空该任务
+持有的 semantic/embedding 工作，再仅在目标由该任务创建时安全回滚，绝不会删除预先存在的目标。
+缺少持久化归属元数据的旧版 `add_resource` 任务返回 `FAILED_PRECONDITION` 并继续排空，
+避免因所有权不明而误删数据。
+
+**支持的任务类型**：
+- `add_resource`
+- `session_commit`
+- `admin_reindex`
+- `snapshot_restore_reindex`
 
 **代码入口**：
 - `openviking/server/routers/tasks.py:cancel_task()` - HTTP 路由
-- `openviking/service/resource_service.py:ResourceService.cancel_add_resource_task()` - 所有权与状态校验
+- `openviking/service/task_tracker.py:TaskTracker.cancel()` - 任务生命周期
+- `crates/ov_cli/src/commands/task.rs:cancel()` - CLI 命令
 
 #### 2. 接口和参数说明
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| task_id | str | 是 | - | `add_resource` 返回的任务 ID |
+| task_id | str | 是 | - | 要取消的后台任务 ID |
+
+只有任务所属的当前用户可以取消任务。ROOT 身份不能执行取消操作。
 
 #### 3. 使用示例
+
+**Python SDK**
+
+```python
+task = await client.cancel_task("uuid-xxx")
+print(task["status"])
+```
+
+**TypeScript SDK**
+
+```typescript
+const task = await client.cancelTask("uuid-xxx");
+console.log(task.status);
+```
+
+**Go SDK**
+
+```go
+task, err := client.CancelTask(ctx, "uuid-xxx")
+if err != nil {
+    return err
+}
+fmt.Println(task["status"])
+```
+
+**HTTP API**
 
 ```http
 POST /api/v1/tasks/{task_id}/cancel
 ```
 
 ```bash
-ov task cancel uuid-xxx
-
 curl -X POST http://localhost:1933/api/v1/tasks/uuid-xxx/cancel \
   -H "X-API-Key: your-key"
+```
+
+**CLI**
+
+```bash
+ov task cancel uuid-xxx
 ```
 
 **响应示例**
@@ -180,14 +221,22 @@ curl -X POST http://localhost:1933/api/v1/tasks/uuid-xxx/cancel \
   "result": {
     "task_id": "uuid-xxx",
     "task_type": "add_resource",
-    "status": "cancelled",
+    "status": "cancelling",
     "resource_id": "viking://resources/guide",
-    "stage": "cancelled"
+    "stage": "processing_queue",
+    "result": null,
+    "error": null
   }
 }
 ```
 
-回滚只会删除由该任务创建的目标。预先存在的目标和所有权未知的旧任务永远不会被删除。
+如果任务没有剩余 work，响应中的状态可以直接为 `cancelled`。否则继续通过 `get_task()` 查询，直到状态变为 `cancelled`。
+
+**错误处理**：
+- `NOT_FOUND`（404）：任务不存在、已过期或不属于当前用户
+- `PERMISSION_DENIED`（403）：ROOT 身份请求取消任务
+- `FAILED_PRECONDITION`（412）：任务类型不支持取消、任务已经 `completed`/`failed`，或旧版
+  `add_resource` 任务不具备持久化取消协议
 
 ---
 
@@ -208,7 +257,7 @@ curl -X POST http://localhost:1933/api/v1/tasks/uuid-xxx/cancel \
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | task_type | str | 否 | None | 按任务类型过滤，例如 `session_commit` |
-| status | str | 否 | None | 按任务状态过滤：`pending`、`running`、`completed`、`failed`、`cancelled` |
+| status | str | 否 | None | 按任务状态过滤：`pending`、`running`、`cancelling`、`completed`、`failed`、`cancelled` |
 | resource_id | str | 否 | None | 按资源 ID 过滤，例如会话 ID |
 | limit | int | 否 | 50 | 最多返回的任务条数 |
 
