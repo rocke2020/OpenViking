@@ -191,7 +191,7 @@ client.initialize()
 #### HTTP Call Examples
 
 - CLI, `SyncHTTPClient`, and `AsyncHTTPClient` automatically upload local files or directories before calling the server API.
-- Python HTTP client and CLI can also opt into shared temporary uploads via client config (`ovcli.conf` -> `upload.mode = "shared"`).
+- Python HTTP clients can opt into shared temporary uploads through `ovcli.conf` (`upload.mode = "shared"`). The Rust `ov` CLI does not read that field; set `OPENVIKING_UPLOAD_MODE=shared` for `ov` instead.
 - Raw HTTP calls don't get this convenience layer. When using `curl` or other HTTP clients, you need to first call `POST /api/v1/resources/temp_upload`, then pass the returned `temp_file_id` to the target API.
 - `temp_upload` defaults to `upload_mode=local`. Use `upload_mode=shared` only when you explicitly want distributed shared temporary uploads.
 - For raw HTTP imports of local directories, you need to first zip them into a `.zip` file and upload using the above method; the server does not accept direct host directory paths.
@@ -472,7 +472,7 @@ This catalog follows the routes actually mounted by the server. Each group headi
 | POST | `/api/v1/sessions/{session_id}/used` | Record context or skills actually used |
 | POST | `/api/v1/search/recall` | Recall memory as injection-ready context |
 
-### [Retrieval](06-retrieval.md), [Code Retrieval](21-code.md), and [Relations](13-relations.md)
+### [Retrieval](06-retrieval.md) and [Relations](13-relations.md)
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -480,9 +480,6 @@ This catalog follows the routes actually mounted by the server. Each group headi
 | POST | `/api/v1/search/search` | Context-aware search |
 | POST | `/api/v1/search/grep` | Content pattern search |
 | POST | `/api/v1/search/glob` | File pattern matching |
-| POST | `/api/v1/code/outline` | Extract code structure |
-| POST | `/api/v1/code/search` | Search code |
-| POST | `/api/v1/code/expand` | Expand code context |
 | GET | `/api/v1/relations` | Get resource relations |
 | POST | `/api/v1/relations/link` | Create a resource link |
 | DELETE | `/api/v1/relations/link` | Delete a resource link |

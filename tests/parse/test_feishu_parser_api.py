@@ -798,6 +798,7 @@ async def test_add_resource_processor_persists_final_resource_uri(monkeypatch):
         start=AsyncMock(),
         update_stage=AsyncMock(),
         get=AsyncMock(return_value=SimpleNamespace(status=TaskStatus.RUNNING)),
+        update_add_resource_rollback_target=AsyncMock(),
         complete=AsyncMock(),
         fail=AsyncMock(),
         wait_for_descendants=AsyncMock(),
@@ -841,9 +842,35 @@ async def test_add_resource_processor_persists_final_resource_uri(monkeypatch):
         cancel_protocol_version=ADD_RESOURCE_CANCEL_PROTOCOL_VERSION,
         meta={"source_path": ""},
     )
+    task_tracker.update_add_resource_rollback_target.assert_awaited_once_with(
+        "task-1",
+        final_uri,
+        None,
+        account_id="account-1",
+        user_id="user-1",
+        materialization_pending=False,
+        lock_handoff=None,
+    )
     task_tracker.complete.assert_awaited_once_with(
         "task-1",
-        {"status": "success", "root_uri": final_uri},
+        {
+            "status": "success",
+            "root_uri": final_uri,
+            "queue_status": {
+                "Semantic": {
+                    "processed": 0,
+                    "requeue_count": 0,
+                    "error_count": 0,
+                    "errors": [],
+                },
+                "Embedding": {
+                    "processed": 0,
+                    "requeue_count": 0,
+                    "error_count": 0,
+                    "errors": [],
+                },
+            },
+        },
         account_id="account-1",
         user_id="user-1",
         resource_id=final_uri,

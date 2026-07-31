@@ -186,7 +186,7 @@ client.initialize()
 #### HTTP 调用示例
 
 - CLI、`SyncHTTPClient`、`AsyncHTTPClient` 遇到本地文件或目录时，会先自动上传，再调用服务端 API。
-- Python HTTP client 和 CLI 也可以通过客户端配置启用 shared 临时上传（`ovcli.conf` 中设置 `upload.mode = "shared"`）。
+- Python HTTP client 可以通过 `ovcli.conf` 启用 shared 临时上传（设置 `upload.mode = "shared"`）。Rust `ov` CLI 不读取这个字段；使用 `ov` 时请设置 `OPENVIKING_UPLOAD_MODE=shared`。
 - 裸 HTTP 调用没有这层封装。使用 `curl` 或其他 HTTP 客户端时，需要先调用 `POST /api/v1/resources/temp_upload`，再把返回的 `temp_file_id` 传给目标 API。
 - `temp_upload` 默认使用 `upload_mode=local`。只有在你显式需要分布式共享临时上传时，才应传 `upload_mode=shared`。
 - 裸 HTTP 如果导入本地目录，需要先自行打成 `.zip` 再通过上述方法上传；服务端不接受直接传宿主机目录路径。
@@ -467,7 +467,7 @@ JSON 输出 - 错误：
 | POST | `/api/v1/sessions/{session_id}/used` | 记录实际使用的上下文或技能 |
 | POST | `/api/v1/search/recall` | 召回记忆并返回可直接注入的上下文 |
 
-### [检索](06-retrieval.md)、[代码检索](21-code.md)与[关系](13-relations.md)
+### [检索](06-retrieval.md)与[关系](13-relations.md)
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -475,9 +475,6 @@ JSON 输出 - 错误：
 | POST | `/api/v1/search/search` | 上下文感知搜索 |
 | POST | `/api/v1/search/grep` | 内容模式搜索 |
 | POST | `/api/v1/search/glob` | 文件模式匹配 |
-| POST | `/api/v1/code/outline` | 提取代码结构 |
-| POST | `/api/v1/code/search` | 代码搜索 |
-| POST | `/api/v1/code/expand` | 展开代码上下文 |
 | GET | `/api/v1/relations` | 获取资源关系 |
 | POST | `/api/v1/relations/link` | 创建资源链接 |
 | DELETE | `/api/v1/relations/link` | 删除资源链接 |
