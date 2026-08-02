@@ -142,10 +142,10 @@ VikingBot 的普通 Skill 先只暴露 `name + description + location`，模型�
 
 当前有两个目录边界：摘要只扫描本地 workspace Skill；OpenViking 中持久化的 Skill 不会自动进入该列表，需要走 OpenViking 检索路径。并且缺依赖的 workspace Skill 会在摘要构造前被过滤，使后续 `available=false/requires` 提示分支不可达；这些是现状 caveat，不是目标语义。
 
-Skill 有两个硬边界：
+Skill 应遵守两个执行边界：
 
-1. **Skill 不能授予权限**。它可以把当前允许的 Tool 集合进一步缩小，但不能因为文本写了“执行 Shell”就出现一个原本不可用的 `exec`。
-2. **Skill 不能隐藏高风险执行**。若某个高频或高风险 SOP 最终靠 `curl`、SQL 或 Shell 完成，应把该动作提升为专用 Tool，而不是长期藏在 Markdown 示例中。
+1. **Skill instruction 不能扩权**。它不能新增本轮不可用的 Tool，也不能绕过服务端授权、hard deny 或 Sandbox；宿主是否允许可信 Skill metadata 临时预授权 Tool，属于 runtime policy。
+2. **高频或高风险动作应显式建模**。在 Eino 中，这类动作不应长期隐藏在 `curl`、SQL 或 Shell 示例中，而应提升为具有鉴权、参数校验、审批和审计能力的专用 Tool。
 
 ### 4.3 同时使用 Skill 与 Tool
 
