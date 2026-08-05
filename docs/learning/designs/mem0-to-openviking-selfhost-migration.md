@@ -6,7 +6,7 @@
 
 eino 当前通过 `pkg/memory.Backend` 使用自托管 mem0：读路径调用 `Search`，写路径调用 `Add`。生产写入已由 Redis Stream durable outbox 从请求路径解耦，因此 OpenViking 的 session-based `create → batch messages → commit` 写入流程可以封装在一次 `Backend.Add` 中；读路径直接调用 `POST /api/v1/search/recall`，再将 `RecallEntry` 映射为 `MemoryCard`。接口替换不要求改动 eino 的核心请求编排，也不替换 PostgreSQL 中的 `memory.raw_evidence`。
 
-本计划推荐先以自托管 OpenViking、单 worker、独立新向量集合上线。向量后端在 `opengauss` 与 `local` 之间保留上线前决策点；embedding 首选通过 Ollama 继续使用 `bge-m3` 以维持与 mem0 相近的 embedding 模型，但 mem0 的 1024 维数据不得直接复用。迁移按「服务验证、backend 实现、配置化双跑、切流与回放验收」推进；OpenViking `CreateSession` 已验证支持客户端提供 `session_id`（见 §OpenViking Self-Host），确定性 session 策略可行，但 re-create 同 id 的碰撞语义仍需切流前 smoke 验证。
+本计划推荐先以自托管 OpenViking、单 worker、独立新向量集合上线。向量后端在 `opengauss` 与 `local` 之间保留上线前决策点；embedding 沿用当前本地 OpenViking 的 Ollama `qwen3-embedding:0.6b`（1024 维）配置，但 mem0 的 1024 维数据仍不得直接复用。迁移按「服务验证、backend 实现、配置化双跑、切流与回放验收」推进；OpenViking `CreateSession` 已验证支持客户端提供 `session_id`（见 §OpenViking Self-Host），确定性 session 策略可行，但 re-create 同 id 的碰撞语义仍需切流前 smoke 验证。
 
 ## Background
 
@@ -57,7 +57,7 @@ Search 行为见 `xkong-agent-center/internal/memory/mem0/client.go:115-133`，A
 | Extraction LLM | OpenAI-compatible endpoint at `LLM_BASE_URL` |
 | Extraction model behavior | DeepSeek with `reasoning_effort: low` |
 | Embedder | OpenAI-compatible endpoint at `OLLAMA_BASE_URL` |
-| Embedding model | `bge-m3` |
+| Embedding model | `qwen3-embedding:0.6b` |
 | Extraction policy | `custom_instructions` limits extraction to durable user facts |
 
 服务端还暴露 `/configure`、`/reset`、`/memories/{id}`，但 eino 的 backend 契约只使用 `/search` 和 `/memories`。运行期构造发生在 `eino_wiring.go`：
@@ -338,11 +338,11 @@ Embedder providers 含 `openai/azure/volcengine(default)/vikingdb/jina/ollama/ge
 
 | Choice | Continuity | Operations |
 |---|---|---|
-| Ollama + `bge-m3` | Best continuity with mem0 model | Keeps Ollama as external dependency |
+| Ollama + `qwen3-embedding:0.6b` | Matches current mem0 and local OpenViking configuration; 1024 dimensions | Keeps Ollama as external dependency |
 | OV local embedder | Fully standalone, simpler topology | Changes model/dim to 512 |
 | Future provider switch | Possible | Full re-index (dims/models cannot mix) |
 
-推荐首迁用 Ollama + `bge-m3`，取决于一次端到端 embedding probe。OV Ollama provider 支持 `bge-m3`，但其部署配置下的精确输出维度须在 collection 创建前 verified。无论选什么，mem0 的 1024 维 collection 不复用——fresh OV collection 强制。
+推荐首迁沿用当前本地 OpenViking 的 Ollama + `qwen3-embedding:0.6b`（1024 维）配置，并在新 collection 创建前做一次端到端 embedding probe。即使两端的模型和维度相同，mem0 的 collection 也不复用：OpenViking 需要自己的 schema、metadata、索引和租户所有权边界，fresh OV collection 强制。
 
 OV auth 两级 account+user：
 
@@ -571,7 +571,7 @@ P0 部署 OV，不改 eino。
 | Users | Tenant-scoped OV users/keys |
 | Runtime key | User key, not root key |
 | Vector backend | `opengauss` or `local` after probe |
-| Embedder | Prefer Ollama `bge-m3`; else verified local |
+| Embedder | Ollama `qwen3-embedding:0.6b` (1024 dimensions) |
 | Collection | Fresh OV collection |
 | Network policy | Allow agent-service → OV :1933 |
 | Existing mem0 | Keep running |
@@ -675,7 +675,7 @@ P3 把 OV 设为选定 backend。
 | `opengauss` compatibility | Exact reuse of current PG instance may fail | Staging compatibility probe; fall back to `local` |
 | Local backend scaling | Embedded storage + PID lock complicate multi-worker | Start one worker; validate backup/restart; avoid lock bypass |
 | Embedding dim change | 1024-dim vectors cannot share new collection | Always fresh OV collection |
-| Embedder model change | Recall relevance may drift | Prefer Ollama `bge-m3` initially; run replay parity |
+| Embedding configuration drift | Provider preprocessing or model revisions may change ranking despite the same model name | Pin provider/model/dimension; run replay parity before cutover |
 | Later embedder switch | Vectors incompatible | Treat any model/dim switch as full re-index |
 | Session re-create collision | At-least-once retries may duplicate sessions/extractions | 确定性 session_id 已验证支持；P0 smoke 碰撞语义；必要时外部 dedup ledger |
 | Partial Add failure | Orphan sessions / duplicate messages | Record session state; resume by verified session ID |
@@ -705,9 +705,7 @@ P3 把 OV 设为选定 backend。
 | BatchAddMessages 重试在同 session 内幂等吗？ | 模糊响应可能复制消息 | 重复同 batch 检查归档/抽取结果 | OV/backend |
 | CommitSession 在已 commit 的 session 上幂等吗？ | 超时后重试可能复制抽取 | 重复 commit 检查 task/session 结果 | OV/backend |
 | 失败 async 抽取 task 在 GetTask 如何表示？ | Add 在抽取完成前返回 | 含注入失败的终态 smoke | OV/operations |
-| 首部署用 Ollama `bge-m3`？ | 保模型连续但留依赖 | 召回质量/维度/延迟/可用性 probe | ML/ops |
 | 首部署用 local GGUF embedder？ | 简化拓扑但改模型/维度 | Replay parity + 容量测试 | ML/ops |
-| 部署 Ollama `bge-m3` 精确维度？ | Collection 须在索引前固定 | 真实 embedding probe | ops |
 | 向量存储用 `opengauss` 还是 `local`？ | 改运维/扩展/recovery 模型 | Staging 负载/重启/备份/兼容证据 | Storage/ops |
 | `opengauss` 能安全用现有 PG 实例吗？ | 决定能否合并基础设施 | 版本/扩展/schema/隔离 probe | DBA/ops |
 | OV 共享 DB 实例但用独立 db/schema 凭证？ | 共享故障域可能大于合并收益 | 容量+隔离评审 `(unverified)` | DBA/security |
