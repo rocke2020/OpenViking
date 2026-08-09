@@ -85,7 +85,7 @@ def test_openviking_http_client_preserves_legacy_exception_types():
         raise AssertionError("expected ConflictError")
 
 
-def test_openviking_sync_http_client_serializes_text_parts():
+def test_openviking_sync_http_client_converts_message_parts_to_payload():
     _purge_openviking_modules()
     import openviking
     from openviking.message import ImagePart, TextPart, ToolPart

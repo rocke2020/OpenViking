@@ -61,7 +61,7 @@ ERROR_CODE_TO_EXCEPTION = {
 }
 
 
-def _serialize_message_part(part: Any) -> Any:
+def _message_part_to_payload(part: Any) -> Any:
     if not is_dataclass(part):
         return part
 
@@ -196,7 +196,7 @@ class AsyncHTTPClient(import_openviking_sdk().AsyncHTTPClient):
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"role": role}
         if parts is not None:
-            payload["parts"] = [_serialize_message_part(part) for part in parts]
+            payload["parts"] = [_message_part_to_payload(part) for part in parts]
         elif content is not None:
             payload["content"] = content
         else:

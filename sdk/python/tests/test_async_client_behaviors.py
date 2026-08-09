@@ -161,7 +161,7 @@ async def test_async_http_client_sends_message_semantics_and_turn_retention():
     }
 
 
-def test_sync_http_client_serializes_dataclass_message_parts():
+def test_sync_http_client_converts_dataclass_message_parts_to_payload():
     request_payloads = []
 
     def handle_request(request):

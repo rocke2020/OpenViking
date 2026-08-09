@@ -68,7 +68,7 @@ GATEWAY_MARKER_HEADER = "X-VikingBot-Gateway"
 GATEWAY_TOKEN_HEADER = "X-Gateway-Token"
 
 
-def _serialize_message_part(part: Any) -> Any:
+def _message_part_to_payload(part: Any) -> Any:
     if not is_dataclass(part):
         return part
 
@@ -1491,7 +1491,7 @@ class AsyncHTTPClient:
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"role": role}
         if parts is not None:
-            payload["parts"] = [_serialize_message_part(part) for part in parts]
+            payload["parts"] = [_message_part_to_payload(part) for part in parts]
         elif content is not None:
             payload["content"] = content
         else:
