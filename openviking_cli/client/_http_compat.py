@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Dict
 
@@ -58,6 +59,20 @@ ERROR_CODE_TO_EXCEPTION = {
     "SESSION_EXPIRED": SessionExpiredError,
     "UNKNOWN": OpenVikingError,
 }
+
+
+def _serialize_message_part(part: Any) -> Any:
+    if not is_dataclass(part):
+        return part
+
+    serialized_part = asdict(part)
+    if serialized_part.get("type") != "image_url":
+        return serialized_part
+
+    image_url = {"url": serialized_part.get("url", "")}
+    if serialized_part.get("detail") is not None:
+        image_url["detail"] = serialized_part["detail"]
+    return {"type": "image_url", "image_url": image_url}
 
 
 def _timeout_configured_outside_call() -> bool:
@@ -171,7 +186,7 @@ class AsyncHTTPClient(import_openviking_sdk().AsyncHTTPClient):
         session_id: str,
         role: str,
         content: str | None = None,
-        parts: list[dict] | None = None,
+        parts: list[Any] | None = None,
         created_at: str | None = None,
         peer_id: str | None = None,
         telemetry: Any = False,
@@ -181,7 +196,7 @@ class AsyncHTTPClient(import_openviking_sdk().AsyncHTTPClient):
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"role": role}
         if parts is not None:
-            payload["parts"] = parts
+            payload["parts"] = [_serialize_message_part(part) for part in parts]
         elif content is not None:
             payload["content"] = content
         else:
@@ -244,7 +259,7 @@ class SyncHTTPClient(import_openviking_sdk().SyncHTTPClient):
         session_id: str,
         role: str,
         content: str | None = None,
-        parts: list[dict] | None = None,
+        parts: list[Any] | None = None,
         created_at: str | None = None,
         peer_id: str | None = None,
         telemetry: Any = False,

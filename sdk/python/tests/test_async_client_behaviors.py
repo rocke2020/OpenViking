@@ -1,12 +1,36 @@
 import inspect
+import json
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import httpx
 import pytest
 from openviking_sdk import AsyncHTTPClient, SyncHTTPClient
 from openviking_sdk.client import Session, SyncSession
 from openviking_sdk.errors import NotFoundError
+
+
+@dataclass
+class DataclassTextPart:
+    text: str
+    type: str = "text"
+
+
+@dataclass
+class DataclassImagePart:
+    url: str
+    detail: str | None = None
+    type: str = "image_url"
+
+
+@dataclass
+class DataclassToolPart:
+    tool_id: str
+    tool_name: str
+    tool_input: dict | None = None
+    type: str = "tool"
 
 
 def test_add_resource_signatures_keep_telemetry_position():
@@ -135,6 +159,65 @@ async def test_async_http_client_sends_message_semantics_and_turn_retention():
         "retained_message_token_budget": 12_000,
         "min_raw_tail_steps": 1,
     }
+
+
+def test_sync_http_client_serializes_dataclass_message_parts():
+    request_payloads = []
+
+    def handle_request(request):
+        request_payloads.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"status": "success", "result": {"message_id": "msg-1"}},
+        )
+
+    client = SyncHTTPClient(url="http://localhost:1933")
+    client._async_client._http = httpx.AsyncClient(
+        base_url="http://localhost:1933",
+        transport=httpx.MockTransport(handle_request),
+    )
+    try:
+        result = client.add_message(
+            "demo-session",
+            "user",
+            parts=[
+                DataclassTextPart(text="Hello world!"),
+                DataclassImagePart(
+                    url="https://example.com/image.png",
+                    detail="high",
+                ),
+                DataclassToolPart(
+                    tool_id="call-1",
+                    tool_name="search",
+                    tool_input={"query": "hello"},
+                ),
+            ],
+        )
+    finally:
+        client.close()
+
+    assert result == {"message_id": "msg-1"}
+    assert request_payloads == [
+        {
+            "role": "user",
+            "parts": [
+                {"text": "Hello world!", "type": "text"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://example.com/image.png",
+                        "detail": "high",
+                    },
+                },
+                {
+                    "tool_id": "call-1",
+                    "tool_name": "search",
+                    "tool_input": {"query": "hello"},
+                    "type": "tool",
+                },
+            ],
+        }
+    ]
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,8 @@
+import json
 import sys
 from pathlib import Path
+
+import httpx
 
 SDK_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -80,3 +83,54 @@ def test_openviking_http_client_preserves_legacy_exception_types():
         assert exc.code == "CONFLICT"
     else:
         raise AssertionError("expected ConflictError")
+
+
+def test_openviking_sync_http_client_serializes_text_parts():
+    _purge_openviking_modules()
+    import openviking
+    from openviking.message import ImagePart, TextPart, ToolPart
+
+    request_payloads = []
+
+    def handle_request(request):
+        request_payloads.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"status": "success", "result": {"message_id": "msg-1"}},
+        )
+
+    client = openviking.SyncHTTPClient(url="http://localhost:1933")
+    client._async_client._http = httpx.AsyncClient(
+        base_url="http://localhost:1933",
+        transport=httpx.MockTransport(handle_request),
+    )
+    try:
+        result = client.add_message(
+            "demo-session",
+            "user",
+            parts=[
+                TextPart(text="Hello world!"),
+                ImagePart(url="https://example.com/image.png", detail="high"),
+                ToolPart(
+                    tool_id="call-1",
+                    tool_name="search",
+                    tool_input={"query": "hello"},
+                ),
+            ],
+        )
+    finally:
+        client.close()
+
+    assert result == {"message_id": "msg-1"}
+    assert request_payloads[0]["role"] == "user"
+    assert request_payloads[0]["parts"][0] == {"text": "Hello world!", "type": "text"}
+    assert request_payloads[0]["parts"][1] == {
+        "type": "image_url",
+        "image_url": {
+            "url": "https://example.com/image.png",
+            "detail": "high",
+        },
+    }
+    assert request_payloads[0]["parts"][2]["type"] == "tool"
+    assert request_payloads[0]["parts"][2]["tool_id"] == "call-1"
+    assert request_payloads[0]["parts"][2]["tool_input"] == {"query": "hello"}
