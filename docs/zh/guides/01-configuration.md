@@ -600,7 +600,7 @@ provider，并设置 `storage.vectordb.sparse_weight > 0`。自托管模型的�
 | `model` | str | 模型名称 |
 | `api_base` | str | API 端点（可选） |
 | `thinking` | bool | 启用思考模式（仅对部分火山模型生效，默认：`false`） |
-| `max_concurrent` | int | 语义处理阶段 LLM 最大并发调用数（默认：`64`） |
+| `max_concurrent` | int | 语义处理阶段 LLM 最大并发调用数（默认：`32`） |
 | `max_retries` | int | VLM provider 瞬时错误的最大重试次数（默认：`3`；`0` 表示禁用重试） |
 | `credentials` | array | 有序 VLM 凭据/模型列表，索引 0 优先级最高。每项可单独覆盖 `provider`、`model`、`api_key`、`api_base`、`api_version`、`extra_headers`、`extra_request_body` 和 `stream` |
 | `failback_timeout_seconds` | float | 切换到低优先级 credential 后，尝试逐级切回的时间阈值（默认：`600`） |
@@ -1295,7 +1295,7 @@ Redis Sentinel 分别配置数据节点和 Sentinel 的 ACL：
 说明：
 
 - `memory.session_auto_commit` 是服务端全局配置，不是单个 session 的业务 policy。
-- session 级别的自动触发参数通过 session 级 `auto_commit_policy` 设置（见下表）。它只能在创建 session 时通过 `POST /api/v1/sessions` 的顶层 `auto_commit_policy` 字段设置，之后通过 `GET /api/v1/sessions/{session_id}` 查看；不支持运行期 PATCH 修改。
+- session 级别的自动触发参数通过 session 级 `auto_commit_policy` 设置（见下表）。可以在创建 session 时通过 `POST /api/v1/sessions` 设置，也可以通过 `PATCH /api/v1/sessions/{session_id}/config` 部分更新。PATCH 时省略 `auto_commit_policy` 会保留现有策略，传 `null` 会禁用自动 commit；通过 `GET /api/v1/sessions/{session_id}` 查看生效策略。
 - `default_enabled=false` 时，未传 `auto_commit_policy` 创建的 session 保持 auto commit 关闭，返回 `auto_commit_policy: null`。显式传 `{}` 或任意 policy 字段会为该 session 开启 auto commit，并用下方默认值补齐缺失字段。
 - `default_enabled=true` 时，未传 `auto_commit_policy` 创建的 session 会带上下方默认 policy。
 - `idle_enabled=false` 时：
@@ -1486,7 +1486,7 @@ OpenViking 使用两个配置文件：
 
 | 配置文件 | 用途 | 默认路径 |
 |---------|------|---------|
-| `ov.conf` | SDK 嵌入模式 + 服务端配置 | `~/.openviking/ov.conf` |
+| `ov.conf` | OpenViking Server 配置 | `~/.openviking/ov.conf` |
 | `ovcli.conf` | HTTP 客户端和 CLI 连接远程服务端 | `~/.openviking/ovcli.conf` |
 
 配置文件放在默认路径时，OpenViking 自动加载，无需额外设置。
@@ -1520,7 +1520,7 @@ openviking-server --config /path/to/ov.conf
 
 ### ov.conf
 
-本文档上方各配置段（embedding、vlm、rerank、storage）均属于 `ov.conf`。SDK 嵌入模式和服务端共用此文件。
+本文档上方各配置段（embedding、vlm、rerank、storage）均属于服务端的 `ov.conf`。
 
 如需配置 memory 相关行为，可在 `ov.conf` 中添加 `memory` 段：
 
@@ -1651,7 +1651,7 @@ openviking add-resource ./docs --exclude "*.tmp"
 
 ### Usage Reporter
 
-可选的 Usage Reporter 从已 commit session 的 tool parts 中抽取记忆使用事件。内置文件日志 Sink 将每个事件写成一行 `{"key": ..., "value": ...}` JSON envelope，并按小时滚动专用日志文件：
+可选的 Usage Reporter 从已 commit session 的 tool parts 中抽取记忆使用事件。内置文件日志 Sink 将每个事件写成一行扁平 JSON，并按小时滚动专用日志文件：
 
 ```json
 {
@@ -1679,9 +1679,15 @@ openviking add-resource ./docs --exclude "*.tmp"
 `"type": "http"` 的部署需要迁移为 `file_log` 并采集专用日志文件，或配置实现
 原投递协议的 `custom` Sink。
 
-启动服务前，需要设置 `resource_id_env` 指定的环境变量。Sink 会自动创建父目录、立即追加事件、按 UTC 每小时滚动文件，并保留 `backup_count` 个历史文件；它不会写入 OpenViking 默认 stdout 日志。
+启动服务前需要设置 `resource_id_env` 指定的环境变量。该变量的值用于标识当前部署的 OpenViking 资源，隔离 account、user 和 URI 相同但 resource 不同的数据。Sink 会自动创建父目录、立即追加事件、按 UTC 每小时滚动文件，并保留 `backup_count` 个历史文件；它不会写入 OpenViking 默认 stdout 日志。
 
-每行是包含 `key` 和 `value` 字段的 JSON envelope。`key` 与原 Kafka 消息键一致，格式为 `resource_id|account_id|user_id|resource_uri`；`resource_uri` 为空时使用 `session_id`。`value` 是原 Kafka 消息的完整对象，包含 `count_name`、`op_type`、`amount`、`timestamp`、`unique_id`、`tags`、`extra` 和 `prefix`。JSON envelope 能完整保留 key 内部的分隔符。文件采集和下游投递仍为 best-effort，消费端应按 `value.unique_id` 去重。
+每行格式如下：
+
+```json
+{"event_time":"2026-08-05 11:30:00","tenant_id":"resource_id:ov-example;account_id:default;user_id:default;resource_uri:viking://user/default/memories/experiences/example.md","event_name":"experience.recall.count","object_id":"ue_<sha256>","count":1,"tags":{"resource_type":"experience"}}
+```
+
+`event_time` 使用 UTC 时间。`tenant_id` 由部署 resource ID、事件所属的 account、user 和 Experience URI 拼接。`memory.recalled` 映射为 `experience.recall.count`，`memory.injected` 映射为 `experience.inject.count`。`object_id` 是稳定的 Usage Event ID。下游必须使用 `(tenant_id, object_id)` 复合键去重，不能跨 tenant 仅按 `object_id` 全局去重。查询时按 `tenant_id`、`event_name` 和 `event_time` 范围过滤，再通过 `sum(count)` 汇总。文件采集和下游投递仍为 best-effort。
 
 支持的 add target URI：
 
@@ -1859,7 +1865,7 @@ Task 记录文件位于所属账号的系统目录：
     "model": "string",
     "api_base": "string",
     "thinking": false,
-    "max_concurrent": 64,
+    "max_concurrent": 32,
     "max_retries": 3,
     "extra_headers": {},
     "extra_request_body": {},

@@ -21,8 +21,6 @@ from .semantic_queue import SemanticQueue
 
 logger = get_logger(__name__)
 
-DEFAULT_MAX_CONCURRENT_SESSION_COMMIT = 4
-
 # ========== Singleton Pattern ==========
 _instance: Optional["QueueManager"] = None
 
@@ -32,8 +30,10 @@ def init_queue_manager(
     timeout: int = 10,
     mount_point: str = "/queue",
     max_concurrent_embedding: int = 10,
-    max_concurrent_semantic: int = 64,
+    max_concurrent_semantic: int = 32,
     max_concurrent_external_parse: int = 4,
+    max_concurrent_add_resource: int = 4,
+    max_concurrent_session_commit: int = 4,
 ) -> "QueueManager":
     """Initialize QueueManager singleton.
 
@@ -44,6 +44,8 @@ def init_queue_manager(
         max_concurrent_embedding: Max concurrent embedding tasks.
         max_concurrent_semantic: Max concurrent semantic node work.
         max_concurrent_external_parse: Max concurrent ExternalParse tasks.
+        max_concurrent_add_resource: Max concurrent AddResource tasks.
+        max_concurrent_session_commit: Max concurrent SessionCommit tasks.
     """
     global _instance
     _instance = QueueManager(
@@ -53,6 +55,8 @@ def init_queue_manager(
         max_concurrent_embedding=max_concurrent_embedding,
         max_concurrent_semantic=max_concurrent_semantic,
         max_concurrent_external_parse=max_concurrent_external_parse,
+        max_concurrent_add_resource=max_concurrent_add_resource,
+        max_concurrent_session_commit=max_concurrent_session_commit,
     )
     return _instance
 
@@ -77,6 +81,9 @@ class QueueManager:
     EXTERNAL_PARSE = "ExternalParse"
     ADD_RESOURCE = "AddResource"
     SESSION_COMMIT = "SessionCommit"
+    USER_DELETION = "UserDeletion"
+    # A deferred archive re-enqueues itself; throttle the next scheduling round.
+    _SESSION_COMMIT_POLL_INTERVAL = 1.0
 
     def __init__(
         self,
@@ -84,8 +91,10 @@ class QueueManager:
         timeout: int = 10,
         mount_point: str = "/queue",
         max_concurrent_embedding: int = 10,
-        max_concurrent_semantic: int = 64,
+        max_concurrent_semantic: int = 32,
         max_concurrent_external_parse: int = 4,
+        max_concurrent_add_resource: int = 4,
+        max_concurrent_session_commit: int = 4,
     ):
         """Initialize QueueManager."""
         self._agfs = agfs
@@ -94,6 +103,8 @@ class QueueManager:
         self._max_concurrent_embedding = max_concurrent_embedding
         self._max_concurrent_semantic = max_concurrent_semantic
         self._max_concurrent_external_parse = max_concurrent_external_parse
+        self._max_concurrent_add_resource = max_concurrent_add_resource
+        self._max_concurrent_session_commit = max_concurrent_session_commit
         self._queues: Dict[str, NamedQueue] = {}
         self._started = False
         self._queue_threads: Dict[str, threading.Thread] = {}
@@ -182,12 +193,16 @@ class QueueManager:
 
     def _max_concurrent_for_queue(self, queue_name: str) -> int:
         """Return the worker concurrency limit for a named queue."""
+        if queue_name == self.USER_DELETION:
+            return 1
         if queue_name == self.EMBEDDING:
             return self._max_concurrent_embedding
         if queue_name == self.EXTERNAL_PARSE:
             return self._max_concurrent_external_parse
+        if queue_name == self.ADD_RESOURCE:
+            return self._max_concurrent_add_resource
         if queue_name == self.SESSION_COMMIT:
-            return DEFAULT_MAX_CONCURRENT_SESSION_COMMIT
+            return self._max_concurrent_session_commit
         return self._max_concurrent_semantic
 
     def _queue_worker_loop(
@@ -200,6 +215,11 @@ class QueueManager:
         """
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        poll_interval = (
+            self._SESSION_COMMIT_POLL_INTERVAL
+            if queue.name == self.SESSION_COMMIT
+            else self._poll_interval
+        )
         try:
             if max_concurrent > 1:
                 loop.run_until_complete(
@@ -212,15 +232,15 @@ class QueueManager:
                         if queue.has_dequeue_handler() and queue_size > 0:
                             data = loop.run_until_complete(queue.dequeue())
                             if data is not None:
-                                logger.debug(
-                                    f"[QueueManager] Dequeued message from {queue.name}: {data}"
-                                )
+                                logger.debug("[QueueManager] Dequeued message from %s", queue.name)
+                            if queue.name == self.SESSION_COMMIT:
+                                stop_event.wait(poll_interval)
                         else:
-                            stop_event.wait(self._poll_interval)
+                            stop_event.wait(poll_interval)
                     except Exception as e:
                         logger.error(f"[QueueManager] Worker error for {queue.name}: {e}")
                         traceback.print_exc()
-                        stop_event.wait(self._poll_interval)
+                        stop_event.wait(poll_interval)
         finally:
             loop.close()
 
@@ -231,6 +251,11 @@ class QueueManager:
 
         A Semaphore caps inflight tasks at max_concurrent.
         """
+        poll_interval = (
+            self._SESSION_COMMIT_POLL_INTERVAL
+            if queue.name == self.SESSION_COMMIT
+            else self._poll_interval
+        )
         sem = asyncio.Semaphore(max_concurrent)
         active_tasks: Set[asyncio.Task] = set()
 
@@ -272,7 +297,7 @@ class QueueManager:
                     f"(active={len(active_tasks)})"
                 )
 
-            await asyncio.sleep(self._poll_interval)
+            await asyncio.sleep(poll_interval)
 
         # Drain remaining in-flight tasks on shutdown (with timeout)
         if active_tasks:
@@ -359,9 +384,12 @@ class QueueManager:
                 )
             if self._started:
                 self._start_queue_worker(self._queues[name])
-        elif self._started:
-            # Ensure existing queue has a worker running
-            self._start_queue_worker(self._queues[name])
+        else:
+            if dequeue_handler is not None:
+                self._queues[name].set_dequeue_handler(dequeue_handler)
+            if self._started:
+                # Ensure existing queue has a worker running
+                self._start_queue_worker(self._queues[name])
         return self._queues[name]
 
     # ========== Compatibility convenience methods ==========

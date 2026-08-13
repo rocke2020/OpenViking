@@ -73,7 +73,7 @@ async def test_vectors_only_write_skips_semantic_refresh_and_vectorizes_file(mon
         "name": "demo.md",
         "summary": "",
     }
-    assert vectorize_file.await_args.kwargs["register_request_wait"] is True
+    assert "register_request_wait" not in vectorize_file.await_args.kwargs
     assert result["semantic_status"] == "skipped"
     assert result["vector_status"] == "queued"
 

@@ -2,7 +2,7 @@
 
 首次配置建议使用 `openviking-server init`，保存后运行 `openviking-server doctor`。
 
-OpenViking 服务端和 Python SDK 嵌入模式读取 `ov.conf`。默认路径是：
+OpenViking 服务端读取 `ov.conf`。默认路径是：
 
 ```text
 ~/.openviking/ov.conf
@@ -42,8 +42,8 @@ openviking-server --config /path/to/ov.conf
 
 | 配置项 | 类型 / 可选值 | 默认值 | 作用 |
 |---|---|---|---|
-| `default_account` | string | `"default"` | SDK 嵌入模式使用的默认账号 |
-| `default_user` | string | `"default"` | SDK 嵌入模式使用的默认用户 |
+| `default_account` | string | `"default"` | Service context 使用的默认账号 |
+| `default_user` | string | `"default"` | Service context 使用的默认用户 |
 | `embedding` | object | 内置本地 Dense 模型 | 向量化模型和稀疏/混合检索配置；默认使用 `local` / `bge-small-zh-v1.5-f16` |
 | `vlm` | object | 空配置 | 内容理解、摘要和记忆抽取使用的模型；使用相关能力前需要配置可用模型 |
 | `query_planner` | object / `null` | `null` | 检索意图分析模型；未配置时回退到 `vlm` |
@@ -207,6 +207,18 @@ Search 和 Find 请求的默认 `limit` 为 `10`，可以在每次 API 或 SDK �
 | `max_concurrent` | integer | `4` | 同时消费的完整 ExternalParse 作业数，必须大于 `0`；修改后需重启服务 |
 
 该配置控制队列作业并发，不等同于 `vlm.media.max_concurrent` 的音视频 VLM 调用并发，也不限制 Understanding API 的单独 HTTP 请求数。
+
+### `queue_workers.add_resource`
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---:|---|
+| `max_concurrent` | integer | `4` | 同时消费的完整 AddResource 作业数，必须大于 `0`；修改后需重启服务 |
+
+### `queue_workers.session_commit`
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---:|---|
+| `max_concurrent` | integer | `4` | 同时消费的 SessionCommit 作业数，必须大于 `0`；修改后需重启服务 |
 
 ## HTTP 服务配置
 

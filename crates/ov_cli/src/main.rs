@@ -374,7 +374,7 @@ enum Commands {
         /// Wait until processing is complete
         #[arg(long, help_heading = "Common options")]
         wait: bool,
-        /// Wait timeout in seconds (only used with --wait)
+        /// Request timeout in seconds. Used with --wait and by Manifest private Git imports
         #[arg(
             long,
             value_parser = config::parse_positive_timeout,
@@ -1080,6 +1080,13 @@ enum Commands {
             value_name = "seconds"
         )]
         timeout: Option<f64>,
+        /// Server-side runtime limit in seconds; reaching it saves partial resource output
+        #[arg(
+            long = "runtime-timeout",
+            value_parser = config::parse_positive_timeout,
+            value_name = "seconds"
+        )]
+        runtime_timeout: Option<f64>,
     },
 
     // --- Status & Observability ---
@@ -1380,7 +1387,24 @@ enum ObserverCommands {
 #[derive(Subcommand)]
 enum SessionCommands {
     /// Create a new session
-    New,
+    New {
+        /// Optional session ID
+        #[arg(long = "session-id", value_name = "session-id")]
+        session_id: Option<String>,
+        /// Default event-memory tags as comma-separated key=value pairs
+        #[arg(long = "event-tags", value_name = "key=value", value_delimiter = ',')]
+        event_tags: Vec<String>,
+        /// Auto-commit policy as a JSON object
+        #[arg(
+            long = "auto-commit-policy-json",
+            value_name = "json",
+            conflicts_with = "no_auto_commit"
+        )]
+        auto_commit_policy_json: Option<String>,
+        /// Disable automatic commits for this session
+        #[arg(long = "no-auto-commit", conflicts_with = "auto_commit_policy_json")]
+        no_auto_commit: bool,
+    },
     /// List sessions
     List,
     /// Get session details
@@ -1437,11 +1461,80 @@ enum SessionCommands {
         #[arg(value_name = "messages-json")]
         messages: String,
     },
+    /// Update mutable session configuration
+    Config {
+        #[command(subcommand)]
+        action: SessionConfigCommands,
+    },
     /// Commit a session (archive messages and extract memories)
     Commit {
         /// Session ID
         #[arg(value_name = "session-id")]
         session_id: String,
+        /// Event-memory tags for this commit as comma-separated key=value pairs
+        #[arg(
+            long = "event-tags",
+            value_name = "key=value",
+            value_delimiter = ',',
+            conflicts_with = "no_event_tags"
+        )]
+        event_tags: Vec<String>,
+        /// Do not apply the session's default event tags to this commit
+        #[arg(long = "no-event-tags", conflicts_with = "event_tags")]
+        no_event_tags: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionConfigCommands {
+    /// Set mutable session configuration
+    Set {
+        /// Session ID
+        #[arg(value_name = "session-id")]
+        session_id: String,
+        /// Default event-memory tags as comma-separated key=value pairs
+        #[arg(
+            long = "event-tags",
+            value_name = "key=value",
+            value_delimiter = ',',
+            required_unless_present_any = [
+                "no_event_tags",
+                "auto_commit_policy_json",
+                "no_auto_commit"
+            ],
+            conflicts_with = "no_event_tags"
+        )]
+        event_tags: Vec<String>,
+        /// Clear the session's default event-memory tags
+        #[arg(
+            long = "no-event-tags",
+            required_unless_present_any = [
+                "event_tags",
+                "auto_commit_policy_json",
+                "no_auto_commit"
+            ],
+            conflicts_with = "event_tags"
+        )]
+        no_event_tags: bool,
+        /// Auto-commit policy fields as a JSON object
+        #[arg(
+            long = "auto-commit-policy-json",
+            value_name = "json",
+            required_unless_present_any = ["event_tags", "no_event_tags", "no_auto_commit"],
+            conflicts_with = "no_auto_commit"
+        )]
+        auto_commit_policy_json: Option<String>,
+        /// Disable automatic commits for this session
+        #[arg(
+            long = "no-auto-commit",
+            required_unless_present_any = [
+                "event_tags",
+                "no_event_tags",
+                "auto_commit_policy_json"
+            ],
+            conflicts_with = "auto_commit_policy_json"
+        )]
+        no_auto_commit: bool,
     },
 }
 
@@ -3352,6 +3445,7 @@ async fn main() {
             reason,
             wait,
             timeout,
+            runtime_timeout,
         } => {
             let client = ctx.get_client();
             commands::compile::run(
@@ -3362,6 +3456,7 @@ async fn main() {
                 reason,
                 wait,
                 timeout,
+                runtime_timeout,
                 ctx.output_format,
                 ctx.compact,
             )
@@ -3750,6 +3845,8 @@ mod tests {
             "--wait",
             "--timeout",
             "10",
+            "--runtime-timeout",
+            "86400",
         ])
         .expect("compile flags should parse");
         match cli.command {
@@ -3759,6 +3856,7 @@ mod tests {
                 reason,
                 wait,
                 timeout,
+                runtime_timeout,
                 ..
             } => {
                 assert_eq!(from_uris.len(), 3);
@@ -3766,6 +3864,7 @@ mod tests {
                 assert!(reason.is_none());
                 assert!(wait);
                 assert_eq!(timeout, Some(10.0));
+                assert_eq!(runtime_timeout, Some(86_400.0));
             }
             _ => panic!("expected compile command"),
         }

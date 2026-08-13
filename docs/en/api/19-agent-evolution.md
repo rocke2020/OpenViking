@@ -20,15 +20,17 @@ Return a paginated list of trajectories that successfully read the specified Exp
 | experience_uri | string | Yes | - | Experience file URI in the current user space |
 | limit | integer | No | 50 | Page size from 1 through 1000 |
 | offset | integer | No | 0 | Zero-based result offset |
+| start_date | string | No | - | Earliest trajectory creation date, inclusive, as a UTC `YYYY-MM-DD` date |
+| end_date | string | No | - | Latest trajectory creation date, inclusive, as a UTC `YYYY-MM-DD` date |
 
 **HTTP API**
 
 ```
-GET /api/v1/agent-evolution/experiences/trajectories?experience_uri={experience_uri}&limit=50&offset=0
+GET /api/v1/agent-evolution/experiences/trajectories?experience_uri={experience_uri}&limit=50&offset=0&start_date=2026-08-01&end_date=2026-08-10
 ```
 
 ```bash
-curl -X GET "http://localhost:1933/api/v1/agent-evolution/experiences/trajectories?experience_uri=viking://user/default/memories/experiences/exchange.md&limit=50&offset=0" \
+curl -X GET "http://localhost:1933/api/v1/agent-evolution/experiences/trajectories?experience_uri=viking://user/default/memories/experiences/exchange.md&limit=50&offset=0&start_date=2026-08-01&end_date=2026-08-10" \
   -H "X-API-Key: your-key"
 ```
 
@@ -75,15 +77,17 @@ Count trajectories that consumed the specified Experience across the five suppor
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | experience_uri | string | Yes | - | Experience file URI in the current user space |
+| start_date | string | No | - | Earliest trajectory creation date, inclusive, as a UTC `YYYY-MM-DD` date |
+| end_date | string | No | - | Latest trajectory creation date, inclusive, as a UTC `YYYY-MM-DD` date |
 
 **HTTP API**
 
 ```
-GET /api/v1/agent-evolution/experiences/outcomes?experience_uri={experience_uri}
+GET /api/v1/agent-evolution/experiences/outcomes?experience_uri={experience_uri}&start_date=2026-08-01&end_date=2026-08-10
 ```
 
 ```bash
-curl -X GET "http://localhost:1933/api/v1/agent-evolution/experiences/outcomes?experience_uri=viking://user/default/memories/experiences/exchange.md" \
+curl -X GET "http://localhost:1933/api/v1/agent-evolution/experiences/outcomes?experience_uri=viking://user/default/memories/experiences/exchange.md&start_date=2026-08-01&end_date=2026-08-10" \
   -H "X-API-Key: your-key"
 ```
 

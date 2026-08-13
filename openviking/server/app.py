@@ -139,6 +139,15 @@ async def _initialize_runtime_state(
     """Initialize service and auth dependencies before traffic is accepted."""
     await service.initialize()
     await _initialize_auth_plugin(app, service, config)
+    from openviking.service.user_deletion import setup_user_deletion
+
+    app.state.user_deletion_service = await setup_user_deletion(
+        service=service,
+        manager=app.state.api_key_manager,
+        shared_upload_prefix=config.temp_upload.shared_prefix,
+        oauth_store=getattr(app.state, "oauth_store", None),
+        usage_audit_runtime=getattr(app.state, "usage_audit_runtime", None),
+    )
     logger.info("OpenVikingService initialization complete")
 
 
@@ -346,6 +355,12 @@ def create_app(
         await shutdown_usage_audit(app=app)
         await shutdown_metrics_async(app=app)
         task_tracker.stop_cleanup_loop()
+        auth_plugin_state = getattr(app.state, "auth_plugin", None)
+        if auth_plugin_state is not None:
+            try:
+                await auth_plugin_state.shutdown()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Auth plugin shutdown failed: %s", e)
         if oauth_gc_task is not None:
             oauth_gc_task.cancel()
             try:
@@ -378,6 +393,7 @@ def create_app(
 
     app.state.config = config
     app.state.api_key_manager = None
+    app.state.user_deletion_service = None
     set_server_config(config)
 
     # Body dump middleware must be registered BEFORE observability so it ends up
@@ -763,8 +779,9 @@ def create_app(
     else:
         logger.info("Web Studio bundle not found at %s; skipping /studio mount", _studio_dir)
 
-    # MCP endpoint — serves 5 tools (search, read, store, forget, health)
-    # via streamable HTTP for Claude Code and other MCP clients.
+    # MCP endpoint — serves 16 tools (find, search, recall, read, write, edit,
+    # list, tree, remember, add_resource, list_watches, cancel_watch, grep,
+    # glob, forget, health) via streamable HTTP for MCP clients.
     from starlette.routing import Match, Route
 
     from openviking.server.mcp_endpoint import create_mcp_app

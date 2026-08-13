@@ -20,15 +20,17 @@ Agent Evolution API 用于查询某条 Experience 被实际应用后的 Trajecto
 | experience_uri | string | 是 | - | 当前用户空间内的 Experience 文件 URI |
 | limit | integer | 否 | 50 | 单页数量，范围为 1～1000 |
 | offset | integer | 否 | 0 | 从零开始的结果偏移量 |
+| start_date | string | 否 | - | Trajectory 创建日期下界（包含），UTC `YYYY-MM-DD` |
+| end_date | string | 否 | - | Trajectory 创建日期上界（包含），UTC `YYYY-MM-DD` |
 
 **HTTP API**
 
 ```
-GET /api/v1/agent-evolution/experiences/trajectories?experience_uri={experience_uri}&limit=50&offset=0
+GET /api/v1/agent-evolution/experiences/trajectories?experience_uri={experience_uri}&limit=50&offset=0&start_date=2026-08-01&end_date=2026-08-10
 ```
 
 ```bash
-curl -X GET "http://localhost:1933/api/v1/agent-evolution/experiences/trajectories?experience_uri=viking://user/default/memories/experiences/exchange.md&limit=50&offset=0" \
+curl -X GET "http://localhost:1933/api/v1/agent-evolution/experiences/trajectories?experience_uri=viking://user/default/memories/experiences/exchange.md&limit=50&offset=0&start_date=2026-08-01&end_date=2026-08-10" \
   -H "X-API-Key: your-key"
 ```
 
@@ -75,15 +77,17 @@ curl -X GET "http://localhost:1933/api/v1/agent-evolution/experiences/trajectori
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | experience_uri | string | 是 | - | 当前用户空间内的 Experience 文件 URI |
+| start_date | string | 否 | - | Trajectory 创建日期下界（包含），UTC `YYYY-MM-DD` |
+| end_date | string | 否 | - | Trajectory 创建日期上界（包含），UTC `YYYY-MM-DD` |
 
 **HTTP API**
 
 ```
-GET /api/v1/agent-evolution/experiences/outcomes?experience_uri={experience_uri}
+GET /api/v1/agent-evolution/experiences/outcomes?experience_uri={experience_uri}&start_date=2026-08-01&end_date=2026-08-10
 ```
 
 ```bash
-curl -X GET "http://localhost:1933/api/v1/agent-evolution/experiences/outcomes?experience_uri=viking://user/default/memories/experiences/exchange.md" \
+curl -X GET "http://localhost:1933/api/v1/agent-evolution/experiences/outcomes?experience_uri=viking://user/default/memories/experiences/exchange.md&start_date=2026-08-01&end_date=2026-08-10" \
   -H "X-API-Key: your-key"
 ```
 
