@@ -8,16 +8,15 @@ files' MEMORY_FIELDS metadata.
 
 from __future__ import annotations
 
-import asyncio
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
+from openviking.concurrency import AsyncSemaphore
 from openviking.core.namespace import (
     NamespaceShapeError,
     canonical_user_root,
-    canonicalize_uri,
     context_type_for_uri,
     uri_parts,
 )
@@ -33,6 +32,7 @@ from openviking.session.memory.utils.resource_refs import (
     resource_ref_matches,
     unlink_resource_references_from_memory,
 )
+from openviking.storage.abstract_overview import body_for_preview
 from openviking.storage.viking_fs import VikingFS, get_viking_fs
 from openviking.storage.vikingdb_manager import VikingDBManager
 from openviking_cli.exceptions import NotFoundError
@@ -91,7 +91,7 @@ def _resource_reason_peer_id(ctx: RequestContext, resource_uri: str) -> Optional
 
 def _peer_id_from_resource_uri(resource_uri: str, ctx: RequestContext) -> Optional[str]:
     try:
-        parts = uri_parts(canonicalize_uri(resource_uri, ctx))
+        parts = uri_parts(resource_uri)
     except (NamespaceShapeError, ValueError):
         return None
     if len(parts) >= 5 and parts[0] == "user" and parts[2] == "peers":
@@ -127,7 +127,8 @@ class ResourceMemoryLinkService:
         self._vikingdb = vikingdb
         self._viking_fs = viking_fs
         self._session_service = session_service
-        self._reason_session_lock = asyncio.Lock()
+        # Additions run on queue loops; deletions can run on the HTTP loop.
+        self._reason_session_lock = AsyncSemaphore()
 
     def set_dependencies(
         self,
@@ -342,9 +343,7 @@ class ResourceMemoryLinkService:
             task_id,
             account_id=ctx.account_id,
             user_id=ctx.user.user_id,
-            timeout=(
-                _RESOURCE_REASON_COMMIT_TIMEOUT_SECONDS if timeout is None else timeout
-            ),
+            timeout=(_RESOURCE_REASON_COMMIT_TIMEOUT_SECONDS if timeout is None else timeout),
             poll_interval=0.1,
         )
         if task.status == TaskStatus.COMPLETED:
@@ -638,7 +637,7 @@ class ResourceMemoryLinkService:
 
     @staticmethod
     def _clean_resource_abstract(abstract: Any) -> str:
-        text = " ".join(str(abstract or "").split())
+        text = " ".join(body_for_preview(str(abstract or "")).split())
         if not text:
             return ""
         if any(text == marker or text.endswith(marker) for marker in _ABSTRACT_NOT_READY_MARKERS):

@@ -22,7 +22,7 @@ from openviking.session.memory.dataclass import (
 from openviking.session.memory.memory_isolation_handler import RoleScope
 from openviking.session.memory.merge_op import MergeOp, MergeOpFactory
 from openviking.session.memory.merge_op.base import FieldType, get_python_type_for_field
-from openviking.session.memory.utils.template_utils import TemplateUtils
+from openviking.session.memory.utils.description_template import render_description_template
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
@@ -37,6 +37,33 @@ def to_pascal_case(s: str) -> str:
     return "".join(word.title() for word in words)
 
 
+# from typing import Literal
+#
+# class PageDecision(BaseModel):
+#     """Temporary page-level reasoning for memory bad-case analysis."""
+#
+#     page_id: int = Field(..., description="The related page_id from read results.")
+#     remove: List[str] = Field(
+#         ...,
+#         description=(
+#             "For UPDATE, list exact affected `- ...` bullets or standalone summary sentences. "
+#             "Use [] for KEEP or DELETE."
+#         ),
+#     )
+#     has_unaffected_facts: bool = Field(
+#         ...,
+#         description="Whether the page contains any fact outside remove that must be preserved.",
+#     )
+#     action: Literal["KEEP", "UPDATE", "DELETE"] = Field(
+#         ...,
+#         description=(
+#             "KEEP when no fact is affected; UPDATE when remove is non-empty and "
+#             "has_unaffected_facts is true; DELETE when the whole page is affected and "
+#             "has_unaffected_facts is false. For DELETE, leave remove empty."
+#         ),
+#     )
+
+
 class SchemaModelGenerator:
     """
     Dynamic Pydantic model generator from memory type schemas.
@@ -49,25 +76,22 @@ class SchemaModelGenerator:
         self,
         schemas: List[MemoryTypeSchema],
         template_context: Optional[Dict[str, Any]] = None,
+        # include_decision_reasoning: bool = True,
     ):
         if hasattr(schemas, "list_all"):
-            schemas = schemas.list_all()
-        self.schemas = schemas
+            self._all_schemas = schemas.list_all(include_disabled=True)
+            schemas = schemas.list_all(include_disabled=False)
+        else:
+            self._all_schemas = list(schemas)
+        self.schemas = list(schemas)
         self._template_context = dict(template_context or {})
+        # self._include_decision_reasoning = include_decision_reasoning
         self._model_cache: Dict[str, Type[BaseModel]] = {}
         self._flat_data_models: Dict[str, Type[BaseModel]] = {}
         self._operations_model: Optional[Type[BaseModel]] = None
 
     def _render_description(self, description: str) -> str:
-        if not description:
-            return description
-        if "{{" not in description and "{%" not in description and "{#" not in description:
-            return description
-        return TemplateUtils.render(
-            description,
-            self._template_context,
-            strip=False,
-        )
+        return render_description_template(description, self._template_context, strip=False)
 
     def _map_field_type(self, field_type: FieldType) -> Type[Any]:
         """Map YAML field type to Python type."""
@@ -121,19 +145,28 @@ class SchemaModelGenerator:
                 ),
             )
 
+        page_id_json_schema = {"type": "integer"}
+        page_id_description = "Temporary page_id for identifying the target memory item."
+        if memory_type.memory_type == "events" and memory_type.operation_mode == "add_only":
+            page_id_json_schema["minimum"] = 100
+            page_id_description = "Unique page_id for this new event; it MUST be at least 100."
+
         field_definitions["page_id"] = (
-            Annotated[int, WithJsonSchema({"type": "integer"})],
+            Annotated[int, WithJsonSchema(page_id_json_schema)],
             Field(
                 ...,
-                description="Temporary page_id for identifying the target memory item.",
+                description=page_id_description,
             ),
         )
+
+        immutable_field_names = []
 
         # Add business fields from schema
         for field in memory_type.fields:
             base_type = self._map_field_type(field.field_type)
             if field.merge_op == MergeOp.IMMUTABLE:
                 # Immutable fields: only base type, required
+                immutable_field_names.append(field.name)
                 field_definitions[field.name] = (
                     base_type,
                     Field(..., description=self._render_description(field.description)),
@@ -172,7 +205,8 @@ class SchemaModelGenerator:
             Dictionary mapping memory_type to generated model class
         """
         models: Dict[str, Type[BaseModel]] = {}
-        for memory_type in self.schemas:
+        schemas = self._all_schemas if include_disabled else self.schemas
+        for memory_type in schemas:
             models[memory_type.memory_type] = self.create_flat_data_model(memory_type)
         return models
 
@@ -200,10 +234,17 @@ class SchemaModelGenerator:
         # Build field definitions for each memory_type
         field_definitions: Dict[str, Tuple[Type[Any], Any]] = {}
 
-        # field_definitions["reasoning"] = (
-        #     str,
-        #     Field("", description="reasoning"),
-        # )
+        # if self._include_decision_reasoning:
+        #     field_definitions["decision_reasoning"] = (
+        #         List[PageDecision],
+        #         Field(
+        #             default_factory=list,
+        #             description=(
+        #                 "Before choosing operations, return one decision for every related "
+        #                 "read page."
+        #             ),
+        #         ),
+        #     )
 
         for mt in enabled_memory_types:
             flat_model = self.create_flat_data_model(mt, role_scope)
@@ -306,8 +347,7 @@ class SchemaModelGenerator:
         StructuredMemoryOperations.is_empty = is_empty
         StructuredMemoryOperations.to_legacy_operations = to_legacy_operations
         StructuredMemoryOperations._memory_type_fields = memory_type_fields  # type: ignore
-        # Opt this model into treating a bare `[]` LLM response as an empty-ops result
-        # (every field is default_factory=list); see parse_json_with_stability Layer 3.
+        # Every top-level field defaults to a list, so [] is a valid no-operations result.
         StructuredMemoryOperations._allow_empty_list_response = True  # type: ignore
 
         self._operations_model = StructuredMemoryOperations
@@ -332,9 +372,7 @@ class SchemaPromptGenerator:
         self._template_context = dict(template_context or {})
 
     def _render_description(self, description: str) -> str:
-        if not description:
-            return description
-        return TemplateUtils.render(description, self._template_context)
+        return render_description_template(description, self._template_context)
 
     def generate_type_descriptions(self) -> str:
         """
@@ -347,7 +385,7 @@ class SchemaPromptGenerator:
 
         for mt in self.schemas:
             lines.append(f"\n### {mt.memory_type}")
-            lines.append(f"{self._render_description(mt.description)}")
+            lines.append(self._render_description(mt.description))
 
             # Add URI format information
             if mt.directory or mt.filename_template:
@@ -370,7 +408,8 @@ class SchemaPromptGenerator:
                 lines.append("\n**Fields:**")
                 for field in mt.fields:
                     lines.append(
-                        f"- `{field.name}` ({field.field_type.value}): {self._render_description(field.description)}"
+                        f"- `{field.name}` ({field.field_type.value}): "
+                        f"{self._render_description(field.description)}"
                     )
 
         return "\n".join(lines)

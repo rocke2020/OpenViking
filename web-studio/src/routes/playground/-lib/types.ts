@@ -1,5 +1,3 @@
-import type { VikingFsEntry } from '#/routes/resources/-types/viking-fm'
-
 export type PlaygroundPanel = 'agent' | 'terminal'
 
 export type PlaygroundSearch = {
@@ -17,6 +15,8 @@ export type ResourceRef = {
 }
 
 export type TerminalEntry = {
+  compileTaskId?: string
+  compileForm?: boolean
   id: string
   kind: 'command' | 'error' | 'info' | 'success'
   title: string
@@ -65,4 +65,3 @@ export type TerminalCommandView = TerminalCommandSuggestion & {
 }
 
 export type ResourceOpenHandler = (uri: string) => Promise<void> | void
-export type VikingEntryHandler = (entry: VikingFsEntry) => void

@@ -5,6 +5,7 @@ Memory type registry - loads YAML configurations.
 """
 
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, List, Optional
 
 import yaml
@@ -258,9 +259,11 @@ class MemoryTypeRegistry:
             if "{{" in schema.filename_template:
                 continue
 
-            # Check if any field has init_value
+            # Seed template variables with every field so that placeholders for
+            # fields without an explicit init_value render as empty instead of
+            # leaking the literal "{{ field }}" text into the initialized file.
             fields_with_init = {
-                f.name: f.init_value for f in schema.fields if f.init_value is not None
+                f.name: f.init_value if f.init_value is not None else "" for f in schema.fields
             }
             if not fields_with_init:
                 continue
@@ -299,6 +302,9 @@ class MemoryTypeRegistry:
             full_content = MemoryFileUtils.write(
                 mf,
                 content_template=schema.content_template,
+                account_content_template_type=(
+                    schema.memory_type if schema._account_content_template else None
+                ),
             )
 
             # Write the file
@@ -309,11 +315,20 @@ class MemoryTypeRegistry:
                 pass
 
 
-def create_default_registry() -> MemoryTypeRegistry:
-    """
-    Create a registry with memory types loaded at initialization.
+_default_registry: Optional[MemoryTypeRegistry] = None
+_default_registry_lock = Lock()
 
-    Returns:
-        MemoryTypeRegistry with built-in types (loaded in __init__)
+
+def get_default_registry() -> MemoryTypeRegistry:
+    """Return the shared default registry, loaded on first use.
+
+    Template changes take effect after restarting the process. Callers must
+    not modify this registry or its schemas; use a separate registry to load
+    additional templates.
     """
-    return MemoryTypeRegistry(load_schemas=True)
+    global _default_registry
+    if _default_registry is None:
+        with _default_registry_lock:
+            if _default_registry is None:
+                _default_registry = MemoryTypeRegistry()
+    return _default_registry

@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
-from openviking.resource.feishu_watch_auth import FeishuRefreshedToken
+from openviking.resource.feishu_watch_auth import FeishuOAuthClient, FeishuRefreshedToken
 from openviking.resource.git_watch_auth import create_git_http_auth_state
 from openviking.resource.watch_manager import WatchManager
 from openviking.resource.watch_scheduler import WatchScheduler
@@ -317,7 +317,6 @@ class TestResourceExistenceCheck:
             skill_processor=MockSkillProcessor(),
             watch_scheduler=None,
         )
-
         scheduler = WatchScheduler(
             resource_service=resource_service,
             viking_fs=None,
@@ -358,6 +357,9 @@ class TestResourceExistenceCheck:
             skill_processor=MockSkillProcessor(),
             watch_scheduler=None,
         )
+        resource_service.refresh_resource = AsyncMock(
+            return_value={"root_uri": "viking://resources/existing"}
+        )
 
         scheduler = WatchScheduler(
             resource_service=resource_service,
@@ -395,6 +397,9 @@ class TestResourceExistenceCheck:
             skill_processor=MockSkillProcessor(),
             watch_scheduler=None,
         )
+        resource_service.refresh_resource = AsyncMock(
+            return_value={"root_uri": "viking://resources/url"}
+        )
 
         scheduler = WatchScheduler(
             resource_service=resource_service,
@@ -416,11 +421,14 @@ class TestResourceExistenceCheck:
         updated_task = await watch_manager.get_task(task.task_id)
         assert updated_task is not None
         assert updated_task.is_active is True
-        assert resource_processor.call_count == 1
+        resource_service.refresh_resource.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_feishu_user_token_watch_refreshes_before_execution(
-        self, temp_storage: Path, request_context: RequestContext
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        temp_storage: Path,
+        request_context: RequestContext,
     ):
         resource_processor = MockResourceProcessor()
         resource_service = ResourceService(
@@ -430,9 +438,24 @@ class TestResourceExistenceCheck:
             skill_processor=MockSkillProcessor(),
             watch_scheduler=None,
         )
+        resource_service.refresh_resource = AsyncMock(
+            return_value={"root_uri": "viking://resources/feishu-user-watch"}
+        )
         scheduler = WatchScheduler(resource_service=resource_service, viking_fs=None)
         await scheduler.start()
-        scheduler._feishu_oauth_client = FakeFeishuOAuthClient()
+        feishu_client = FakeFeishuOAuthClient()
+
+        def from_auth_state(_cls, auth_state):
+            assert auth_state["app_id"] == "cli-test"
+            assert auth_state["app_secret"] == "secret-test"
+            return feishu_client
+
+        monkeypatch.setattr(
+            FeishuOAuthClient,
+            "from_auth_state",
+            classmethod(from_auth_state),
+            raising=False,
+        )
         watch_manager = scheduler.watch_manager
 
         task = await watch_manager.create_task(
@@ -444,14 +467,15 @@ class TestResourceExistenceCheck:
                 "access_token": "u-old",
                 "refresh_token": "r-old",
                 "expires_at": None,
+                "app_id": "cli-test",
+                "app_secret": "secret-test",
             },
         )
 
         await scheduler._execute_task(task)
 
-        assert scheduler._feishu_oauth_client.calls == ["r-old"]
-        assert resource_processor.call_count == 1
-        assert resource_processor.calls[-1]["feishu_access_token"] == "u-new"
+        assert feishu_client.calls == ["r-old"]
+        assert resource_service.refresh_resource.await_args.kwargs["feishu_access_token"] == "u-new"
 
         updated_task = await watch_manager.get_task(task.task_id)
         assert updated_task is not None
@@ -460,7 +484,7 @@ class TestResourceExistenceCheck:
         assert updated_task.auth_state["expires_at"] is not None
 
     @pytest.mark.asyncio
-    async def test_git_token_watch_restores_request_local_auth_for_execution(
+    async def test_git_token_watch_restores_task_auth_for_refresh(
         self, temp_storage: Path, request_context: RequestContext
     ):
         resource_service = ResourceService(
@@ -519,6 +543,9 @@ class TestSchedulerIntegration:
             skill_processor=MockSkillProcessor(),
             watch_scheduler=None,
         )
+        resource_service.refresh_resource = AsyncMock(
+            return_value={"root_uri": "viking://resources/test"}
+        )
 
         scheduler = WatchScheduler(
             resource_service=resource_service,
@@ -540,7 +567,7 @@ class TestSchedulerIntegration:
 
         await scheduler.stop()
 
-        assert resource_processor.call_count >= 1
+        assert resource_service.refresh_resource.await_count >= 1
 
     @pytest.mark.asyncio
     async def test_scheduler_handles_multiple_tasks_after_restart(
@@ -560,6 +587,9 @@ class TestSchedulerIntegration:
             resource_processor=resource_processor,
             skill_processor=MockSkillProcessor(),
             watch_scheduler=None,
+        )
+        resource_service.refresh_resource = AsyncMock(
+            return_value={"root_uri": "viking://resources/test"}
         )
 
         scheduler = WatchScheduler(
@@ -588,7 +618,7 @@ class TestSchedulerIntegration:
 
         await scheduler.stop()
 
-        assert resource_processor.call_count >= 2
+        assert resource_service.refresh_resource.await_count >= 2
 
     @pytest.mark.asyncio
     async def test_scheduler_skips_inactive_tasks_after_restart(

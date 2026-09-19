@@ -10,6 +10,8 @@ validates the manifest, file list, directory list, and checksums so package
 content cannot drift from the manifest. If an attacker can rewrite both content
 and manifest, rely on external signatures, secure transport, and access control.
 
+Storage encryption does not encrypt the exported package. Export reads through the transparent decryption layer and writes plaintext content into a normal ZIP archive. Protect the `.ovpack` file independently during storage and transfer; possession of the archive is enough to read its content without the source storage key.
+
 ## Supported Scope
 
 Regular `export/import` handles one package root:
@@ -21,7 +23,11 @@ Full migration uses the separate `backup/restore` flow. It packages public
 scope roots together:
 
 - `viking://resources`
-- `viking://user`
+- all `viking://user/{user_id}` content in the current account
+
+Only ROOT or ADMIN can call `backup/restore`, and these operations traverse all
+user content within the current account. Backup packages do not contain user
+accounts, API keys, or other authentication data.
 
 Sessions are included through the user namespace at
 `viking://user/{user_id}/sessions/{session_id}`. The
@@ -36,16 +42,22 @@ Multi-write storage only replicates writes that happen after it is enabled. It
 does not automatically copy historical files that already existed before
 `storage.agfs.backups` was turned on.
 
-When migrating an existing environment to multi-write mode, first move the
-existing dataset with OVPack, then enable multi-write storage.
+To seed the primary and replicas together, enable multi-write on the **empty target environment before restoring** the package:
 
-Recommended flow:
+1. Pause application writes and export or back up each source account.
+2. Configure the target primary and backup backends, including their write policies, then start the target server and provision its restore identity.
+3. Restore or import through that server so historical content passes through the configured write fanout.
+4. Check synchronization status for every restored scope and verify the expected files in each replica before switching traffic. Asynchronous replication can still be pending after restore returns.
+5. Resume writes after validating content and index integrity. Keep the source and backup until verification is complete.
 
-1. Use `ov backup` or `ov export` to export the current dataset.
-2. Restore or import the dataset into the target storage environment.
-3. Validate data and index integrity in the target environment.
-4. Configure and enable multi-write storage.
-5. Resume normal writes and let multi-write handle future incremental copies.
+For example, using the target account's admin key:
+
+```bash
+ov system backend sync-status viking://resources
+ov system backend sync-status viking://user
+```
+
+Restoring first and enabling backups afterwards only replicates subsequent writes; it does not seed historical content into replicas.
 
 For more details, see the [Multi-Write Storage Guide](./13-multi-write-storage.md).
 
@@ -122,7 +134,7 @@ details include only one missing key to keep logs small.
 Python SDK:
 
 ```python
-report = await client.check_consistency("viking://resources/my-project")
+report = await client.check_consistency(uri="viking://resources/my-project")
 print(report["ok"], report["missing_records"])
 ```
 
@@ -157,6 +169,39 @@ ov restore ./backups/openviking.ovpack --on-conflict overwrite
 Backup packages can only be restored with `restore`; regular `import` rejects
 them.
 
+Backup reads live files and is not an atomic point-in-time snapshot. Content
+that changes during backup may represent different moments. Pause writes during
+the backup window when strict consistency is required.
+
+In API key mode, a new target needs an account and an admin identity **before** restore. The root key can create that identity but cannot call tenant-scoped pack APIs. Set `OPENVIKING_ROOT_API_KEY` to the target root key, then call the target server to create the account with a restore operator whose user ID is absent from the package:
+
+```bash
+curl -f -X POST http://localhost:1933/api/v1/admin/accounts \
+  -H "X-API-Key: $OPENVIKING_ROOT_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"account_id": "acme", "admin_user_id": "restore-operator"}'
+```
+
+Use the returned `user_key` as `api_key` in a dedicated target client config, for example `restore.ovcli.conf`:
+
+```json
+{
+  "url": "http://localhost:1933",
+  "api_key": "<target-admin-user-key>"
+}
+```
+
+Account initialization already creates scope directories. Consequently, `fail` rejects a restore even when this new account contains no business data; choosing a different restore operator does not avoid that scope-level check. Confirm that the target contains **only the newly created account's initial content**, then restore with `overwrite`:
+
+```bash
+OPENVIKING_CLI_CONFIG_FILE=./restore.ovcli.conf \
+  ov restore ./backups/openviking.ovpack --on-conflict overwrite
+```
+
+For an existing target account, use its admin key instead of creating it again. If it contains business data, do not run this command unchanged: pause writes, back up the target, and review the package paths against target content before deciding what may be overwritten, or use a separate clean target. `overwrite` replaces matching paths; a file/directory type conflict can remove the existing subtree. `fail` checks for existing scope roots, not individual file conflicts, and `skip` skips the whole restore when a scope exists. Each backup/restore is account-scoped; repeat with the appropriate identity for other accounts.
+
+After restoring content, register the remaining users with the same `user_id` values found in the package. Existing user directories do not mean that user accounts exist. The target generates new API keys; source keys are not restored. Verify reads with each target user's key before switching clients.
+
 ## Python SDK
 
 ```python
@@ -188,9 +233,12 @@ async def migrate_project():
 Full backup:
 
 ```python
-await client.backup_ovpack("./backups/openviking.ovpack", include_vectors=True)
+await client.backup_ovpack(
+    to="./backups/openviking.ovpack",
+    include_vectors=True,
+)
 await client.restore_ovpack(
-    "./backups/openviking.ovpack",
+    file_path="./backups/openviking.ovpack",
     on_conflict="overwrite",
     vector_mode="auto",
 )
@@ -308,6 +356,18 @@ curl -X POST http://localhost:1933/api/v1/pack/backup \
 
 `skip` is a root-level skip, not a file-level merge.
 
+The table above describes regular `import`. For full `restore`, `overwrite`
+performs a merge-upsert: missing target paths are created, matching paths are
+overwritten, and target-only paths absent from the backup are normally preserved. If a package file replaces an existing directory (or vice versa), restore removes the conflicting target first; existing descendants of that directory are also removed. Restore
+does not delete the full `viking://resources` or `viking://user` tree, and it
+does not create or write the aggregate `viking://user` container itself.
+Vectors are restored or recomputed only for package content that is added or
+overwritten; vectors for target-only content remain unchanged.
+
+Every conflict policy first validates the complete manifest, files, checksums,
+and vector metadata. A corrupt package fails even with `skip`; it cannot return
+success without validation.
+
 ## Package Layout
 
 OVPack v3 is a standard ZIP archive with one package root directory:
@@ -413,6 +473,9 @@ from the package:
 id, uri, account_id, owner_user_id, owner_space,
 created_at, updated_at, active_count
 ```
+
+User ownership is rebuilt from `viking://user/{user_id}` paths. User accounts
+and API keys are not OVPack content.
 
 With `--include-vectors`, export also stores pure-dense vectors and embedding
 metadata. Even when import restores dense snapshots, runtime fields are rebuilt

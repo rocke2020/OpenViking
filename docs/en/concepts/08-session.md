@@ -6,11 +6,13 @@ Session manages conversation messages, tracks context usage, and extracts long-t
 
 **Lifecycle**: Create → Interact → Commit
 
-Getting a session by ID does not auto-create it by default. Use `client.get_session(..., auto_create=True)` when you want missing sessions to be created automatically.
+Getting a session by ID does not create it. Create the session first, then use
+`client.session(session_id=...)` to append messages or commit it.
 
 ```python
-session = client.session(session_id="chat_001")
-session.add_message("user", [TextPart("...")])
+session_info = client.create_session(session_id="chat_001")
+session = client.session(session_id=session_info["session_id"])
+session.add_message(role="user", content="...")
 session.commit()
 ```
 
@@ -18,49 +20,39 @@ session.commit()
 
 | Method | Description |
 |--------|-------------|
-| `add_message(role, parts)` | Add message |
-| `used(contexts, skill)` | Record used contexts/skills |
+| `add_message(role, content=None, parts=None, options=None, peer_id=None)` | Add message |
 | `commit()` | Commit: archive (sync) + summary generation and memory extraction (async background) |
 | `get_task(task_id)` | Query background task status |
 
 ### add_message
 
 ```python
+from openviking_sdk import ContextPart, ImagePart, TextPart
+
 session.add_message(
-    "user",
-    [TextPart("How to configure embedding?")]
+    role="user",
+    content="How to configure embedding?",
 )
 
 session.add_message(
-    "assistant",
-    [
-        TextPart("Here's how..."),
-        ContextPart(uri="viking://user/memories/profile.md"),
+    role="assistant",
+    parts=[
+        TextPart(text="Here's how..."),
+        ContextPart(
+            uri="viking://~/memories/profile.md",
+            context_type="memory",
+            abstract="User profile",
+        ),
     ]
 )
 
 session.add_message(
-    "user",
-    [
-        TextPart("Remember this studio layout."),
+    role="user",
+    parts=[
+        TextPart(text="Remember this studio layout."),
         ImagePart(url="https://example.com/studio.png", detail="auto"),
     ]
 )
-```
-
-### used
-
-```python
-# Record used contexts
-session.used(contexts=["viking://user/memories/profile.md"])
-
-# Record used skill
-session.used(skill={
-    "uri": "viking://user/skills/code-search",
-    "input": "search config",
-    "output": "found 3 files",
-    "success": True
-})
 ```
 
 ### commit
@@ -75,7 +67,7 @@ result = session.commit()
 # }
 
 # Poll background task progress
-task = client.get_task(result["task_id"])
+task = client.get_task(task_id=result["task_id"])
 # task["status"]: "pending" | "running" | "completed" | "failed"
 # sum(task["result"]["memories_extracted"].values()): 3
 ```
@@ -147,7 +139,9 @@ Unfinished tasks
 
 After a session is committed, OpenViking uses the conversation and active memory policy to extract information that can improve future interactions. It stores the result in the current user's memory space. When a conversation involves a stable Peer, relevant memories can also be stored in that Peer's space.
 
-OpenViking includes memory types such as `profile`, `preferences`, `entities`, `events`, `identity`, `soul`, `cases`, `trajectories`, `experiences`, `tools`, and `skills`, and supports custom types for application-specific needs. See [Context Types](./02-context-types.md) for the complete purpose and path mapping.
+OpenViking includes memory types such as `profile`, `preferences`, `entities`, `events`, `identity`, `soul`, `cases`, `trajectories`, and `experiences`, and supports custom types for application-specific needs. See [Context Types](./02-context-types.md) for the complete purpose and path mapping.
+
+Within `memory_policy.memory_types`, `experiences` enables the complete Agent Evolution pipeline and automatically activates `cases` and `trajectories`. If `experiences` is absent, explicitly supplied `cases` and `trajectories` entries are ignored without an error.
 
 ### Extraction Flow
 
@@ -203,10 +197,19 @@ Each `session.commit()` writes a `memory_diff.json` to the archive directory, re
       }
     ]
   },
+  "skipped_operations": [
+    {
+      "memory_type": "events",
+      "page_id": 101,
+      "reason_code": "invalid_ranges",
+      "reason": "No valid event range could be resolved"
+    }
+  ],
   "summary": {
     "total_adds": 1,
     "total_updates": 1,
-    "total_deletes": 1
+    "total_deletes": 1,
+    "total_skipped": 1
   }
 }
 ```
@@ -218,9 +221,10 @@ Each `session.commit()` writes a `memory_diff.json` to the archive directory, re
 | `operations.adds` | New memories created (no `before`) |
 | `operations.updates` | Modified memories (with `before` and `after`) |
 | `operations.deletes` | Deleted memories (with `deleted_content`) |
+| `skipped_operations` | Intentionally skipped operations and their stable reason codes; these are not file changes |
 | `summary` | Counts per operation type |
 
-An empty `memory_diff.json` (all counts zero) is written even when no memory operations occurred.
+An empty `memory_diff.json` (all counts zero) is written when no applied or intentionally skipped operations occurred.
 
 ## Storage Structure
 
@@ -240,7 +244,7 @@ viking://user/{user_id}/sessions/{session_id}/
 └── tools/
     └── {tool_id}/tool.json
 
-viking://user/memories/
+viking://~/memories/
 ├── profile.md
 ├── identity.md
 ├── soul.md
@@ -249,16 +253,15 @@ viking://user/memories/
 ├── events/
 ├── cases/
 ├── trajectories/
-├── experiences/
-├── tools/
-└── skills/
+└── experiences/
 ```
 
-`viking://user/sessions/{session_id}` is accepted as a short form relative to
-the current request user and is canonicalized to
-`viking://user/{user_id}/sessions/{session_id}`. The old
-`viking://session/{session_id}` form is accepted as a backward-compatible alias
-for the same current-user session path and is not a separate storage root.
+`viking://~/sessions/{session_id}` uses the home alias and is expanded to
+`viking://user/{user_id}/sessions/{session_id}` for the authenticated caller.
+The uid-less spelling `viking://user/sessions/{session_id}` is no longer accepted
+and returns an error pointing at the `viking://~/...` form. The old
+`viking://session/{session_id}` form is still accepted as a backward-compatible
+alias for the same session path and is not a separate storage root.
 
 ## Related Documents
 

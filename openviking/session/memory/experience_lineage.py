@@ -8,7 +8,7 @@ import json
 import re
 from typing import Any, Iterable
 
-from openviking.core.namespace import canonicalize_uri, uri_parts
+from openviking.core.namespace import uri_parts
 from openviking.message import Message, ToolPart
 from openviking.server.identity import RequestContext
 from openviking.utils.tags import normalize_search_tag
@@ -22,7 +22,10 @@ _READ_TOOL_OPERATIONS = {
     "ov_read": "read",
     "ov_multi_read": "multi_read",
 }
-_MCP_OPENVIKING_READ_RE = re.compile(r"^mcp__openviking__(read|multi_read)$")
+_MCP_OPENVIKING_READ_RE = re.compile(
+    r"^mcp__(?:openviking|plugin_.+_openviking)__(read|multi_read)$",
+    re.IGNORECASE,
+)
 TRAJECTORY_OUTCOMES = ("success", "failure", "partial", "unknown", "unfinished")
 
 
@@ -40,10 +43,9 @@ def is_experience_uri_for_user(uri: str, user_id: str) -> bool:
 
 
 def canonical_experience_uri(uri: str, ctx: RequestContext) -> str | None:
-    """Canonicalize an Experience URI and enforce current-user ownership."""
-    try:
-        canonical_uri = canonicalize_uri(str(uri or "").strip(), ctx)
-    except (TypeError, ValueError):
+    """Enforce canonical Experience URI shape and current-user ownership."""
+    canonical_uri = str(uri or "").strip()
+    if not canonical_uri.startswith("viking://"):
         return None
     if not is_experience_uri_for_user(canonical_uri, ctx.user.user_id):
         return None
@@ -155,7 +157,7 @@ def _read_operation(tool_name: str) -> str | None:
     if operation is not None:
         return operation
     match = _MCP_OPENVIKING_READ_RE.fullmatch(name)
-    return match.group(1) if match is not None else None
+    return match.group(1).lower() if match is not None else None
 
 
 def _load_value(value: Any) -> Any:

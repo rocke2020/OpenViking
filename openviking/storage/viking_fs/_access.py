@@ -1,26 +1,36 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Access control, URI normalization, path conversion, and visibility mixin for VikingFS."""
+"""Access control, URI/path conversion, and visibility mixin for VikingFS."""
 
-import contextvars
 import hashlib
 import json
 import re
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
 
 from openviking.core.context import ContextLevel
 from openviking.core.namespace import (
-    canonicalize_uri,
+    is_accessible as namespace_is_accessible,
+)
+from openviking.core.namespace import (
     is_hidden_by_actor_peer_view,
     may_include_hidden_actor_peers,
 )
-from openviking.core.namespace import (
-    is_accessible as namespace_is_accessible,
-)
 from openviking.resource.watch_storage import is_watch_task_control_uri
-from openviking.server.error_mapping import is_not_found_error, map_exception
+from openviking.server.error_mapping import is_not_found_error
 from openviking.server.identity import RequestContext, Role
+from openviking.storage.acl import (
+    AclAction,
+    AclEntry,
+    AclLevel,
+    AclMode,
+    acl_allows,
+    acl_ancestors,
+    has_implicit_manage,
+    is_acl_uri,
+    normalize_acl_level,
+    normalize_acl_principal,
+)
 from openviking.storage.internal_names import STORAGE_INTERNAL_ENTRY_NAMES
 from openviking_cli.exceptions import (
     FailedPreconditionError,
@@ -30,18 +40,10 @@ from openviking_cli.exceptions import (
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.uri import VikingURI
 
-if TYPE_CHECKING:
-    from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
-    from openviking_cli.utils.config import GrepConfig, RerankConfig, RetrievalConfig
-
 
 class _AccessMixin:
     """URI normalization, access control, path conversion, and visibility helpers."""
 
-    # Over-fetch multiplier for bounded tree traversal. When a node_limit is
-    # set, we push down node_limit * this factor as the raw-node limit to Rust,
-    # leaving headroom for ACL/internal-name filtering before re-fetching.
-    _TREE_OVERFETCH_FACTOR = 4
     _GLOB_PAGE_SIZE_DEFAULT = 1024
 
     # Maximum bytes for a single filename component (filesystem limit is typically 255)
@@ -54,14 +56,16 @@ class _AccessMixin:
     # crates/ragfs/src/git/enumerate.rs and VikingFS._INTERNAL_NAMES so that
     # callers fail fast in Python with a clear error rather than passing a
     # path that the Rust side will silently drop.
-    _GIT_INTERNAL_FIRST_SEGMENTS = frozenset({
-        "_system",
-        "tasks",
-        "temp",
-        "queue",
-        "upload",
-        ".path.ovlock",
-    })
+    _GIT_INTERNAL_FIRST_SEGMENTS = frozenset(
+        {
+            "_system",
+            "tasks",
+            "temp",
+            "queue",
+            "upload",
+            ".path.ovlock",
+        }
+    )
 
     _DEFAULT_GIT_AUTHOR_NAME = "viking-bot"
     _DEFAULT_GIT_AUTHOR_EMAIL = "bot@viking.local"
@@ -79,8 +83,8 @@ class _AccessMixin:
     }
     _NO_VECTOR_DERIVED = frozenset({".relations.json", ".ovgitignore"})
 
-    def set_user_deletion_guard(self, guard: Optional[Callable[[str, str], bool]]) -> None:
-        self._user_deletion_guard = guard
+    def set_deletion_guard(self, guard: Optional[Callable[[str, str], bool]]) -> None:
+        self._deletion_guard = guard
 
     @staticmethod
     def _default_ctx() -> RequestContext:
@@ -102,36 +106,30 @@ class _AccessMixin:
             self._bound_ctx.reset(token)
 
     @staticmethod
-    def _normalize_uri(uri: str) -> str:
-        """Normalize short-format URIs to the canonical viking:// form."""
-        if uri.startswith("viking://"):
-            return uri
-        return VikingURI.normalize(uri)
-
-    @classmethod
-    def _normalized_uri_parts(cls, uri: str) -> tuple[str, List[str]]:
-        """Normalize a URI and reject ambiguous or platform-specific path traversal forms."""
-        normalized = cls._normalize_uri(uri)
-        parts = [p for p in normalized[len("viking://") :].strip("/").split("/") if p]
+    def _safe_uri_parts(uri: str) -> List[str]:
+        """Split a canonical URI and reject unsafe path traversal forms."""
+        if not uri.startswith("viking://"):
+            raise ValueError("URI must start with 'viking://'")
+        parts = [p for p in uri[len("viking://") :].strip("/").split("/") if p]
 
         for part in parts:
             if part in {".", ".."}:
                 raise PermissionDeniedError(
-                    f"Unsafe URI traversal segment '{part}' in {normalized}",
-                    resource=normalized,
+                    f"Unsafe URI traversal segment '{part}' in {uri}",
+                    resource=uri,
                 )
             if "\\" in part:
                 raise PermissionDeniedError(
-                    f"Unsafe URI path separator '\\\\' in component '{part}' of {normalized}",
-                    resource=normalized,
+                    f"Unsafe URI path separator '\\\\' in component '{part}' of {uri}",
+                    resource=uri,
                 )
             if len(part) >= 2 and part[1] == ":" and part[0].isalpha():
                 raise PermissionDeniedError(
-                    f"Unsafe URI drive-prefixed component '{part}' in {normalized}",
-                    resource=normalized,
+                    f"Unsafe URI drive-prefixed component '{part}' in {uri}",
+                    resource=uri,
                 )
 
-        return normalized, parts
+        return parts
 
     # TODO: Once pathlock moves down into ragfs, stop reconstructing the
     # encrypted mount-relative path in Python and derive the lock target from
@@ -157,52 +155,230 @@ class _AccessMixin:
         digest = hashlib.sha256(relative_path.encode("utf-8")).hexdigest()
         return f"{mount_prefix}{temp_root}/{digest}.encrypt"
 
-    def _ensure_access(self, uri: str, ctx: Optional[RequestContext]) -> None:
+    async def _can_access_many(
+        self,
+        uris: Sequence[str],
+        ctx: Optional[RequestContext],
+        *,
+        action: AclAction = AclAction.READ,
+    ) -> Dict[str, bool]:
+        if not isinstance(action, AclAction):
+            raise TypeError(f"action must be AclAction, got {type(action).__name__}")
         real_ctx = self._ctx_or_default(ctx)
-        normalized_uri, _ = self._normalized_uri_parts(uri)
-        if not self._is_accessible(normalized_uri, real_ctx):
-            raise PermissionDeniedError(f"Access denied for {uri}", resource=normalized_uri)
+        result: Dict[str, bool] = {}
+        valid: List[str] = []
+        for uri in dict.fromkeys(uris):
+            try:
+                self._safe_uri_parts(uri)
+            except ValueError:
+                result[uri] = False
+            else:
+                valid.append(uri)
 
-    def _ensure_mutable_access(self, uri: str, ctx: Optional[RequestContext]) -> None:
-        self._ensure_access(uri, ctx)
+        acl_manager = self.acl_manager
+        if acl_manager is None or not acl_manager.is_enabled(real_ctx.account_id):
+            result.update({uri: self._is_accessible(uri, real_ctx) for uri in valid})
+            return result
+
+        pending: List[str] = []
+        for uri in valid:
+            if is_watch_task_control_uri(uri):
+                result[uri] = self._is_accessible(uri, real_ctx)
+                continue
+            if not is_acl_uri(uri):
+                result[uri] = self._is_accessible(uri, real_ctx)
+                continue
+            if real_ctx.bypass_acl or has_implicit_manage(real_ctx, uri):
+                result[uri] = True
+            else:
+                pending.append(uri)
+
+        effective = await acl_manager.resolve_many(pending, real_ctx) if pending else {}
+        for uri in pending:
+            acl = effective[uri]
+            if not acl.enabled:
+                result[uri] = self._is_accessible(uri, real_ctx)
+            else:
+                result[uri] = acl_allows(acl, real_ctx, action)
+        return result
+
+    async def _ensure_access(
+        self,
+        uri: str,
+        ctx: Optional[RequestContext],
+        *,
+        action: AclAction = AclAction.READ,
+    ) -> None:
+        await self._ensure_access_many([uri], ctx, action=action)
+
+    async def _ensure_access_many(
+        self,
+        uris: Sequence[str],
+        ctx: Optional[RequestContext],
+        *,
+        action: AclAction,
+    ) -> None:
         real_ctx = self._ctx_or_default(ctx)
-        self._ensure_user_not_deleting(real_ctx)
-        normalized_uri, _ = self._normalized_uri_parts(uri)
-        if is_hidden_by_actor_peer_view(normalized_uri, real_ctx) or may_include_hidden_actor_peers(
-            normalized_uri, real_ctx
-        ):
-            raise PermissionDeniedError(f"Access denied for {uri}", resource=normalized_uri)
-        self._ensure_supported_write_namespace(normalized_uri)
-        if real_ctx.role != Role.ROOT and normalized_uri.rstrip("/") == "viking://temp":
-            raise PermissionDeniedError(
-                "Temp root is read-only for non-root users",
-                resource=normalized_uri,
-            )
+        access = await self._can_access_many(uris, real_ctx, action=action)
+        denied = next((uri for uri in uris if not access.get(uri, False)), None)
+        if denied is not None:
+            raise PermissionDeniedError(f"Access denied for {denied}", resource=denied)
 
-    def _ensure_delete_access(self, uri: str, ctx: Optional[RequestContext]) -> None:
-        self._ensure_access(uri, ctx)
+        if action is AclAction.READ:
+            return
+
+        self._ensure_identity_not_deleting(real_ctx)
+        for uri in uris:
+            self._safe_uri_parts(uri)
+            if uri == "viking://" and real_ctx.role == Role.USER:
+                raise PermissionDeniedError(
+                    "Writing the account root requires an administrator",
+                    resource=uri,
+                )
+            if is_hidden_by_actor_peer_view(uri, real_ctx) or may_include_hidden_actor_peers(
+                uri, real_ctx
+            ):
+                raise PermissionDeniedError(f"Access denied for {uri}", resource=uri)
+            if action is AclAction.MANAGE:
+                self._ensure_supported_delete_namespace(uri)
+                canonical_parts = self._safe_uri_parts(uri)
+                if real_ctx.role != Role.ROOT and (
+                    canonical_parts == ["resources"]
+                    or (canonical_parts[:1] == ["user"] and len(canonical_parts) == 2)
+                ):
+                    raise PermissionDeniedError(
+                        "Deleting a namespace root requires root access; use a concrete content "
+                        "path instead.",
+                        resource=uri,
+                    )
+            self._ensure_supported_write_namespace(uri)
+            if real_ctx.role != Role.ROOT and uri.rstrip("/") == "viking://temp":
+                raise PermissionDeniedError(
+                    "Temp root is read-only for non-root users",
+                    resource=uri,
+                )
+
+    async def _ensure_retrieval_scope(self, uri: str, ctx: Optional[RequestContext]) -> None:
+        self._safe_uri_parts(uri)
+        if self._acl_enabled(ctx) and is_acl_uri(uri):
+            return
+        await self._ensure_access(uri, ctx)
+
+    def _acl_enabled(self, ctx: Optional[RequestContext]) -> bool:
         real_ctx = self._ctx_or_default(ctx)
-        self._ensure_user_not_deleting(real_ctx)
-        normalized_uri, _ = self._normalized_uri_parts(uri)
-        if is_hidden_by_actor_peer_view(normalized_uri, real_ctx) or may_include_hidden_actor_peers(
-            normalized_uri, real_ctx
-        ):
-            raise PermissionDeniedError(f"Access denied for {uri}", resource=normalized_uri)
-        self._ensure_supported_delete_namespace(normalized_uri)
-        if real_ctx.role != Role.ROOT and normalized_uri.rstrip("/") == "viking://temp":
-            raise PermissionDeniedError(
-                "Temp root is read-only for non-root users",
-                resource=normalized_uri,
-            )
+        return self.acl_manager is not None and self.acl_manager.is_enabled(real_ctx.account_id)
 
-    def _ensure_user_not_deleting(self, ctx: RequestContext) -> None:
-        guard = getattr(self, "_user_deletion_guard", None)
-        if (
-            ctx.role != Role.ROOT
-            and guard is not None
-            and guard(ctx.account_id, ctx.user.user_id)
-        ):
-            raise FailedPreconditionError("User deletion is in progress")
+    async def _ensure_acl_manage(self, uri: str, ctx: Optional[RequestContext]) -> RequestContext:
+        if self.acl_manager is None:
+            raise RuntimeError("ACL is not initialized")
+        real_ctx = self._ctx_or_default(ctx)
+        self._safe_uri_parts(uri)
+        acl_ancestors(uri)
+        if has_implicit_manage(real_ctx, uri):
+            return real_ctx
+        effective = await self.acl_manager.resolve(uri, real_ctx)
+        if effective.enabled and acl_allows(effective, real_ctx, AclAction.MANAGE):
+            return real_ctx
+        raise PermissionDeniedError(f"ACL management denied for {uri}", resource=uri)
+
+    async def _ensure_acl_target_exists(self, uri: str, ctx: RequestContext) -> bool:
+        """Return whether the ACL target is a directory; raise if it is missing."""
+        try:
+            stat = await self._async_agfs.stat(self._uri_to_path(uri, ctx=ctx))
+        except Exception as exc:
+            if is_not_found_error(exc):
+                raise NotFoundError(uri, "resource") from exc
+            raise
+        return bool(stat.get("isDir", False)) if isinstance(stat, dict) else False
+
+    async def _acquire_acl_target_lock(self, uri: str, ctx: RequestContext) -> Dict[str, Any]:
+        """Lock an existing ACL target: Exact for a file, Tree for a directory.
+
+        The existence check runs before the lock so a missing target returns
+        NotFound instead of materializing a directory for lock metadata.
+        """
+        is_dir = await self._ensure_acl_target_exists(uri, ctx)
+        path = self._uri_to_path(uri, ctx=ctx)
+        acquire = (
+            self._async_agfs.pathlock_acquire_tree
+            if is_dir
+            else self._async_agfs.pathlock_acquire_exact
+        )
+        return await acquire(path)
+
+    async def get_acl(self, uri: str, ctx: Optional[RequestContext] = None) -> Dict[str, Any]:
+        real_ctx = await self._ensure_acl_manage(uri, ctx)
+        await self._ensure_acl_target_exists(uri, real_ctx)
+        effective = await self.acl_manager.resolve(uri, real_ctx)
+        return self.acl_manager.to_report(uri, effective)
+
+    async def set_acl(
+        self,
+        uri: str,
+        entries: Sequence[AclEntry | Mapping[str, Any]] | None = None,
+        ctx: Optional[RequestContext] = None,
+        *,
+        acl_mode: AclMode | None = None,
+    ) -> Dict[str, Any]:
+        real_ctx = await self._ensure_acl_manage(uri, ctx)
+        lease = await self._acquire_acl_target_lock(uri, real_ctx)
+        try:
+            await self._ensure_acl_manage(uri, real_ctx)
+            await self._ensure_acl_target_exists(uri, real_ctx)
+            effective = await self.acl_manager.set_acl(uri, entries, real_ctx, acl_mode=acl_mode)
+            return self.acl_manager.to_report(uri, effective)
+        finally:
+            await self._async_agfs.pathlock_release(lease)
+
+    async def grant_acl(
+        self,
+        uri: str,
+        principal: str,
+        level: AclLevel | str,
+        ctx: Optional[RequestContext] = None,
+    ) -> Dict[str, Any]:
+        return await self._update_acl_entry(uri, principal, level, ctx)
+
+    async def revoke_acl(
+        self,
+        uri: str,
+        principal: str,
+        ctx: Optional[RequestContext] = None,
+    ) -> Dict[str, Any]:
+        return await self._update_acl_entry(uri, principal, None, ctx)
+
+    async def _update_acl_entry(
+        self,
+        uri: str,
+        principal: str,
+        level: Optional[AclLevel | str],
+        ctx: Optional[RequestContext],
+    ) -> Dict[str, Any]:
+        principal = normalize_acl_principal(principal)
+        normalized_level = normalize_acl_level(level) if level is not None else None
+        real_ctx = await self._ensure_acl_manage(uri, ctx)
+        lease = await self._acquire_acl_target_lock(uri, real_ctx)
+        try:
+            await self._ensure_acl_manage(uri, real_ctx)
+            await self._ensure_acl_target_exists(uri, real_ctx)
+            direct = await self.acl_manager.get_direct(uri, real_ctx)
+            entries = {entry.principal: entry for entry in direct.entries}
+            if normalized_level is None:
+                entries.pop(principal, None)
+            else:
+                entries[principal] = AclEntry(principal, normalized_level)
+            effective = await self.acl_manager.set_acl(uri, list(entries.values()), real_ctx)
+            return self.acl_manager.to_report(uri, effective)
+        finally:
+            await self._async_agfs.pathlock_release(lease)
+
+    async def delete_acl(self, uri: str, ctx: Optional[RequestContext] = None) -> Dict[str, Any]:
+        return await self.set_acl(uri, [], acl_mode=AclMode.INHERIT, ctx=ctx)
+
+    def _ensure_identity_not_deleting(self, ctx: RequestContext) -> None:
+        guard = getattr(self, "_deletion_guard", None)
+        if ctx.role != Role.ROOT and guard is not None and guard(ctx.account_id, ctx.user.user_id):
+            raise FailedPreconditionError("Identity deletion is in progress")
 
     def _ensure_supported_delete_namespace(self, normalized_uri: str) -> None:
         parts = [p for p in normalized_uri[len("viking://") :].strip("/").split("/") if p]
@@ -213,15 +389,11 @@ class _AccessMixin:
             )
         if parts == ["user"]:
             raise PermissionDeniedError(
-                "Deleting viking://user is not supported; use an explicit user namespace "
-                "or current-user content path instead.",
+                "Deleting viking://user is not supported; use viking://~/... or an "
+                "explicit viking://user/{user_id}/... path instead.",
                 resource=normalized_uri,
             )
         if parts == ["agent"]:
-            # Parity with _ensure_supported_write_namespace, which forbids the
-            # account-shared viking://agent root: deleting it would recursively
-            # wipe every account's agent skills/endpoints/tools/payments. Concrete
-            # sub-paths (viking://agent/skills/...) remain deletable.
             raise PermissionDeniedError(
                 "Deleting viking://agent root is not supported; use a concrete "
                 "agent sub-path (e.g. viking://agent/skills/...) instead.",
@@ -232,8 +404,8 @@ class _AccessMixin:
         parts = [p for p in normalized_uri[len("viking://") :].strip("/").split("/") if p]
         if parts == ["user"]:
             raise PermissionDeniedError(
-                "Writing viking://user is not supported; use an explicit user namespace "
-                "or current-user content path instead.",
+                "Writing viking://user is not supported; use viking://~/... or an "
+                "explicit viking://user/{user_id}/... path instead.",
                 resource=normalized_uri,
             )
         if parts and parts[0] == "session":
@@ -241,17 +413,6 @@ class _AccessMixin:
                 f"Writing {normalized_uri} is not supported; use user-owned namespaces instead.",
                 resource=normalized_uri,
             )
-        if parts and parts[0] == "agent":
-            if len(parts) >= 2 and parts[1] not in {"skills", "endpoints", "tools", "payments"}:
-                raise PermissionDeniedError(
-                    "viking://agent/{agent_id} is deprecated. Use viking://user/.../peers/{agent_id} instead.",
-                    resource=normalized_uri,
-                )
-            if len(parts) < 2:
-                raise PermissionDeniedError(
-                    "Writing to viking://agent root is not supported.",
-                    resource=normalized_uri,
-                )
 
     def _pathlock_fs_ctx(
         self,
@@ -315,9 +476,10 @@ class _AccessMixin:
             if not self._is_name_visible_at_path(name, parent_path):
                 return False
 
-        uri = self._path_to_uri(entry_path, ctx=ctx)
-        if not self._is_accessible(uri, ctx):
-            return False
+        if not self._acl_enabled(ctx):
+            uri = self._path_to_uri(entry_path, ctx=ctx)
+            if not self._is_accessible(uri, ctx):
+                return False
 
         return True
 
@@ -342,25 +504,12 @@ class _AccessMixin:
         show_all_hidden: bool = False,
         node_limit: Optional[int] = None,
         level_limit: Optional[int] = None,
+        offset: int = 0,
+        sort_by: Optional[str] = None,
+        sort_order: str = "asc",
         ctx: Optional[RequestContext] = None,
     ):
-        """Shared generator: fetch raw TreeEntry list from Rust, yield (entry, uri) tuples.
-
-        node_limit counts ACL-visible entries (see design §6.5), so the user's
-        node_limit cannot be pushed directly to Rust — doing so would truncate
-        before filtering and drop entries that should be visible.
-
-        To keep memory bounded without changing that semantic, we push down an
-        *amplified* raw-node limit (node_limit * _TREE_OVERFETCH_FACTOR). If ACL
-        filtering leaves fewer than node_limit visible entries while Rust still
-        returned a full page (i.e. more raw nodes may exist), we double the raw
-        limit and re-fetch. Because Rust truncates a deterministic sorted prefix,
-        this yields exactly the same result as an unbounded fetch, while avoiding
-        materializing the entire prefix in the common case.
-
-        When node_limit is None (full-tree callers), no limit is pushed down.
-        level_limit IS always passed to Rust.
-        """
+        """Yield one visible tree page after namespace and ACL filtering."""
         real_ctx = self._ctx_or_default(ctx)
         primary_path = self._uri_to_path(uri, ctx=ctx)
         path: Optional[str] = None
@@ -371,14 +520,19 @@ class _AccessMixin:
                 path = candidate_path
                 break
         if path is None:
-            if self._is_legacy_session_root_uri(uri):
+            if self._is_session_root_uri(uri):
                 return
             raise NotFoundError(uri, "directory")
 
-        if node_limit is None:
-            raw_limit: Optional[int] = None
-        else:
-            raw_limit = max(node_limit * self._TREE_OVERFETCH_FACTOR, node_limit)
+        if node_limit == 0:
+            return
+        raw_offset = 0
+        raw_limit = None if node_limit is None else max(node_limit, 256)
+        remaining_offset = offset
+        yielded = 0
+        acl_enabled = self._acl_enabled(real_ctx)
+        expose_resource_names = acl_enabled and is_acl_uri(uri)
+        denied_directories: set[str] = set()
 
         while True:
             raw_entries = await self._async_agfs.tree_directory(
@@ -386,12 +540,15 @@ class _AccessMixin:
                 show_hidden=show_all_hidden,
                 node_limit=raw_limit,
                 level_limit=level_limit,
+                offset=raw_offset,
+                sort_by=sort_by,
+                sort_order=sort_order,
             )
+            if not raw_entries:
+                return
 
-            visible: List[tuple] = []
+            candidates: List[tuple] = []
             for entry in raw_entries:
-                if node_limit is not None and len(visible) >= node_limit:
-                    break
                 if not self._is_tree_entry_visible(entry, path, real_ctx):
                     continue
                 if not await self._read_path_visible(uri, entry["path"], primary_path, real_ctx):
@@ -402,24 +559,63 @@ class _AccessMixin:
                     entry_path=entry["path"],
                     ctx=ctx,
                 )
-                visible.append((entry, entry_uri))
+                candidates.append((entry, entry_uri))
+                remaining_limit = None if node_limit is None else node_limit - yielded
+                if (
+                    not acl_enabled
+                    and remaining_limit is not None
+                    and len(candidates) >= (remaining_offset + remaining_limit)
+                ):
+                    break
 
-            # If we still lack enough visible entries but Rust returned a full
-            # page (raw_limit reached), more raw nodes may exist — re-fetch with
-            # a doubled limit. Otherwise Rust is exhausted and we yield as-is.
-            need_more = (
-                node_limit is not None
-                and len(visible) < node_limit
-                and raw_limit is not None
-                and len(raw_entries) >= raw_limit
-            )
-            if need_more:
-                raw_limit *= 2
-                continue
+            if not acl_enabled:
+                visible = candidates
+            else:
+                access = await self._can_access_many(
+                    [entry_uri for _, entry_uri in candidates], real_ctx
+                )
+                if expose_resource_names:
+                    denied_directories.update(
+                        {
+                            entry["path"].rstrip("/")
+                            for entry, entry_uri in candidates
+                            if entry.get("info", {}).get("isDir", False)
+                            and not access.get(entry_uri, False)
+                        }
+                    )
+                    visible = []
+                    base = path.rstrip("/")
+                    for entry, entry_uri in candidates:
+                        parent = entry["path"].rstrip("/").rsplit("/", 1)[0]
+                        blocked = False
+                        while parent.startswith(f"{base}/"):
+                            if parent in denied_directories:
+                                blocked = True
+                                break
+                            parent = parent.rsplit("/", 1)[0]
+                        if blocked:
+                            continue
+                        if access.get(entry_uri, False):
+                            visible.append((entry, entry_uri))
+                        else:
+                            denied_entry = dict(entry)
+                            denied_entry["access"] = "denied"
+                            visible.append((denied_entry, entry_uri))
+                else:
+                    visible = [item for item in candidates if access.get(item[1], False)]
 
             for item in visible:
+                if remaining_offset:
+                    remaining_offset -= 1
+                    continue
                 yield item
-            return
+                yielded += 1
+                if node_limit is not None and yielded >= node_limit:
+                    return
+
+            if raw_limit is None or len(raw_entries) < raw_limit:
+                return
+            raw_offset += len(raw_entries)
 
     # ========== URI Conversion ==========
 
@@ -444,15 +640,9 @@ class _AccessMixin:
         """
         real_ctx = self._ctx_or_default(ctx)
         account_id = real_ctx.account_id
-        normalized_uri, legacy_parts = self._normalized_uri_parts(uri)
-        if legacy_parts and legacy_parts[0] == "agent" and self._is_legacy_agent_id_uri(uri):
-            # Old format: viking://agent/{agent_id}/... — direct mapping for read-only compat
-            safe_parts = [
-                self._shorten_component(p, self._MAX_FILENAME_BYTES) for p in legacy_parts
-            ]
-            return f"/local/{account_id}/{'/'.join(safe_parts)}"
-        canonical_uri = canonicalize_uri(uri, real_ctx)
-        _, parts = self._normalized_uri_parts(canonical_uri)
+        parts = self._safe_uri_parts(uri)
+        if parts[:1] == ["session"]:
+            raise ValueError(f"Legacy session URI is not accepted internally: {uri}")
         if not parts:
             return f"/local/{account_id}"
 
@@ -462,47 +652,42 @@ class _AccessMixin:
     def _legacy_session_path(self, uri: str, ctx: Optional[RequestContext] = None) -> str:
         """Map a legacy viking://session URI to its pre-user-namespace path."""
         real_ctx = self._ctx_or_default(ctx)
-        _, parts = self._normalized_uri_parts(uri)
+        parts = self._safe_uri_parts(uri)
         safe_parts = [self._shorten_component(p, self._MAX_FILENAME_BYTES) for p in parts]
         return f"/local/{real_ctx.account_id}/{'/'.join(safe_parts)}"
 
-    def _legacy_current_user_session_path(
+    def _legacy_user_session_path(
         self, uri: str, ctx: Optional[RequestContext] = None
     ) -> Optional[str]:
         """Return the legacy nested /session/{user_id}/{session_id} candidate."""
         real_ctx = self._ctx_or_default(ctx)
-        _, parts = self._normalized_uri_parts(uri)
-        if len(parts) <= 1 or parts[0] != "session":
+        parts = self._safe_uri_parts(uri)
+        if len(parts) <= 3 or parts[0] != "user" or parts[2] != "sessions":
             return None
-        nested_parts = ["session", real_ctx.user.user_id, *parts[1:]]
+        nested_parts = ["session", parts[1], *parts[3:]]
         safe_parts = [self._shorten_component(p, self._MAX_FILENAME_BYTES) for p in nested_parts]
         return f"/local/{real_ctx.account_id}/{'/'.join(safe_parts)}"
 
-    def _is_legacy_session_uri(self, uri: str) -> bool:
-        _, parts = self._normalized_uri_parts(uri)
-        return bool(parts and parts[0] == "session")
+    def _legacy_session_alias(self, uri: str) -> Optional[str]:
+        """Return the old storage alias for a canonical user session URI."""
+        parts = self._safe_uri_parts(uri)
+        if len(parts) < 3 or parts[0] != "user" or parts[2] != "sessions":
+            return None
+        suffix = parts[3:]
+        return "viking://session" + (f"/{'/'.join(suffix)}" if suffix else "")
 
-    def _is_legacy_session_root_uri(self, uri: str) -> bool:
-        _, parts = self._normalized_uri_parts(uri)
-        return parts == ["session"]
-
-    def _is_legacy_agent_id_uri(self, uri: str) -> bool:
-        _, parts = self._normalized_uri_parts(uri)
-        return bool(
-            parts
-            and parts[0] == "agent"
-            and len(parts) >= 2
-            and parts[1] not in {"skills", "endpoints", "tools", "payments"}
-        )
+    def _is_session_root_uri(self, uri: str) -> bool:
+        return self._legacy_session_alias(uri) == "viking://session"
 
     def _read_paths(self, uri: str, ctx: Optional[RequestContext] = None) -> List[str]:
         """Return read candidates for a URI, including legacy alias fallbacks."""
         paths = [self._uri_to_path(uri, ctx=ctx)]
 
-        if self._is_legacy_session_uri(uri):
+        legacy_uri = self._legacy_session_alias(uri)
+        if legacy_uri:
             for candidate in (
-                self._legacy_session_path(uri, ctx=ctx),
-                self._legacy_current_user_session_path(uri, ctx=ctx),
+                self._legacy_session_path(legacy_uri, ctx=ctx),
+                self._legacy_user_session_path(uri, ctx=ctx),
             ):
                 if candidate and candidate not in paths:
                     paths.append(candidate)
@@ -517,8 +702,9 @@ class _AccessMixin:
     ) -> bool:
         if path == primary_path:
             return True
-        if self._is_legacy_session_uri(request_uri):
-            return await self._legacy_session_path_visible(path, ctx)
+        if self._legacy_session_alias(request_uri):
+            owner_user_id = self._safe_uri_parts(request_uri)[1]
+            return await self._legacy_session_path_visible(path, owner_user_id=owner_user_id)
         return True
 
     def _alias_uri_for_path(
@@ -530,23 +716,14 @@ class _AccessMixin:
         ctx: Optional[RequestContext],
     ) -> str:
         base = base_path.rstrip("/")
-        normalized_request, request_parts = self._normalized_uri_parts(request_uri)
-        request_root = (
-            normalized_request
-            if normalized_request == "viking://"
-            else normalized_request.rstrip("/")
-        )
-        preserve_request_alias = normalized_request in {"viking://", "viking://user"} or bool(
-            request_parts
-            and (
-                request_parts[0] == "session"
-                or (request_parts[0] == "agent" and self._is_legacy_agent_id_uri(request_uri))
-            )
-        )
+        request_root = request_uri if request_uri == "viking://" else request_uri.rstrip("/")
+        preserve_request_alias = request_uri in {"viking://", "viking://user"}
         rel_path = entry_path[len(base) :].strip("/") if entry_path.startswith(base) else ""
         if entry_path.startswith(base):
             separator = "" if request_root.endswith("://") else "/"
             candidate_uri = request_root if not rel_path else f"{request_root}{separator}{rel_path}"
+            if self._legacy_session_alias(request_uri):
+                return candidate_uri
             if preserve_request_alias:
                 return candidate_uri
             try:
@@ -608,7 +785,12 @@ class _AccessMixin:
             return owner_hint == ctx.user.user_id
         return True
 
-    async def _legacy_session_path_visible(self, path: str, ctx: RequestContext) -> bool:
+    async def _legacy_session_path_visible(
+        self,
+        path: str,
+        *,
+        owner_user_id: str,
+    ) -> bool:
         parts = [p for p in path.strip("/").split("/") if p]
         try:
             session_index = parts.index("session")
@@ -621,22 +803,24 @@ class _AccessMixin:
         root_prefix = "/" + "/".join(parts[: session_index + 1])
         direct_root = f"{root_prefix}/{suffix[0]}"
         if await self._looks_like_legacy_session_dir(direct_root):
-            return await self._legacy_session_visible(direct_root, ctx)
+            owner = await self._legacy_session_owner(direct_root)
+            return bool(owner) and owner == owner_user_id
 
         if len(suffix) >= 2:
+            if suffix[0] != owner_user_id:
+                return False
             nested_root = f"{root_prefix}/{suffix[0]}/{suffix[1]}"
             if await self._looks_like_legacy_session_dir(nested_root):
-                return await self._legacy_session_visible(
-                    nested_root,
-                    ctx,
-                    owner_hint=suffix[0],
-                )
+                owner = await self._legacy_session_owner(nested_root)
+                return not owner or owner == owner_user_id
         return True
 
     async def _legacy_session_root_items(
         self,
         path: str,
         ctx: RequestContext,
+        output_root_uri: str,
+        owner_user_id: str,
     ) -> List[tuple[Dict[str, Any], str]]:
         try:
             entries = await self._ls_entries(path)
@@ -652,11 +836,12 @@ class _AccessMixin:
                 continue
             child_path = f"{path.rstrip('/')}/{name}"
             if await self._looks_like_legacy_session_dir(child_path):
-                if await self._legacy_session_visible(child_path, ctx):
-                    items.append((entry, f"viking://session/{name}"))
+                legacy_owner = await self._legacy_session_owner(child_path)
+                if legacy_owner == owner_user_id:
+                    items.append((entry, f"{output_root_uri}/{name}"))
                 continue
 
-            if ctx.role != Role.ROOT and name != ctx.user.user_id:
+            if name != owner_user_id:
                 continue
             try:
                 nested_entries = await self._ls_entries(child_path)
@@ -672,7 +857,7 @@ class _AccessMixin:
                 if not await self._looks_like_legacy_session_dir(nested_path):
                     continue
                 if await self._legacy_session_visible(nested_path, ctx, owner_hint=name):
-                    items.append((nested, f"viking://session/{nested_name}"))
+                    items.append((nested, f"{output_root_uri}/{nested_name}"))
         return items
 
     async def _session_root_items(
@@ -681,19 +866,23 @@ class _AccessMixin:
         ctx: RequestContext,
     ) -> List[tuple[Dict[str, Any], str]]:
         primary_path = self._uri_to_path(uri, ctx=ctx)
+        output_root_uri = uri.rstrip("/")
+        owner_user_id = self._safe_uri_parts(uri)[1]
         by_name: Dict[str, tuple[Dict[str, Any], str]] = {}
         try:
             for entry in await self._ls_entries(primary_path, ctx=ctx):
                 name = entry.get("name", "")
                 if not name or name in {".", ".."}:
                     continue
-                by_name[name] = (entry, f"viking://session/{name}")
+                by_name[name] = (entry, f"{output_root_uri}/{name}")
         except Exception as exc:
             if not is_not_found_error(exc):
                 raise
 
-        legacy_path = self._legacy_session_path(uri, ctx=ctx)
-        for entry, entry_uri in await self._legacy_session_root_items(legacy_path, ctx):
+        legacy_path = self._legacy_session_path("viking://session", ctx=ctx)
+        for entry, entry_uri in await self._legacy_session_root_items(
+            legacy_path, ctx, output_root_uri, owner_user_id
+        ):
             name = entry.get("name", "")
             if name and name not in by_name:
                 by_name[name] = (entry, entry_uri)
@@ -702,30 +891,50 @@ class _AccessMixin:
     async def _list_read_path_items(
         self,
         uri: str,
+        raw_offset: int = 0,
+        raw_limit: Optional[int] = None,
+        sort_by: Optional[str] = None,
+        sort_order: str = "asc",
         ctx: Optional[RequestContext] = None,
-    ) -> List[tuple[Dict[str, Any], str]]:
+    ) -> tuple[List[tuple[Dict[str, Any], str]], int, bool]:
+        """Return one mapped RagFS page, consumed count, and exhaustion state."""
         real_ctx = self._ctx_or_default(ctx)
-        if self._is_legacy_session_root_uri(uri):
-            return await self._session_root_items(uri, real_ctx)
+        if self._is_session_root_uri(uri):
+            items = await self._session_root_items(uri, real_ctx)
+            return items, len(items), True
 
         primary_path = self._uri_to_path(uri, ctx=ctx)
-        merge_paths = self._is_legacy_session_uri(uri)
+        merge_paths = self._legacy_session_alias(uri) is not None
         found_path = False
         last_not_found: Optional[Exception] = None
         by_uri: Dict[str, tuple[Dict[str, Any], str]] = {}
+        raw_count = 0
 
         for path in self._read_paths(uri, ctx=ctx):
-            if not await self._read_path_visible(uri, path, primary_path, real_ctx):
-                continue
             try:
-                entries = await self._ls_entries(path, ctx=ctx)
+                entries = await self._ls_entries(
+                    path,
+                    offset=0 if merge_paths else raw_offset,
+                    limit=None if merge_paths else raw_limit,
+                    sort_by=sort_by,
+                    sort_order=sort_order,
+                    filter_internal=False,
+                    ctx=ctx,
+                )
             except Exception as exc:
                 if is_not_found_error(exc):
                     last_not_found = exc
                     continue
                 raise
 
+            # Missing legacy directories need no owner probes. Check visibility
+            # before merging entries from a directory that actually exists.
+            if not await self._read_path_visible(uri, path, primary_path, real_ctx):
+                continue
+
             found_path = True
+            raw_count += len(entries)
+            entries = self._filter_ls_entries(path, entries)
             for entry in entries:
                 entry_uri = self._alias_uri_for_path(
                     request_uri=uri,
@@ -738,7 +947,8 @@ class _AccessMixin:
                 break
 
         if found_path:
-            return list(by_uri.values())
+            exhausted = raw_limit is None or merge_paths or raw_count < raw_limit
+            return list(by_uri.values()), raw_count, exhausted
         raise NotFoundError(uri, "directory") from last_not_found
 
     def _path_to_uri(self, path: str, ctx: Optional[RequestContext] = None) -> str:
@@ -747,9 +957,7 @@ class _AccessMixin:
         Pure prefix replacement: strips /local/{account_id}/ and prepends viking://.
         No implicit space stripping.
         """
-        if path.startswith("viking://"):
-            return path
-        elif path.startswith("/local/"):
+        if path.startswith("/local/"):
             inner = path[7:].strip("/")
             if not inner:
                 return "viking://"
@@ -760,10 +968,7 @@ class _AccessMixin:
             if not parts:
                 return "viking://"
             return f"viking://{'/'.join(parts)}"
-        elif path.startswith("/"):
-            return f"viking:/{path}"
-        else:
-            return f"viking://{path}"
+        raise ValueError(f"AGFS path must start with '/local/': {path!r}")
 
     def _looks_like_legacy_temp_leaf(self, value: str) -> bool:
         return bool(re.match(r"^\d{8}_[0-9a-f]{6}$", value or ""))
@@ -777,14 +982,14 @@ class _AccessMixin:
 
     def _is_accessible(self, uri: str, ctx: RequestContext) -> bool:
         """Check whether a URI is visible/accessible under current request context."""
-        normalized_uri, parts = self._normalized_uri_parts(uri)
+        parts = self._safe_uri_parts(uri)
         if ctx.role == Role.ROOT:
             return True
-        if is_hidden_by_actor_peer_view(normalized_uri, ctx):
+        if is_hidden_by_actor_peer_view(uri, ctx):
             return False
         if not parts:
             return True
-        if is_watch_task_control_uri(normalized_uri):
+        if is_watch_task_control_uri(uri):
             return False
 
         scope = parts[0]
@@ -800,15 +1005,7 @@ class _AccessMixin:
             return ctx.role == Role.ROOT
         if scope == "_system":
             return False
-        if scope == "agent":
-            # New format: agent/skills/..., agent/endpoints/... — globally readable (account scope)
-            if len(parts) >= 2 and parts[1] in {"skills", "endpoints", "tools", "payments"}:
-                return True
-            # Old format: agent/{agent_id}/... — actor_peer_id match for read-only access
-            if not ctx.actor_peer_id or len(parts) < 2:
-                return True
-            return parts[1] == ctx.actor_peer_id
-        return namespace_is_accessible(normalized_uri, ctx)
+        return namespace_is_accessible(uri, ctx)
 
     def _handle_agfs_read(self, result: Union[bytes, Any, None]) -> bytes:
         """Handle AGFSClient read return types consistently."""
@@ -864,12 +1061,12 @@ class _AccessMixin:
         — passing them through silently would result in a no-op commit and
         confuse callers.
         """
-        real_ctx = self._ctx_or_default(ctx)
-        canonical = canonicalize_uri(uri, real_ctx)
-        _, parts = self._normalized_uri_parts(canonical)
+        parts = self._safe_uri_parts(uri)
         if not parts:
             raise ValueError(f"git tree path cannot be the account root: {uri!r}")
         first = parts[0]
+        if first == "session":
+            raise ValueError(f"Legacy session URI is not accepted internally: {uri}")
         if first in self._GIT_INTERNAL_FIRST_SEGMENTS:
             raise ValueError(f"git tree path rejects internal scope/segment {first!r}: {uri!r}")
         return "/".join(parts)
@@ -877,7 +1074,7 @@ class _AccessMixin:
     def _tree_path_to_uri(self, tree_path: str) -> str:
         """Convert an account-relative git tree path to a viking:// URI.
 
-        Inverse of :py:meth:`_uri_to_tree_path` (without context canonicalization).
+        Inverse of :py:meth:`_uri_to_tree_path`.
         """
         cleaned = tree_path.strip("/")
         if not cleaned:

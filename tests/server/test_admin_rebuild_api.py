@@ -1,10 +1,14 @@
 """Tests for reindex admin endpoint and executor behavior."""
 
+import asyncio
+from types import SimpleNamespace
+
 import httpx
 import pytest
 
 from openviking.core.context import ContextLevel
 from openviking.server.identity import RequestContext, Role
+from openviking.storage.queuefs.process_result import ProcessResult
 from openviking_cli.exceptions import OpenVikingError, PermissionDeniedError
 from openviking_cli.session.user_id import UserIdentifier
 from tests.server.test_admin_api import ROOT_KEY
@@ -20,6 +24,14 @@ ROOT_ACCOUNT_HEADERS = {
     "X-API-Key": ROOT_KEY,
     "X-OpenViking-Account": "default",
 }
+
+
+@pytest.fixture
+def semantic_config(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_openviking_config",
+        lambda: SimpleNamespace(vlm=SimpleNamespace(max_concurrent=2)),
+    )
 
 
 def _make_reindex_run(ctx, counters):
@@ -57,7 +69,7 @@ async def test_reindex_user_can_only_target_own_user_scope(monkeypatch):
     monkeypatch.setattr("openviking.server.routers.content.get_service", lambda: FakeService())
 
     own_scope = await reindex(
-        body=ReindexRequest(uri="viking://user/resources", mode="vectors_only"),
+        body=ReindexRequest(uri="viking://~/resources", mode="vectors_only"),
         ctx=ctx,
     )
     assert own_scope.status == "ok"
@@ -164,11 +176,23 @@ async def test_reindex_resource_vectors_only_wait_true(monkeypatch):
     seen = {}
 
     class FakeService:
-        async def reindex(self, *, uri, mode, wait, ctx, dry_run=False):
+        async def reindex(
+            self,
+            *,
+            uri,
+            mode,
+            wait,
+            ctx,
+            dry_run=False,
+            tags=None,
+            tag_mode="replace",
+        ):
             seen["uri"] = uri
             seen["mode"] = mode
             seen["wait"] = wait
             seen["ctx"] = ctx
+            seen["tags"] = tags
+            seen["tag_mode"] = tag_mode
             return {
                 "status": "completed",
                 "uri": uri,
@@ -186,7 +210,13 @@ async def test_reindex_resource_vectors_only_wait_true(monkeypatch):
         user=UserIdentifier(account_id="test", user_id="alice"),
         role=Role.ROOT,
     )
-    request = ReindexRequest(uri="viking://resources/demo", mode="vectors_only", wait=True)
+    request = ReindexRequest(
+        uri="viking://resources/demo",
+        mode="vectors_only",
+        wait=True,
+        tags=["Team=Search", "env=prod"],
+        tag_mode="append",
+    )
 
     monkeypatch.setattr("openviking.server.routers.content.get_service", lambda: FakeService())
     response = await reindex(body=request, ctx=ctx)
@@ -199,6 +229,8 @@ async def test_reindex_resource_vectors_only_wait_true(monkeypatch):
     assert seen["mode"] == "vectors_only"
     assert seen["wait"] is True
     assert seen["ctx"] == ctx
+    assert seen["tags"] == ["Team=Search", "env=prod"]
+    assert seen["tag_mode"] == "append"
     assert "reason" not in response.result
 
 
@@ -230,6 +262,35 @@ async def test_reindex_resource_vectors_only_wait_false(monkeypatch):
     assert response.result["task_id"] == "rbld_123"
     assert response.result["object_type"] == "resource"
     assert "reason" not in response.result
+
+
+@pytest.mark.asyncio
+async def test_reindex_passes_non_recursive_to_service(monkeypatch):
+    from openviking.server.routers.content import ReindexRequest, reindex
+
+    seen = {}
+
+    class FakeService:
+        async def reindex(self, **kwargs):
+            seen.update(kwargs)
+            return {"status": "completed"}
+
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="alice"),
+        role=Role.ROOT,
+    )
+    monkeypatch.setattr("openviking.server.routers.content.get_service", lambda: FakeService())
+
+    await reindex(
+        body=ReindexRequest(
+            uri="viking://resources/demo",
+            mode="semantic_and_vectors",
+            recursive=False,
+        ),
+        ctx=ctx,
+    )
+
+    assert seen["recursive"] is False
 
 
 @pytest.mark.asyncio
@@ -326,16 +387,351 @@ async def test_reindex_executor_rejects_dry_run_for_non_prune_mode_direct():
 
 
 @pytest.mark.asyncio
+async def test_reindex_executor_discards_invalid_tags_before_creating_background_task():
+    from openviking.service.reindex_executor import ReindexExecutor
+
+    ingest_options = ReindexExecutor._resolve_ingest_options(
+        mode="vectors_only",
+        tags=["invalid", "team=search"],
+        tag_mode="replace",
+    )
+
+    assert ingest_options is not None
+    assert ingest_options.search_tags == ["team=search"]
+
+
+@pytest.mark.asyncio
+async def test_reindex_executor_ignores_tags_for_prune_orphans(monkeypatch):
+    from openviking.service.reindex_executor import ReindexExecutor
+
+    executor = ReindexExecutor()
+    seen = {}
+
+    async def fake_run(**kwargs):
+        seen.update(kwargs)
+        return {"status": "completed"}
+
+    class FakeTracker:
+        async def has_running(self, *args, **kwargs):
+            return False
+
+    monkeypatch.setattr(executor, "_run", fake_run)
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_task_tracker",
+        lambda: FakeTracker(),
+    )
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="alice"),
+        role=Role.ROOT,
+    )
+
+    result = await executor.execute(
+        uri="viking://resources/demo",
+        mode="prune_orphans",
+        wait=True,
+        tags=["invalid"],
+        tag_mode="invalid",
+        ctx=ctx,
+    )
+
+    assert result == {"status": "completed"}
+    assert seen["ingest_options"] is None
+
+
+@pytest.mark.asyncio
+async def test_reindex_file_target_uses_exact_lock(monkeypatch):
+    from types import SimpleNamespace
+
+    from openviking.service.reindex_executor import ReindexExecutor
+
+    calls = []
+
+    class FakeAGFS:
+        async def pathlock_acquire_exact(self, path):
+            calls.append(("exact", path))
+            return {"id": "lease-1"}
+
+        async def pathlock_acquire_tree(self, path):
+            calls.append(("tree", path))
+            raise AssertionError("file target must not acquire a tree lock")
+
+        async def pathlock_as_borrowed(self, lease):
+            return lease
+
+        async def pathlock_release(self, lease):
+            calls.append(("release", lease["id"]))
+
+    class FakeFS:
+        _async_agfs = FakeAGFS()
+
+        def _uri_to_path(self, uri, ctx):
+            return "/local/default/resources/demo.md"
+
+        async def stat(self, uri, ctx):
+            return {"isDir": False}
+
+    executor = ReindexExecutor()
+
+    async def fake_reindex_resource(*, uri, mode, run):
+        return None
+
+    monkeypatch.setattr(executor, "_reindex_resource", fake_reindex_resource)
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_service",
+        lambda: SimpleNamespace(
+            viking_fs=FakeFS(),
+            vikingdb_manager=SimpleNamespace(has_queue_manager=True),
+        ),
+    )
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="alice"),
+        role=Role.ROOT,
+    )
+
+    result = await executor._run(
+        uri="viking://resources/demo.md",
+        object_type="resource",
+        mode="vectors_only",
+        ctx=ctx,
+    )
+
+    assert result["status"] == "completed"
+    assert calls == [
+        ("exact", "/local/default/resources/demo.md"),
+        ("release", "lease-1"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reindex_prune_existing_file_uses_exact_lock(monkeypatch):
+    from types import SimpleNamespace
+
+    from openviking.service.reindex_executor import ReindexExecutor
+
+    calls = []
+
+    class FakeAGFS:
+        async def pathlock_acquire_exact(self, path):
+            calls.append(("exact", path))
+            return {"id": "lease-1"}
+
+        async def pathlock_acquire_tree(self, path):
+            calls.append(("tree", path))
+            raise AssertionError("existing file target must not acquire a tree lock")
+
+        async def pathlock_as_borrowed(self, lease):
+            return lease
+
+        async def pathlock_release(self, lease):
+            calls.append(("release", lease["id"]))
+
+    class FakeFS:
+        _async_agfs = FakeAGFS()
+
+        def _uri_to_path(self, uri, ctx):
+            return "/local/default/resources/demo.md"
+
+        async def exists(self, uri, ctx):
+            return True
+
+        async def stat(self, uri, ctx):
+            return {"isDir": False}
+
+    executor = ReindexExecutor()
+
+    async def fake_prune_orphan_vectors(**kwargs):
+        return None
+
+    monkeypatch.setattr(executor, "_prune_orphan_vectors", fake_prune_orphan_vectors)
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_service",
+        lambda: SimpleNamespace(
+            viking_fs=FakeFS(),
+            vikingdb_manager=SimpleNamespace(has_queue_manager=True),
+        ),
+    )
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="alice"),
+        role=Role.ROOT,
+    )
+
+    result = await executor._run(
+        uri="viking://resources/demo.md",
+        object_type="resource",
+        mode="prune_orphans",
+        dry_run=True,
+        ctx=ctx,
+    )
+
+    assert result["status"] == "completed"
+    assert calls == [
+        ("exact", "/local/default/resources/demo.md"),
+        ("release", "lease-1"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("locked", [False, True])
+async def test_reindex_prune_missing_target_does_not_lock(monkeypatch, locked):
+    """A missing prune target must not acquire a lock: doing so creates the directory."""
+    from types import SimpleNamespace
+
+    from openviking.service.reindex_executor import ReindexExecutor
+    from openviking.storage.errors import ResourceBusyError
+
+    calls = []
+
+    class FakeAGFS:
+        async def pathlock_acquire_exact(self, path):
+            raise AssertionError("missing target must not acquire a lock")
+
+        async def pathlock_acquire_tree(self, path):
+            raise AssertionError("missing target must not acquire a lock")
+
+        async def pathlock_is_locked(self, path):
+            calls.append(("is_locked", path))
+            return locked
+
+        async def pathlock_as_borrowed(self, lease):
+            raise AssertionError("no lease to borrow")
+
+        async def pathlock_release(self, lease):
+            raise AssertionError("no lease to release")
+
+    class FakeFS:
+        _async_agfs = FakeAGFS()
+
+        def _uri_to_path(self, uri, ctx):
+            return "/local/default/resources/missing"
+
+        async def exists(self, uri, ctx):
+            return False
+
+    executor = ReindexExecutor()
+
+    async def fake_prune_orphan_vectors(**kwargs):
+        return None
+
+    monkeypatch.setattr(executor, "_prune_orphan_vectors", fake_prune_orphan_vectors)
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_service",
+        lambda: SimpleNamespace(
+            viking_fs=FakeFS(),
+            vikingdb_manager=SimpleNamespace(has_queue_manager=True),
+        ),
+    )
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="alice"),
+        role=Role.ROOT,
+    )
+
+    run = executor._run(
+        uri="viking://resources/missing",
+        object_type="resource",
+        mode="prune_orphans",
+        dry_run=True,
+        ctx=ctx,
+    )
+    if locked:
+        with pytest.raises(ResourceBusyError):
+            await run
+    else:
+        assert (await run)["status"] == "completed"
+    assert calls == [("is_locked", "/local/default/resources/missing")]
+
+
+@pytest.mark.asyncio
+async def test_reindex_executor_passes_tags_to_background_run(monkeypatch):
+    import asyncio
+
+    from openviking.service.reindex_executor import ReindexExecutor
+
+    seen = {}
+
+    class FakeTask:
+        task_id = "task-1"
+
+    class FakeTracker:
+        async def create_if_no_running(self, *args, **kwargs):
+            return FakeTask()
+
+    executor = ReindexExecutor()
+
+    async def fake_run_tracked(task_id, **kwargs):
+        seen["task_id"] = task_id
+        seen.update(kwargs)
+
+    monkeypatch.setattr(executor, "_run_tracked", fake_run_tracked)
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_task_tracker",
+        lambda: FakeTracker(),
+    )
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="alice"),
+        role=Role.ROOT,
+    )
+
+    result = await executor.execute(
+        uri="viking://resources/demo",
+        mode="vectors_only",
+        wait=False,
+        tags=["Team=Search"],
+        tag_mode="append",
+        ctx=ctx,
+    )
+    await asyncio.sleep(0)
+
+    assert result["status"] == "accepted"
+    assert seen["task_id"] == "task-1"
+    assert seen["ingest_options"].search_tags == ["team=search"]
+    assert seen["ingest_options"].search_tag_mode == "append"
+
+
+@pytest.mark.asyncio
+async def test_reindex_resource_passes_run_tags_to_vector_rebuild(monkeypatch):
+    from openviking.service.reindex_executor import (
+        ReindexExecutor,
+        _ReindexCounters,
+        _ReindexRunContext,
+    )
+    from openviking.utils.ingest_options import IngestOptions
+
+    seen = {}
+
+    async def fake_reindex_resource_vectors(self, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(
+        ReindexExecutor,
+        "_reindex_resource_vectors",
+        fake_reindex_resource_vectors,
+    )
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="alice"),
+        role=Role.ROOT,
+    )
+    ingest_options = IngestOptions.from_search_tags(["team=search"], mode="replace")
+
+    await ReindexExecutor()._reindex_resource(
+        uri="viking://resources/demo",
+        mode="vectors_only",
+        run=_ReindexRunContext(
+            ctx=ctx,
+            counters=_ReindexCounters(),
+            ingest_options=ingest_options,
+        ),
+    )
+
+    assert seen["ingest_options"] is ingest_options
+
+
+@pytest.mark.asyncio
 async def test_reindex_upsert_uses_uri_owner_for_user_scoped_records(monkeypatch):
     from openviking.service.reindex_executor import ReindexExecutor
 
     captured = {}
 
     class FakeVikingDB:
-        async def get_context_by_uri(self, uri, owner_space=None, level=None, limit=1, *, ctx=None):
-            captured["lookup_ctx"] = ctx
-            return []
-
         async def enqueue_embedding_msg(self, msg):
             captured["msg"] = msg
             return True
@@ -364,11 +760,12 @@ async def test_reindex_upsert_uses_uri_owner_for_user_scoped_records(monkeypatch
     assert data["user"]["user_id"] == "bob"
     assert data["owner_user_id"] == "bob"
     assert data["owner_space"] == "bob"
-    assert captured["lookup_ctx"].user.user_id == "bob"
 
 
 @pytest.mark.asyncio
-async def test_reindex_semantic_processor_uses_uri_owner_for_user_scoped_records(monkeypatch):
+async def test_reindex_semantic_processor_uses_uri_owner_for_user_scoped_records(
+    monkeypatch, semantic_config
+):
     from openviking.service.reindex_executor import ReindexExecutor
 
     captured = {}
@@ -380,6 +777,7 @@ async def test_reindex_semantic_processor_uses_uri_owner_for_user_scoped_records
         async def on_dequeue(self, payload, lock=None):
             captured["payload"] = payload
             captured["lock"] = lock
+            return ProcessResult.success()
 
     monkeypatch.setattr(
         "openviking.service.reindex_executor.SemanticProcessor",
@@ -542,10 +940,11 @@ async def test_prune_orphans_dry_run_preserves_resource_l1_fallback_and_skips_un
 
 
 @pytest.mark.asyncio
-async def test_prune_orphans_deletes_stale_memory_chunk_with_uri_owner_ctx(monkeypatch):
+@pytest.mark.parametrize("filename", ["theme.md", "report#chunk_notes.md", "report#chunk_0000"])
+async def test_prune_orphans_deletes_stale_memory_chunk_with_uri_owner_ctx(monkeypatch, filename):
     from openviking.service.reindex_executor import ReindexExecutor, _ReindexCounters
 
-    base_uri = "viking://user/bob/memories/preferences/theme.md"
+    base_uri = f"viking://user/bob/memories/preferences/{filename}"
     deleted = {}
 
     class FakeVikingFS:
@@ -982,6 +1381,7 @@ async def test_reindex_semantic_processor_uses_configured_vlm_concurrency(monkey
 
         async def on_dequeue(self, data, lock=None):
             seen["data"] = data
+            return ProcessResult.success()
 
     monkeypatch.setattr(reindex_mod, "SemanticProcessor", FakeSemanticProcessor)
     monkeypatch.setattr(
@@ -1041,6 +1441,170 @@ async def test_reindex_memory_semantic_and_vectors_rebuilds_full_subtree(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_reindex_resource_non_recursive_limits_semantics_and_vectors(monkeypatch):
+    from openviking.service.reindex_executor import ReindexExecutor, _ReindexCounters
+
+    seen = {}
+
+    async def fake_run_semantic_processor(self, **kwargs):
+        seen["semantic"] = kwargs
+
+    async def fake_reindex_resource_vectors(self, **kwargs):
+        seen["vectors"] = kwargs
+
+    monkeypatch.setattr(ReindexExecutor, "_run_semantic_processor", fake_run_semantic_processor)
+    monkeypatch.setattr(ReindexExecutor, "_reindex_resource_vectors", fake_reindex_resource_vectors)
+
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="alice"),
+        role=Role.ROOT,
+    )
+    await ReindexExecutor()._reindex_resource(
+        uri="viking://resources/demo",
+        mode="semantic_and_vectors",
+        recursive=False,
+        run=_make_reindex_run(ctx, _ReindexCounters()),
+    )
+
+    assert seen["semantic"]["recursive"] is False
+    assert seen["vectors"]["recursive"] is False
+
+
+@pytest.mark.asyncio
+async def test_reindex_memory_non_recursive_limits_semantics_and_vectors(monkeypatch):
+    from openviking.service.reindex_executor import ReindexExecutor, _ReindexCounters
+
+    seen = {}
+
+    async def fake_run_semantic_processor(self, **kwargs):
+        seen["semantic"] = kwargs
+
+    async def fake_reindex_memory_vectors(self, **kwargs):
+        seen["vectors"] = kwargs
+
+    class FakeVikingFS:
+        async def stat(self, uri, ctx=None):
+            return {"isDir": True}
+
+    monkeypatch.setattr(ReindexExecutor, "_run_semantic_processor", fake_run_semantic_processor)
+    monkeypatch.setattr(ReindexExecutor, "_reindex_memory_vectors", fake_reindex_memory_vectors)
+    monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
+
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="alice"),
+        role=Role.ROOT,
+    )
+    await ReindexExecutor()._reindex_memory(
+        uri="viking://user/alice/memories/preferences",
+        mode="semantic_and_vectors",
+        recursive=False,
+        run=_make_reindex_run(ctx, _ReindexCounters()),
+    )
+
+    assert seen["semantic"]["recursive"] is False
+    assert seen["vectors"]["recursive"] is False
+
+
+@pytest.mark.asyncio
+async def test_reindex_skill_non_recursive_limits_vectors_to_directory(monkeypatch):
+    from openviking.service.reindex_executor import ReindexExecutor, _ReindexCounters
+
+    seen = {}
+
+    async def fake_regenerate_skill_semantics(self, **kwargs):
+        seen["semantic"] = kwargs
+
+    async def fake_reindex_skill_vectors(self, **kwargs):
+        seen["vectors"] = kwargs
+
+    monkeypatch.setattr(
+        ReindexExecutor, "_regenerate_skill_semantics", fake_regenerate_skill_semantics
+    )
+    monkeypatch.setattr(ReindexExecutor, "_reindex_skill_vectors", fake_reindex_skill_vectors)
+
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="alice"),
+        role=Role.ROOT,
+    )
+    await ReindexExecutor()._reindex_skill(
+        uri="viking://user/alice/skills/demo",
+        mode="semantic_and_vectors",
+        recursive=False,
+        run=_make_reindex_run(ctx, _ReindexCounters()),
+    )
+
+    assert seen["semantic"]["uri"] == "viking://user/alice/skills/demo"
+    assert seen["vectors"]["recursive"] is False
+
+
+@pytest.mark.asyncio
+async def test_reindex_skill_vectors_only_ignores_non_recursive_flag(monkeypatch):
+    from openviking.service.reindex_executor import ReindexExecutor, _ReindexCounters
+
+    seen = {}
+
+    async def fake_reindex_skill_vectors(self, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(ReindexExecutor, "_reindex_skill_vectors", fake_reindex_skill_vectors)
+
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="alice"),
+        role=Role.ROOT,
+    )
+    await ReindexExecutor()._reindex_skill(
+        uri="viking://user/alice/skills/demo",
+        mode="vectors_only",
+        recursive=False,
+        run=_make_reindex_run(ctx, _ReindexCounters()),
+    )
+
+    assert "recursive" not in seen
+
+
+@pytest.mark.asyncio
+async def test_reindex_resource_vectors_non_recursive_skips_tree(monkeypatch):
+    from openviking.service.reindex_executor import ReindexExecutor, _ReindexCounters
+
+    seen = {}
+
+    class FakeVikingFS:
+        async def exists(self, uri, ctx=None):
+            return True
+
+        async def stat(self, uri, ctx=None):
+            return {"isDir": True}
+
+    async def fail_tree_all(*args, **kwargs):
+        raise AssertionError("non-recursive vector rebuild must not walk descendants")
+
+    async def fake_reindex_from_entries(self, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
+    monkeypatch.setattr(ReindexExecutor, "_tree_all", fail_tree_all)
+    monkeypatch.setattr(
+        ReindexExecutor,
+        "_reindex_resource_vectors_from_entries",
+        fake_reindex_from_entries,
+    )
+
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="alice"),
+        role=Role.ROOT,
+    )
+    await ReindexExecutor()._reindex_resource_vectors(
+        uri="viking://resources/demo",
+        counters=_ReindexCounters(),
+        ctx=ctx,
+        recursive=False,
+    )
+
+    assert seen["directories"] == ["viking://resources/demo"]
+    assert seen["files"] == []
+
+
+@pytest.mark.asyncio
 async def test_reindex_executor_infers_skill_supports_semantic_and_vectors():
     from openviking.service.reindex_executor import ReindexExecutor
 
@@ -1074,12 +1638,15 @@ async def test_reindex_executor_infers_user_namespace_root():
 
 
 @pytest.mark.asyncio
-async def test_reindex_executor_rejects_deprecated_agent_namespace_root():
+async def test_reindex_executor_infers_shared_agent_content():
     from openviking.service.reindex_executor import ReindexExecutor
 
     service = ReindexExecutor()
 
-    with pytest.raises(OpenVikingError, match="no longer supported"):
+    assert service._infer_target_type("viking://agent/skills") == "skill_namespace"
+    assert service._infer_target_type("viking://agent/skills/demo") == "skill"
+    assert service._infer_target_type("viking://agent/workflows/daily.md") == "resource"
+    with pytest.raises(OpenVikingError, match="Unsupported reindex URI"):
         service._infer_target_type("viking://agent/")
 
 
@@ -1441,23 +2008,12 @@ async def test_reindex_fetch_existing_record_uses_get_context_by_uri(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_reindex_upsert_context_preserves_existing_search_tags(monkeypatch):
+async def test_reindex_upsert_context_omits_search_tags_without_ingest_options(monkeypatch):
     from openviking.service.reindex_executor import ReindexExecutor
 
     captured = {}
 
     class FakeVikingDB:
-        async def get_context_by_uri(self, uri, owner_space=None, level=None, limit=1, *, ctx=None):
-            del owner_space, limit, ctx
-            return [
-                {
-                    "uri": uri,
-                    "level": level,
-                    "abstract": "existing",
-                    "search_tags": ["team-a", "project-x"],
-                }
-            ]
-
         async def enqueue_embedding_msg(self, msg):
             captured["msg"] = msg
             return True
@@ -1469,6 +2025,7 @@ async def test_reindex_upsert_context_preserves_existing_search_tags(monkeypatch
         def __init__(self):
             self.telemetry_id = ""
             self.id = "msg-1"
+            self.context_data = {}
 
     def fake_from_context(context):
         captured["meta"] = dict(context.meta or {})
@@ -1496,11 +2053,12 @@ async def test_reindex_upsert_context_preserves_existing_search_tags(monkeypatch
         ctx=ctx,
     )
 
-    assert captured["meta"]["search_tags"] == ["team-a", "project-x"]
+    assert "search_tags" not in captured["meta"]
+    assert "search_tags" not in captured["msg"].context_data
 
 
 @pytest.mark.asyncio
-async def test_reindex_resource_vectors_only_continues_after_single_record_failure(monkeypatch):
+async def test_reindex_resource_vectors_parallelize_files_and_isolate_failures(monkeypatch):
     from openviking.service.reindex_executor import ReindexExecutor, _ReindexCounters
     from openviking_cli.exceptions import OpenVikingError
 
@@ -1540,12 +2098,21 @@ async def test_reindex_resource_vectors_only_continues_after_single_record_failu
         return summary
 
     seen = []
+    both_entered = asyncio.Event()
+    release = asyncio.Event()
 
     async def fake_upsert_context(self, **kwargs):
         seen.append(kwargs["uri"])
+        if len(seen) == 2:
+            both_entered.set()
+        await release.wait()
         if kwargs["uri"].endswith("bad.txt"):
             raise OpenVikingError("boom", code="PROCESSING_ERROR")
 
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_openviking_config",
+        lambda: SimpleNamespace(reindex=SimpleNamespace(file_vectorization_concurrency=8)),
+    )
     monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
     monkeypatch.setattr(ReindexExecutor, "_read_directory_abstract", fake_read_directory_abstract)
     monkeypatch.setattr(ReindexExecutor, "_read_directory_overview", fake_read_directory_overview)
@@ -1564,22 +2131,31 @@ async def test_reindex_resource_vectors_only_continues_after_single_record_failu
         role=Role.ROOT,
     )
 
-    await service._reindex_resource_vectors(
-        uri="viking://resources/demo",
-        counters=counters,
-        ctx=ctx,
+    task = asyncio.create_task(
+        service._reindex_resource_vectors(
+            uri="viking://resources/demo",
+            counters=counters,
+            ctx=ctx,
+        )
     )
+    try:
+        await asyncio.wait_for(both_entered.wait(), timeout=1)
+    finally:
+        release.set()
+        await task
 
-    assert seen == [
+    assert set(seen) == {
         "viking://resources/demo/bad.txt",
         "viking://resources/demo/good.txt",
-    ]
+    }
     assert counters.failed_records == 1
     assert counters.rebuilt_records == 1
 
 
 @pytest.mark.asyncio
-async def test_reindex_semantic_processor_runs_with_skip_vectorization(monkeypatch):
+async def test_reindex_semantic_processor_runs_with_skip_vectorization(
+    monkeypatch, semantic_config
+):
     from openviking.service.reindex_executor import ReindexExecutor
 
     seen = {}
@@ -1590,6 +2166,7 @@ async def test_reindex_semantic_processor_runs_with_skip_vectorization(monkeypat
 
         async def on_dequeue(self, payload, lock=None):
             seen["payload"] = payload
+            return ProcessResult.success()
 
     monkeypatch.setattr(
         "openviking.service.reindex_executor.SemanticProcessor",
@@ -1612,6 +2189,88 @@ async def test_reindex_semantic_processor_runs_with_skip_vectorization(monkeypat
 
     msg = json.loads(seen["payload"]["data"])
     assert msg["skip_vectorization"] is True
+    assert msg["recursive"] is True
+    assert msg["use_hierarchical_aggregation"] is False
+    assert msg["propagate_to_parent"] is True
+
+
+@pytest.mark.asyncio
+async def test_reindex_semantic_processor_passes_non_recursive_message(
+    monkeypatch, semantic_config
+):
+    from openviking.service.reindex_executor import ReindexExecutor
+
+    seen = {}
+
+    class FakeSemanticProcessor:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def on_dequeue(self, payload, lock=None):
+            seen["payload"] = payload
+            return ProcessResult.success()
+
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.SemanticProcessor",
+        FakeSemanticProcessor,
+    )
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="alice"),
+        role=Role.ROOT,
+    )
+    await ReindexExecutor()._run_semantic_processor(
+        uri="viking://resources/demo",
+        context_type="resource",
+        ctx=ctx,
+        recursive=False,
+    )
+
+    import json
+
+    msg = json.loads(seen["payload"]["data"])
+    assert msg["recursive"] is False
+    assert msg["use_hierarchical_aggregation"] is False
+    assert msg["propagate_to_parent"] is False
+
+
+@pytest.mark.asyncio
+async def test_reindex_semantic_processor_sets_memory_aggregation_policy(
+    monkeypatch, semantic_config
+):
+    from openviking.service.reindex_executor import ReindexExecutor
+
+    seen = {}
+
+    class FakeSemanticProcessor:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def on_dequeue(self, payload, lock=None):
+            seen["payload"] = payload
+            return ProcessResult.success()
+
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.SemanticProcessor",
+        FakeSemanticProcessor,
+    )
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="alice"),
+        role=Role.ROOT,
+    )
+
+    await ReindexExecutor()._run_semantic_processor(
+        uri="viking://user/alice/memories/preferences",
+        context_type="memory",
+        ctx=ctx,
+        recursive=False,
+    )
+
+    import json
+
+    msg = json.loads(seen["payload"]["data"])
+    assert msg["generation_trigger"] == "reindex"
+    assert msg["use_hierarchical_aggregation"] is True
+    assert msg["propagate_to_parent"] is False
 
 
 @pytest.mark.asyncio
@@ -1724,7 +2383,9 @@ async def test_reindex_resource_vector_text_summary_first_skips_content_read(mon
     monkeypatch.setattr(ReindexExecutor, "_fetch_existing_record", fake_fetch_existing_record)
     monkeypatch.setattr(
         "openviking.service.reindex_executor.get_openviking_config",
-        lambda: type("Config", (), {"embedding": type("Embedding", (), {"text_source": "summary_first"})()})(),
+        lambda: type(
+            "Config", (), {"embedding": type("Embedding", (), {"text_source": "summary_first"})()}
+        )(),
     )
 
     service = ReindexExecutor()
@@ -1745,6 +2406,7 @@ async def test_reindex_resource_vector_text_summary_first_skips_content_read(mon
 @pytest.mark.asyncio
 async def test_reindex_file_summary_reads_existing_record_as_uri_owner(monkeypatch):
     from openviking.service.reindex_executor import ReindexExecutor
+    from openviking.storage.abstract_overview import render_abstract_overview
 
     captured = {}
 
@@ -1771,6 +2433,36 @@ async def test_reindex_file_summary_reads_existing_record_as_uri_owner(monkeypat
 
     assert summary == "owner summary"
     assert captured["ctx"].user.user_id == "bob"
+
+    raw = render_abstract_overview(
+        ContextLevel.OVERVIEW,
+        "viking://resources/demo",
+        "# Demo\n\n## image.png\nVisible file summary.",
+        {
+            "source": {
+                "kind": "http",
+                "uri": "https://example.com/private.pdf",
+            }
+        },
+    )
+
+    async def fake_safe_read_text(self, uri, *, ctx):
+        del self, uri, ctx
+        return raw
+
+    async def fail_if_existing_record_read(self, *, uri, level, ctx):
+        raise AssertionError("body-only overview summary should be used before fallback")
+
+    monkeypatch.setattr(ReindexExecutor, "_safe_read_text", fake_safe_read_text)
+    monkeypatch.setattr(ReindexExecutor, "_fetch_existing_record", fail_if_existing_record_read)
+
+    summary = await service._best_file_summary(
+        "viking://resources/demo/image.png",
+        ctx=ctx,
+    )
+
+    assert summary == "Visible file summary."
+    assert "source:" not in summary
 
 
 @pytest.mark.asyncio
@@ -2397,55 +3089,102 @@ async def test_reindex_global_namespace_partitions_user_and_resources(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_reindex_skill_l2_falls_back_to_skill_content_when_abstract_missing(monkeypatch):
+async def test_reindex_skill_vectors_non_recursive_skips_skill_detail(monkeypatch):
     from openviking.service.reindex_executor import ReindexExecutor, _ReindexCounters
 
     class FakeVikingFS:
         async def exists(self, uri, ctx=None):
-            return True
-
-    seen = {}
+            raise AssertionError(f"must not inspect skill detail: {uri}")
 
     async def fake_read_directory_abstract(self, uri, *, ctx):
         return "skill abstract"
 
     async def fake_read_directory_overview(self, uri, *, ctx):
-        return ""
-
-    async def fake_fetch_existing_record(self, *, uri, level, ctx):
-        return None
+        return "skill overview"
 
     async def fake_safe_read_text(self, uri, *, ctx):
-        return "# Skill Title\n\nDo things well."
-
-    async def fake_upsert_context(self, **kwargs):
-        seen[kwargs["uri"]] = kwargs
+        raise AssertionError(f"must not read skill detail: {uri}")
 
     async def fake_skill_meta(self, *, uri, abstract, ctx):
         return {"name": "my_skill", "description": abstract}
 
+    upserts = []
+
+    async def fake_vectorize_directory(uri, abstract, overview, **kwargs):
+        upserts.extend([(uri, ContextLevel.ABSTRACT), (uri, ContextLevel.OVERVIEW)])
+
     monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
     monkeypatch.setattr(ReindexExecutor, "_read_directory_abstract", fake_read_directory_abstract)
     monkeypatch.setattr(ReindexExecutor, "_read_directory_overview", fake_read_directory_overview)
-    monkeypatch.setattr(ReindexExecutor, "_fetch_existing_record", fake_fetch_existing_record)
     monkeypatch.setattr(ReindexExecutor, "_safe_read_text", fake_safe_read_text)
     monkeypatch.setattr(ReindexExecutor, "_skill_meta", fake_skill_meta)
-    monkeypatch.setattr(ReindexExecutor, "_upsert_context", fake_upsert_context)
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.vectorize_directory_meta", fake_vectorize_directory
+    )
 
-    service = ReindexExecutor()
     counters = _ReindexCounters()
     ctx = RequestContext(
         user=UserIdentifier(account_id="test", user_id="alice"),
         role=Role.ROOT,
     )
+    uri = "viking://user/skills/my_skill"
 
-    await service._reindex_skill_vectors(
-        uri="viking://user/skills/my_skill",
+    await ReindexExecutor()._reindex_skill_vectors(
+        uri=uri,
         counters=counters,
         ctx=ctx,
+        recursive=False,
     )
 
-    assert seen["viking://user/skills/my_skill/SKILL.md"]["abstract"] == "skill abstract"
+    assert upserts == [
+        (uri, ContextLevel.ABSTRACT),
+        (uri, ContextLevel.OVERVIEW),
+    ]
+    assert counters.scanned_records == 1
+    assert counters.rebuilt_records == 2
+
+
+@pytest.mark.asyncio
+async def test_reindex_upsert_applies_empty_replace_tags_to_embedding_message(monkeypatch):
+    from types import SimpleNamespace
+
+    from openviking.service.reindex_executor import ReindexExecutor
+    from openviking.utils.ingest_options import IngestOptions
+
+    queued = []
+
+    class FakeVikingDB:
+        async def enqueue_embedding_msg(self, msg):
+            queued.append(msg)
+            return True
+
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_service",
+        lambda: SimpleNamespace(vikingdb_manager=FakeVikingDB()),
+    )
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_request_wait_tracker",
+        lambda: SimpleNamespace(register_embedding_root=lambda *args: None),
+    )
+
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="alice"),
+        role=Role.ROOT,
+    )
+    await ReindexExecutor()._upsert_context(
+        uri="viking://resources/demo.md",
+        parent_uri="viking://resources",
+        abstract="demo",
+        vector_text="demo",
+        is_leaf=True,
+        context_type="resource",
+        level=ContextLevel.DETAIL,
+        ctx=ctx,
+        ingest_options=IngestOptions.from_search_tags([], mode="replace"),
+    )
+
+    assert queued[0].context_data["search_tags"] == []
+    assert queued[0].context_data["_upsert_options"] == {"search_tag_mode": "replace"}
 
 
 @pytest.mark.asyncio
@@ -2488,7 +3227,7 @@ async def test_openviking_service_reindex_uses_default_root_context(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_openviking_service_reindex_canonicalizes_user_shorthand(monkeypatch):
+async def test_openviking_service_reindex_keeps_canonical_user_id(monkeypatch):
     from openviking.service.core import OpenVikingService
 
     seen = {}
@@ -2517,13 +3256,13 @@ async def test_openviking_service_reindex_canonicalizes_user_shorthand(monkeypat
 
     result = await OpenVikingService.reindex(
         service,
-        uri="viking://user/memories",
+        uri="viking://user/resources/memories",
         mode="prune_orphans",
         wait=True,
         dry_run=True,
         ctx=ctx,
     )
 
-    assert result == {"status": "completed", "uri": "viking://user/alice/memories"}
-    assert seen["uri"] == "viking://user/alice/memories"
+    assert result == {"status": "completed", "uri": "viking://user/resources/memories"}
+    assert seen["uri"] == "viking://user/resources/memories"
     assert seen["ctx"] is ctx

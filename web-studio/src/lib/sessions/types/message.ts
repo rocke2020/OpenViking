@@ -49,7 +49,16 @@ export interface ToolResultPart {
   is_error: boolean
 }
 
+export interface ImagePart {
+  type: 'image_url'
+  image_url: {
+    url: string
+    detail?: string
+  }
+}
+
 export type MessagePart =
+  | ImagePart
   | TextPart
   | ReasoningPart
   | IterationPart
@@ -60,24 +69,10 @@ export type MessagePart =
 /** A single message in a session (matches backend Message.to_dict()). */
 export interface Message {
   id: string
+  turn_id?: string
+  message_kind?:
+    'user_query' | 'assistant_step' | 'tool_transport' | 'checkpoint'
   role: 'user' | 'assistant'
   parts: MessagePart[]
   created_at: string
-}
-
-/** Helpers */
-
-export function getTextContent(message: Message): string {
-  for (const part of message.parts) {
-    if (part.type === 'text') return part.text
-  }
-  return ''
-}
-
-export function getToolParts(message: Message): ToolPart[] {
-  return message.parts.filter((p): p is ToolPart => p.type === 'tool')
-}
-
-export function getContextParts(message: Message): ContextPart[] {
-  return message.parts.filter((p): p is ContextPart => p.type === 'context')
 }

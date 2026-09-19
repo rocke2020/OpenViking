@@ -240,7 +240,7 @@ async def test_memory_usage_extractor_parses_mcp_text_search_and_list_results():
             parts=[
                 ToolPart(
                     tool_id="call-find",
-                    tool_name="mcp__openviking__find",
+                    tool_name="mcp__plugin_openviking-memory_openviking__find",
                     tool_status="completed",
                     tool_output=(
                         "Found 2 item(s):\n\n"
@@ -317,6 +317,31 @@ async def test_memory_usage_extractor_canonicalizes_short_user_list_uri():
 
 
 @pytest.mark.asyncio
+async def test_memory_usage_extractor_canonicalizes_home_alias_list_uri():
+    messages = [
+        Message(
+            id="msg-home-alias-list",
+            role="user",
+            parts=[
+                ToolPart(
+                    tool_id="call-list",
+                    tool_name="mcp__openviking__list",
+                    tool_status="completed",
+                    tool_input={"uri": "viking://~/memories/experiences"},
+                    tool_output="[file] listed experience.md",
+                )
+            ],
+        )
+    ]
+
+    events = await MemoryUsageExtractor().extract(messages=messages, context=_context())
+
+    assert [event.resource_uri for event in events] == [
+        "viking://user/test/memories/experiences/listed experience.md"
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tool_name", "tool_input"),
     [
@@ -325,6 +350,10 @@ async def test_memory_usage_extractor_canonicalizes_short_user_list_uri():
         ("ov_read", {"uri": "viking://user/test/memories/experiences/read.md"}),
         (
             "mcp__openviking__read",
+            {"uris": "viking://user/test/memories/experiences/read.md"},
+        ),
+        (
+            "mcp__plugin_openviking-memory_openviking__read",
             {"uris": "viking://user/test/memories/experiences/read.md"},
         ),
     ],
@@ -362,6 +391,8 @@ async def test_memory_usage_extractor_recognizes_generic_read_tools(tool_name, t
         "openviking_multi_read",
         "ov_multi_read",
         "mcp__openviking__multi_read",
+        "mcp__plugin_openviking-memory_openviking__multi_read",
+        "mcp__PLUGIN_openviking-memory_OpenViking__MULTI_READ",
     ],
 )
 async def test_memory_usage_extractor_multi_read_counts_only_successful_experiences(tool_name):
@@ -418,6 +449,12 @@ async def test_memory_usage_extractor_does_not_fuzzy_match_other_mcp_tools():
                     tool_status="completed",
                     tool_input={"uri": experience_uri},
                 ),
+                ToolPart(
+                    tool_id="call-plugin-read",
+                    tool_name="mcp__plugin_other-memory_other__read",
+                    tool_status="completed",
+                    tool_input={"uri": experience_uri},
+                ),
             ],
         )
     ]
@@ -465,6 +502,30 @@ async def test_memory_usage_extractor_ignores_short_user_read_not_found_result()
                     tool_status="completed",
                     tool_input={"uris": short_uri},
                     tool_output=f"(nothing found at {short_uri})",
+                )
+            ],
+        )
+    ]
+
+    events = await MemoryUsageExtractor().extract(messages=messages, context=_context())
+
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_memory_usage_extractor_ignores_home_alias_read_not_found_result():
+    alias_uri = "viking://~/memories/experiences/missing.md"
+    messages = [
+        Message(
+            id="msg-missing-home-alias-read",
+            role="user",
+            parts=[
+                ToolPart(
+                    tool_id="call-read",
+                    tool_name="mcp__openviking__read",
+                    tool_status="completed",
+                    tool_input={"uris": alias_uri},
+                    tool_output=f"(nothing found at {alias_uri})",
                 )
             ],
         )

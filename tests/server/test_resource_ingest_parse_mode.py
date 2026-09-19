@@ -22,8 +22,6 @@ async def test_ingest_temp_upload_forwards_no_split(monkeypatch: pytest.MonkeyPa
     )
     store = SimpleNamespace(
         resolve_for_consume=AsyncMock(return_value=resolved),
-        mark_consumed=AsyncMock(),
-        mark_failed=AsyncMock(),
     )
     add_resource = AsyncMock(
         return_value={"status": "success", "root_uri": "viking://resources/upload"}
@@ -42,8 +40,10 @@ async def test_ingest_temp_upload_forwards_no_split(monkeypatch: pytest.MonkeyPa
         store,
         "upload-id",
         ctx,
+        parent="viking://user/test_user/resources/team",
         parse_mode="no_split",
     )
 
     assert add_resource.await_args.kwargs["args"] == {"parse_mode": "no_split"}
     assert "parse_mode" not in add_resource.await_args.kwargs
+    assert add_resource.await_args.kwargs["parent"] == "viking://user/test_user/resources/team"

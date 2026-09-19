@@ -15,6 +15,7 @@ from openviking.core.namespace import canonical_session_uri
 from openviking.server.agent_evolution_config import AgentEvolutionConfigProvider
 from openviking.server.config import AgentEvolutionConfig, ToolOutputExternalizationConfig
 from openviking.server.identity import RequestContext
+from openviking.server.user_config import read_user_memory_policy
 from openviking.service.session_auto_commit import (
     compute_next_check_at,
     get_idle_timeout_seconds,
@@ -29,7 +30,7 @@ from openviking.service.session_auto_commit import (
 from openviking.service.task_tracker import get_task_tracker
 from openviking.session import Session
 from openviking.session.auto_commit_policy import AutoCommitPolicy
-from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
+from openviking.session.memory.memory_type_registry import get_default_registry
 from openviking.session.memory_policy import MemoryPolicy
 from openviking.storage.viking_fs import VikingFS
 from openviking.storage.vikingdb_manager import VikingDBManager
@@ -46,7 +47,7 @@ from openviking_cli.utils.config.memory_config import SessionAutoCommitConfig
 logger = get_logger(__name__)
 
 if TYPE_CHECKING:
-    from openviking.session.compressor_v2 import SessionCompressorV2
+    from openviking.session.compressor_v3 import SessionCompressorV3
     from openviking.usage_reporter import UsageReporter
 
 
@@ -57,7 +58,7 @@ class SessionService:
         self,
         vikingdb: Optional[VikingDBManager] = None,
         viking_fs: Optional[VikingFS] = None,
-        session_compressor: Optional["SessionCompressorV2"] = None,
+        session_compressor: Optional["SessionCompressorV3"] = None,
     ):
         self._vikingdb = vikingdb
         self._viking_fs = viking_fs
@@ -66,6 +67,7 @@ class SessionService:
         self._agent_evolution_enabled = AgentEvolutionConfig().enabled
         self._agent_evolution_config_provider: Optional[AgentEvolutionConfigProvider] = None
         self._agent_evolution_config_path: Optional[str] = None
+        self._default_user_memory_policy: Optional[Dict[str, Any]] = None
         self._configure_agent_evolution_provider()
         self._usage_reporter: Optional["UsageReporter"] = None
         # Server-wide controls remain disabled until configured during app setup.
@@ -81,7 +83,7 @@ class SessionService:
         self,
         vikingdb: VikingDBManager,
         viking_fs: VikingFS,
-        session_compressor: "SessionCompressorV2",
+        session_compressor: "SessionCompressorV3",
     ) -> None:
         """Set dependencies (for deferred initialization)."""
         self._vikingdb = vikingdb
@@ -94,6 +96,15 @@ class SessionService:
     ) -> None:
         """Set tool output externalization controls for newly created sessions."""
         self._tool_output_externalization_config = config.model_copy(deep=True)
+
+    def set_default_user_memory_policy(self, memory_policy: Optional[Dict[str, Any]]) -> None:
+        """Set the server fallback used when a User has no persisted policy."""
+        if memory_policy is None:
+            self._default_user_memory_policy = None
+            return
+        policy = MemoryPolicy.from_dict(memory_policy)
+        policy.validate_memory_types(set(get_default_registry().list_names(include_disabled=False)))
+        self._default_user_memory_policy = policy.to_dict()
 
     def set_agent_evolution_config(self, config: AgentEvolutionConfig) -> None:
         """Set the default used when an account has no persisted override."""
@@ -200,8 +211,16 @@ class SessionService:
             agent_evolution_enabled_provider=lambda: self.get_agent_evolution_enabled(
                 ctx.account_id
             ),
+            memory_policy_provider=lambda: self._get_user_memory_policy(ctx),
             usage_reporter=self._usage_reporter,
         )
+
+    async def _get_user_memory_policy(self, ctx: RequestContext) -> Optional[Dict[str, Any]]:
+        """Resolve the latest User policy with the configured server fallback."""
+        memory_policy = await read_user_memory_policy(self._viking_fs, ctx)
+        if memory_policy is not None:
+            return memory_policy
+        return self._default_user_memory_policy
 
     async def create(
         self,
@@ -238,7 +257,7 @@ class SessionService:
             if memory_policy is not None:
                 policy = MemoryPolicy.from_dict(memory_policy)
                 policy.validate_memory_types(
-                    set(MemoryTypeRegistry().list_names(include_disabled=False))
+                    set(get_default_registry().list_names(include_disabled=False))
                 )
                 session.meta.memory_policy = policy.to_dict()
             # Auto-commit is enabled when the caller supplies a policy, or when
@@ -252,7 +271,10 @@ class SessionService:
             else:
                 session.meta.auto_commit_policy = None
             if event_tags is not None:
-                session.meta.event_search_tags = normalize_search_tags(event_tags)
+                session.meta.event_search_tags = normalize_search_tags(
+                    event_tags,
+                    discard_invalid=True,
+                )
             await session.ensure_exists()
             self._record_lifecycle_metric("create", "ok")
             return session
@@ -316,25 +338,6 @@ class SessionService:
         except Exception:
             logger.debug("Failed to list sessions", exc_info=True)
 
-        try:
-            entries = await self._viking_fs.ls(
-                "viking://session",
-                sort_by="mtime",
-                sort_order="desc",
-                ctx=ctx,
-            )
-            for entry in entries:
-                name = entry.get("name", "")
-                if name in [".", ".."] or name in sessions_by_id:
-                    continue
-                sessions_by_id[name] = {
-                    "session_id": name,
-                    "uri": entry.get("uri", f"viking://session/{name}"),
-                    "is_dir": entry.get("isDir", False),
-                    "mod_time": entry.get("modTime", ""),
-                }
-        except Exception:
-            logger.debug("Failed to list legacy sessions", exc_info=True)
         return list(sessions_by_id.values())
 
     async def delete(self, session_id: str, ctx: RequestContext) -> bool:
@@ -370,6 +373,7 @@ class SessionService:
         retained_message_token_budget: Optional[int] = None,
         min_raw_tail_steps: Optional[int] = None,
         event_tags: Optional[List[str]] = None,
+        reset_context: bool = False,
     ) -> Dict[str, Any]:
         """Commit a session (archive messages and extract memories).
 
@@ -391,6 +395,7 @@ class SessionService:
             retained_message_token_budget=retained_message_token_budget,
             min_raw_tail_steps=min_raw_tail_steps,
             event_tags=event_tags,
+            reset_context=reset_context,
         )
 
     async def commit_async(
@@ -404,6 +409,7 @@ class SessionService:
         retained_message_token_budget: Optional[int] = None,
         min_raw_tail_steps: Optional[int] = None,
         event_tags: Optional[List[str]] = None,
+        reset_context: bool = False,
     ) -> Dict[str, Any]:
         """Async commit a session.
 
@@ -433,6 +439,8 @@ class SessionService:
         )
         if event_tags is not None:
             commit_kwargs["event_tags"] = event_tags
+        if reset_context:
+            commit_kwargs["reset_context"] = True
         result = await session.commit_async(**commit_kwargs)
         self._record_lifecycle_metric("commit", "ok" if result.get("status") else "error")
         self._record_archive_metric("ok" if result.get("archived") else "skip")
@@ -458,7 +466,7 @@ class SessionService:
         """
         self._ensure_initialized()
         if not self._session_compressor:
-            raise NotInitializedError("SessionCompressorV2")
+            raise NotInitializedError("SessionCompressorV3")
 
         session = await self.get(session_id, ctx)
         archive_uri = f"{session.uri}/manual_extract"
@@ -507,7 +515,9 @@ class SessionService:
         self._ensure_initialized()
         session = await self.get(session_id, ctx)
         normalized_event_tags = (
-            normalize_search_tags(event_tags) if event_tags is not None else None
+            normalize_search_tags(event_tags, discard_invalid=True)
+            if event_tags is not None
+            else None
         )
         if normalized_event_tags is not None or update_auto_commit_policy:
             await session.update_config(

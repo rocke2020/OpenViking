@@ -4,6 +4,9 @@
 """Session lifecycle tests"""
 
 import re
+from functools import partial
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from openviking.server.identity import RequestContext
 from openviking.service.core import OpenVikingService
@@ -90,8 +93,8 @@ class TestSessionLoad:
         # Nonexistent session should be empty after loading
         assert len(session.messages) == 0
 
-    async def test_load_ignores_non_archive_history_entries(self, client: AsyncOpenViking):
-        session = client.session(session_id="archive_name_validation_test")
+    async def test_load_ignores_non_archive_history_entries(self, client: partial):
+        session = client(session_id="archive_name_validation_test")
         for name in ("archive_001", "archive_002", "archive_001.bak.20260628"):
             await session._viking_fs.mkdir(
                 f"{session.uri}/history/{name}",
@@ -99,7 +102,7 @@ class TestSessionLoad:
                 ctx=session.ctx,
             )
 
-        loaded = client.session(session_id=session.session_id)
+        loaded = client(session_id=session.session_id)
         await loaded.load()
 
         assert loaded.compression.compression_index == 2
@@ -152,6 +155,19 @@ class TestSessionServiceGet:
 
 class TestSessionExists:
     """Test persisted session existence."""
+
+    async def test_session_exists_skips_directory_vector_count(self):
+        session = Session.__new__(Session)
+        session._viking_fs = SimpleNamespace(stat=AsyncMock(return_value={"isDir": True}))
+        session._session_uri = "viking://user/alice/sessions/session-1"
+        session.ctx = SimpleNamespace()
+
+        assert await session.exists() is True
+        session._viking_fs.stat.assert_awaited_once_with(
+            session._session_uri,
+            ctx=session.ctx,
+            skip_count=True,
+        )
 
     async def test_session_exists_true_after_create(
         self,

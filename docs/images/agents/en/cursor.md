@@ -1,25 +1,31 @@
-## Install the Cursor integration
+## Step 1: Install
 
-Requires macOS/Linux and Node.js 18+. The command installs Hooks, MCP, Rule, and Skill together:
+1. Run the installer in your terminal:
 
-```bash
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) --harness cursor --dist tos
-```
+   ```bash
+   bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh)
+   ```
 
-When asked where to connect, select **Volcengine OpenViking Cloud** and enter your API key. Choose **Self-hosted / local** only for a locally running OpenViking server.
+2. The installer will ask for language (English / Chinese) and OpenViking credentials. In the OpenViking credential step, choose **VolcEngine OpenViking Cloud Service [api.vikingdb.cn-beijing.volces.com]** and enter the API KEY:
 
-## Verify
+   ```text
+   {{OPENVIKING_API_KEY}}
+   ```
 
-1. Restart Cursor and start a new Agent session.
-2. In **Cursor Settings → Hooks**, confirm that the lifecycle Hooks ran `cursor-hook.mjs`, the URI protection Hooks ran `uri-guard.mjs`, and the prompt Hook returned `additional_context`.
-3. In **Cursor Settings → Tools & MCPs**, confirm that `openviking` is connected.
+## Step 2: Verify
 
-See the complete [Cursor integration guide](https://docs.openviking.ai/en/agent-integrations/12-cursor).
+1. Open **Customize → MCPs** and confirm both **openviking User** and **openviking Plugin** are visible.
+2. Open **Customize → Hooks** and confirm the **openviking-memory** entry is visible.
 
-## Troubleshooting
+## Troubleshoot
 
-| Problem | Suggested fix |
+| Problem | Fix |
 |---|---|
-| Hooks do not run after installation | Quit Cursor completely, restart it, and create a new Agent session. |
-| Recall runs more than once | Check the Execution Log for an imported legacy Claude OpenViking Hook, then upgrade or remove the legacy plugin reported by the installer. |
-| Connection/authentication fails | Check `~/.openviking/ovcli.conf` and restart Cursor. |
+| Hooks do not run | Quit Cursor completely, restart, new Agent session |
+| Connection / auth fails | Check `~/.openviking/ovcli.conf` and restart Cursor |
+| Need logs | `OPENVIKING_DEBUG=1` and `~/.openviking/logs/cursor-hooks.log` |
+
+## Reference
+
+- Docs on Manual Settings: [Cursor](https://docs.openviking.net/en/agent-integrations/12-cursor)
+- Code: [examples/agent-hook-plugin](https://github.com/volcengine/OpenViking/tree/main/examples/agent-hook-plugin)

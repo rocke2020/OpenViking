@@ -146,9 +146,7 @@ Recommended usage:
 
 - **TypeScript SDK Release** (`typescript-sdk-release.yml`): triggered by pushing a
   `typescript-sdk@X.Y.Z` tag, or manually. Publishes `@openviking/sdk` to npm.
-- **OpenCode Plugin Release** (`opencode-plugin-release.yml`): runs automatically on
-  pushes to `main` that touch `examples/opencode-plugin/**`, or manually. Publishes
-  `@openviking/opencode-plugin` to npm and skips versions that already exist.
+- **Plugin npm Release** (`plugin-npm-release.yml`): runs automatically on pushes to `main` that touch `examples/dsh-memory-plugin/**`, `examples/opencode-plugin/**`, or the shared plugin library `examples/memory-plugin-shared/lib/**`, or manually. Publishes `@openviking/dsh-memory-plugin` and `@openviking/opencode-plugin` to npm, one matrix job per package, and skips versions that already exist.
 - **Controlplane MCP Release** (`controlplane-mcp-release.yml`): manual only. Publishes
   `mcp-server-openviking-controlplane`, including the `ov-cp` CLI.
 
@@ -160,7 +158,7 @@ VikingBot is no longer maintained as a recommended standalone PyPI release path.
 - Source development entry point: `uv pip install -e ".[bot]"`.
 - The official Docker image already includes VikingBot by default; disable it with `--without-bot` or `OPENVIKING_WITH_BOT=0`.
 
-The root repository still contains a `First Release to PyPI` workflow, but it builds an independent Python package from the `bot` directory. The current `bot/` directory does not contain an independent `pyproject.toml`, `setup.py`, or `setup.cfg`, so this workflow should be treated as historical leftover configuration and should not be used for new VikingBot releases.
+The former root-level `First Release to PyPI` workflow has been removed. The current `bot/` directory does not contain an independent `pyproject.toml`, `setup.py`, or `setup.cfg`, so it cannot be released as a standalone Python package from this repository.
 
 The file `bot/.github/workflows/release.yml` lives under the `bot` subdirectory. Treat it as a historical bot subproject or split-repository release reference, not as a GitHub Actions workflow that the current root repository can directly trigger. Restoring an independent `vikingbot` package would first require adding standalone Python package metadata, a versioning strategy, and a publishing credential strategy under `bot/`.
 

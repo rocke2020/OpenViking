@@ -29,10 +29,6 @@ def _client(api_key_type: str = "user") -> VikingClient:
     client.admin_user_id = "bot-user"
     client.agent_id = "agent-1"
     client._request_connection = None
-    client._namespace_policy = {
-        "isolate_user_scope_by_agent": False,
-        "isolate_agent_scope_by_user": False,
-    }
     return client
 
 
@@ -219,7 +215,7 @@ async def test_read_peer_profile_uses_current_user_peer_alias(monkeypatch):
     profile = await client.read_peer_profile("telegram:alice")
 
     assert profile == "Alice profile"
-    assert calls == [(f"viking://user/peers/{TELEGRAM_ALICE_PEER_ID}/memories/profile.md", "read")]
+    assert calls == [(f"viking://~/peers/{TELEGRAM_ALICE_PEER_ID}/memories/profile.md", "read")]
 
 
 @pytest.mark.asyncio
@@ -255,7 +251,7 @@ async def test_read_user_profile_uses_current_user_self_alias_for_user_key(monke
     profile = await client.read_user_profile("sender-is-peer")
 
     assert profile == "Self profile"
-    assert calls == [("viking://user/memories/profile.md", "read")]
+    assert calls == [("viking://~/memories/profile.md", "read")]
 
 
 @pytest.mark.asyncio
@@ -470,7 +466,7 @@ async def test_search_with_peer_id_uses_peer_target_uri_without_forwarding_peer_
     assert calls == [
         {
             "query": "hello",
-            "target_uri": f"viking://user/peers/{TELEGRAM_ALICE_PEER_ID}/memories/",
+            "target_uri": f"viking://~/peers/{TELEGRAM_ALICE_PEER_ID}/memories/",
             "limit": 3,
         }
     ]

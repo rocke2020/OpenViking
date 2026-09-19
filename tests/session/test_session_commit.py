@@ -37,8 +37,14 @@ async def _marker_exists(session, archive_uri: str, name: str) -> bool:
 class TestCommit:
     """Test commit"""
 
-    async def test_commit_success(self, session_with_messages: Session):
-        """Test successful commit returns accepted with task_id"""
+    async def test_commit_preserves_unicode_separators_and_accepts_later_messages(
+        self, session_with_messages: Session
+    ):
+        """Unicode separators inside a message must not split its JSONL record."""
+        unicode_text = "before\u2028middle\u2029after\u0085tail"
+        session_with_messages.add_message("assistant", [TextPart(unicode_text)])
+        session_with_messages.add_message("user", [TextPart("continue")])
+
         result = await session_with_messages.commit_async()
 
         assert isinstance(result, dict)
@@ -47,6 +53,19 @@ class TestCommit:
         assert result.get("task_id") is not None
         assert "memory_diff_uri" not in result
         assert "memories_extracted" not in result
+        archive_content = await session_with_messages._viking_fs.read_file(
+            f"{result['archive_uri']}/messages.jsonl",
+            ctx=session_with_messages.ctx,
+        )
+        archived_messages = [
+            json.loads(line) for line in archive_content.split("\n") if line.strip()
+        ]
+        assert unicode_text in {
+            part["text"]
+            for message in archived_messages
+            for part in message["parts"]
+            if part["type"] == "text"
+        }
 
     async def test_commit_extracts_memories(
         self,
@@ -95,6 +114,172 @@ class TestCommit:
 
         # Wait for semantic/embedding queues
         await service.resources.wait_processed(timeout=60.0)
+
+    async def test_phase2_splits_with_the_committed_auto_commit_policy(
+        self,
+        session_with_messages: Session,
+        monkeypatch,
+    ):
+        await session_with_messages.update_config(
+            auto_commit_policy={
+                "pending_token_threshold": 0,
+                "message_count_threshold": 1,
+            },
+            update_auto_commit_policy=True,
+        )
+        working_memory_batches = []
+
+        async def generate_summary(
+            _session,
+            messages,
+            latest_archive_overview="",
+            checkpoint_requests=None,
+        ):
+            del checkpoint_requests
+            working_memory_batches.append([message.id for message in messages])
+            return f"{latest_archive_overview}\n{messages[0].id}"
+
+        monkeypatch.setattr(Session, "_generate_archive_summary_async", generate_summary)
+        extract_long_term = AsyncMock(return_value=[])
+        session_with_messages._session_compressor.extract_long_term_memories = extract_long_term
+
+        result = await session_with_messages.commit_async()
+        task_result = await _wait_for_task(result["task_id"])
+
+        assert task_result["status"] == "completed"
+        assert len(working_memory_batches) == 4
+        assert all(len(batch) == 1 for batch in working_memory_batches)
+        assert extract_long_term.await_count == 4
+        assert all(len(call.kwargs["messages"]) == 1 for call in extract_long_term.await_args_list)
+        phase1 = await session_with_messages._read_phase1_meta(result["archive_uri"])
+        assert phase1["queue_message"]["auto_commit_policy"]["message_count_threshold"] == 1
+
+    async def test_commit_task_reports_intentionally_skipped_memory_operations(
+        self,
+        session_with_messages: Session,
+    ):
+        async def extract_long_term_memories(**kwargs):
+            archive_uri = kwargs["archive_uri"]
+            await session_with_messages._viking_fs.write_file(
+                uri=f"{archive_uri}/memory_diff.json",
+                content=json.dumps(
+                    {
+                        "archive_uri": archive_uri,
+                        "operations": {"adds": [], "updates": [], "deletes": []},
+                        "summary": {
+                            "total_adds": 0,
+                            "total_updates": 0,
+                            "total_deletes": 0,
+                            "total_skipped": 1,
+                        },
+                        "skipped_operations": [
+                            {
+                                "memory_type": "preferences",
+                                "page_id": 102,
+                                "reason_code": "peer_not_allowed",
+                                "reason": "Target peer is outside the allowed memory scope",
+                            }
+                        ],
+                    }
+                ),
+                ctx=session_with_messages.ctx,
+            )
+            return []
+
+        session_with_messages._session_compressor.extract_long_term_memories = AsyncMock(
+            side_effect=extract_long_term_memories
+        )
+
+        commit_result = await session_with_messages.commit_async()
+        task_result = await _wait_for_task(commit_result["task_id"])
+
+        assert commit_result["status"] == "accepted"
+        assert task_result["status"] == "completed"
+        assert task_result["result"]["memory_extraction"] == {
+            "skipped": 1,
+            "skipped_operations": [
+                {
+                    "memory_type": "preferences",
+                    "page_id": 102,
+                    "reason_code": "peer_not_allowed",
+                    "reason": "Target peer is outside the allowed memory scope",
+                }
+            ],
+        }
+
+    async def test_recovered_commit_task_reads_existing_skipped_memory_operations(
+        self,
+        session_with_messages: Session,
+        monkeypatch,
+    ):
+        original_prepare = Session._prepare_phase2_archive_messages
+
+        async def prepare_with_completed_long_term(self, archive_uri, current_messages):
+            (
+                messages,
+                coverage_start_archive,
+                coverage_end_archive,
+                covered_failed_archives,
+                completed_memory_steps,
+            ) = await original_prepare(self, archive_uri, current_messages)
+            completed_memory_steps.setdefault("long_term", set()).update(
+                message.id for message in messages
+            )
+            await self._viking_fs.write_file(
+                uri=f"{archive_uri}/memory_diff.json",
+                content=json.dumps(
+                    {
+                        "archive_uri": archive_uri,
+                        "operations": {"adds": [], "updates": [], "deletes": []},
+                        "summary": {
+                            "total_adds": 0,
+                            "total_updates": 0,
+                            "total_deletes": 0,
+                            "total_skipped": 1,
+                        },
+                        "skipped_operations": [
+                            {
+                                "memory_type": "preferences",
+                                "page_id": 102,
+                                "reason_code": "peer_not_allowed",
+                                "reason": "Target peer is outside the allowed memory scope",
+                            }
+                        ],
+                    }
+                ),
+                ctx=self.ctx,
+            )
+            return (
+                messages,
+                coverage_start_archive,
+                coverage_end_archive,
+                covered_failed_archives,
+                completed_memory_steps,
+            )
+
+        monkeypatch.setattr(
+            Session,
+            "_prepare_phase2_archive_messages",
+            prepare_with_completed_long_term,
+        )
+        session_with_messages._session_compressor.extract_long_term_memories = AsyncMock()
+
+        commit_result = await session_with_messages.commit_async()
+        task_result = await _wait_for_task(commit_result["task_id"])
+
+        assert task_result["status"] == "completed"
+        assert task_result["result"]["memory_extraction"] == {
+            "skipped": 1,
+            "skipped_operations": [
+                {
+                    "memory_type": "preferences",
+                    "page_id": 102,
+                    "reason_code": "peer_not_allowed",
+                    "reason": "Target peer is outside the allowed memory scope",
+                }
+            ],
+        }
+        session_with_messages._session_compressor.extract_long_term_memories.assert_not_awaited()
 
     async def test_commit_default_disables_agent_memory_but_keeps_archive(
         self, session_with_messages: Session
@@ -147,6 +332,31 @@ class TestCommit:
         assert call_kwargs["agent_evolution_enabled"] is True
         assert call_kwargs["allowed_memory_types"] is None
 
+    async def test_commit_reads_latest_user_memory_policy_when_session_has_no_override(
+        self, session_with_messages: Session
+    ):
+        memory_policy_provider = AsyncMock(
+            return_value={
+                "memory_types": ["profile"],
+            }
+        )
+        session_with_messages._memory_policy_provider = memory_policy_provider
+        session_with_messages._session_compressor.extract_long_term_memories = AsyncMock(
+            return_value=[]
+        )
+
+        result = await session_with_messages.commit_async()
+        task_result = await _wait_for_task(result["task_id"])
+
+        assert task_result["status"] == "completed"
+        assert task_result["result"]["effective_memory_types"] == ["profile"]
+        call_kwargs = (
+            session_with_messages._session_compressor.extract_long_term_memories.call_args.kwargs
+        )
+        assert call_kwargs["allowed_memory_types"] == {"profile"}
+        assert call_kwargs["allowed_peer_ids"] == set()
+        memory_policy_provider.assert_awaited_once_with()
+
     async def test_disabled_agent_evolution_keeps_working_memory(
         self, session_with_messages: Session, monkeypatch
     ):
@@ -163,10 +373,6 @@ class TestCommit:
         session_with_messages._session_compressor.extract_long_term_memories = AsyncMock(
             return_value=[]
         )
-        if hasattr(session_with_messages._session_compressor, "extract_execution_memories"):
-            session_with_messages._session_compressor.extract_execution_memories = AsyncMock(
-                return_value={"contexts": [], "session_skills": []}
-            )
 
         result = await session_with_messages.commit_async(
             memory_policy={
@@ -181,8 +387,6 @@ class TestCommit:
         archive_uri = task_result["result"]["archive_uri"]
         assert await _marker_exists(session_with_messages, archive_uri, ".overview.md")
         session_with_messages._session_compressor.extract_long_term_memories.assert_not_awaited()
-        if hasattr(session_with_messages._session_compressor, "extract_execution_memories"):
-            session_with_messages._session_compressor.extract_execution_memories.assert_not_awaited()
 
     async def test_commit_reports_session_skills_separately(
         self, session_with_messages: Session, monkeypatch
@@ -195,45 +399,27 @@ class TestCommit:
 
         session_with_messages._agent_evolution_enabled_provider = lambda: True
         session_with_messages._session_compressor.extract_long_term_memories = AsyncMock(
-            return_value=[]
+            return_value={
+                "contexts": [],
+                "session_skills": [{"uri": "viking://user/test/skills/code-review"}],
+            }
         )
-        if hasattr(session_with_messages._session_compressor, "extract_execution_memories"):
-            session_with_messages._session_compressor.extract_execution_memories = AsyncMock(
-                return_value={
-                    "contexts": [],
-                    "session_skills": [{"uri": "viking://user/test/skills/code-review"}],
-                }
-            )
-
-        session_with_messages._meta.memory_policy = {"memory_types": ["trajectories"]}
 
         result = await session_with_messages.commit_async()
         task_result = await _wait_for_task(result["task_id"])
 
         assert task_result["status"] == "completed"
         assert task_result["result"]["memories_extracted"] == {}
-        if hasattr(session_with_messages._session_compressor, "extract_execution_memories"):
-            # v2: trajectories/skills flow through extract_execution_memories
-            assert task_result["result"]["session_skills_extracted"] == 1
-            assert task_result["result"]["session_skill_uris"] == [
-                "viking://user/test/skills/code-review"
-            ]
-        else:
-            # v3: trajectory/experience memory path is not wired when policy
-            # restricts to EXECUTION_MEMORY_TYPES (no extract_execution_memories).
-            assert task_result["result"]["session_skills_extracted"] == 0
-            assert task_result["result"]["session_skill_uris"] == []
+        assert task_result["result"]["session_skills_extracted"] == 1
+        assert task_result["result"]["session_skill_uris"] == [
+            "viking://user/test/skills/code-review"
+        ]
         assert "memory_diff_uri" not in task_result["result"]
-        if hasattr(session_with_messages._session_compressor, "extract_execution_memories"):
-            session_with_messages._session_compressor.extract_long_term_memories.assert_not_awaited()
-            session_with_messages._session_compressor.extract_execution_memories.assert_awaited_once()
-            call_kwargs = session_with_messages._session_compressor.extract_execution_memories.call_args.kwargs
-            assert call_kwargs["allowed_memory_types"] == {"trajectories"}
-            assert call_kwargs["include_session_skills"] is True
-        else:
-            session_with_messages._session_compressor.extract_long_term_memories.assert_awaited_once()
-            call_kwargs = session_with_messages._session_compressor.extract_long_term_memories.call_args.kwargs
-            assert call_kwargs["allowed_memory_types"] == {"trajectories"}
+        session_with_messages._session_compressor.extract_long_term_memories.assert_awaited_once()
+        call_kwargs = (
+            session_with_messages._session_compressor.extract_long_term_memories.call_args.kwargs
+        )
+        assert call_kwargs["allowed_memory_types"] is None
 
     async def test_commit_skips_session_skills_without_execution_memory_type(
         self, session_with_messages: Session, monkeypatch
@@ -246,13 +432,6 @@ class TestCommit:
         session_with_messages._session_compressor.extract_long_term_memories = AsyncMock(
             return_value=[]
         )
-        if hasattr(session_with_messages._session_compressor, "extract_execution_memories"):
-            session_with_messages._session_compressor.extract_execution_memories = AsyncMock(
-                return_value={
-                    "contexts": [],
-                    "session_skills": [{"uri": "viking://user/test/skills/code-review"}],
-                }
-            )
 
         session_with_messages._meta.memory_policy = {"memory_types": ["profile"]}
 
@@ -264,8 +443,6 @@ class TestCommit:
         assert task_result["result"]["session_skills_extracted"] == 0
         assert "memory_diff_uri" not in task_result["result"]
         session_with_messages._session_compressor.extract_long_term_memories.assert_awaited_once()
-        if hasattr(session_with_messages._session_compressor, "extract_execution_memories"):
-            session_with_messages._session_compressor.extract_execution_memories.assert_not_awaited()
 
     async def test_commit_skips_session_skill_extraction_when_disabled(
         self, session_with_messages: Session, monkeypatch
@@ -278,10 +455,6 @@ class TestCommit:
         session_with_messages._session_compressor.extract_long_term_memories = AsyncMock(
             return_value=[]
         )
-        if hasattr(session_with_messages._session_compressor, "extract_execution_memories"):
-            session_with_messages._session_compressor.extract_execution_memories = AsyncMock(
-                return_value={"contexts": [], "session_skills": []}
-            )
 
         result = await session_with_messages.commit_async()
         task_result = await _wait_for_task(result["task_id"])
@@ -291,10 +464,6 @@ class TestCommit:
         assert task_result["result"]["session_skill_uris"] == []
         assert "memory_diff_uri" not in task_result["result"]
         session_with_messages._session_compressor.extract_long_term_memories.assert_awaited_once()
-        if hasattr(session_with_messages._session_compressor, "extract_execution_memories"):
-            session_with_messages._session_compressor.extract_execution_memories.assert_awaited_once()
-            call_kwargs = session_with_messages._session_compressor.extract_execution_memories.call_args.kwargs
-            assert call_kwargs["include_session_skills"] is False
 
     async def test_commit_can_skip_working_memory_summary(
         self, session_with_messages: Session, monkeypatch
@@ -321,10 +490,6 @@ class TestCommit:
         session_with_messages._session_compressor.extract_long_term_memories = AsyncMock(
             side_effect=fake_extract
         )
-        if hasattr(session_with_messages._session_compressor, "extract_execution_memories"):
-            session_with_messages._session_compressor.extract_execution_memories = AsyncMock(
-                return_value={"contexts": [], "session_skills": []}
-            )
 
         result = await session_with_messages.commit_async(
             memory_policy={"working_memory": {"enabled": False}}
@@ -355,7 +520,6 @@ class TestCommit:
         session = client(session_id="peer_memory_role_routing_test")
         await session.ensure_exists()
         long_term_calls: list[dict] = []
-        execution_calls: list[dict] = []
 
         async def fake_summary(messages, latest_archive_overview=""):
             del messages, latest_archive_overview
@@ -367,6 +531,7 @@ class TestCommit:
             ctx,
             allowed_memory_types,
             allow_self_memory=True,
+            peer_memory_enabled=True,
             allowed_peer_ids=None,
             **kwargs,
         ):
@@ -375,6 +540,7 @@ class TestCommit:
                 {
                     "allowed_memory_types": set(allowed_memory_types or set()),
                     "allow_self_memory": allow_self_memory,
+                    "peer_memory_enabled": peer_memory_enabled,
                     "allowed_peer_ids": set(allowed_peer_ids or set()),
                     "roles": [message.role for message in messages],
                     "peer_ids": [message.peer_id for message in messages],
@@ -382,29 +548,8 @@ class TestCommit:
             )
             return []
 
-        async def fake_execution_extract(
-            *,
-            messages,
-            allowed_memory_types,
-            include_session_skills=None,
-            **kwargs,
-        ):
-            del kwargs
-            execution_calls.append(
-                {
-                    "allowed_memory_types": set(allowed_memory_types or set()),
-                    "include_session_skills": include_session_skills,
-                    "roles": [message.role for message in messages],
-                }
-            )
-            return {"contexts": [], "session_skills": []}
-
         monkeypatch.setattr(session, "_generate_archive_summary_async", fake_summary)
         monkeypatch.setattr(session._session_compressor, "extract_long_term_memories", fake_extract)
-        if hasattr(session._session_compressor, "extract_execution_memories"):
-            monkeypatch.setattr(
-                session._session_compressor, "extract_execution_memories", fake_execution_extract
-            )
 
         session.add_message(
             "user",
@@ -434,12 +579,12 @@ class TestCommit:
                     "profile",
                 },
                 "allow_self_memory": False,
+                "peer_memory_enabled": True,
                 "allowed_peer_ids": {"web-visitor-alice"},
                 "roles": ["user", "assistant"],
                 "peer_ids": ["web-visitor-alice", "web-visitor-alice"],
             },
         ]
-        assert execution_calls == []
 
     async def test_commit_archives_messages(self, session_with_messages: Session):
         """Test commit archives messages"""

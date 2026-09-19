@@ -13,7 +13,6 @@ import pytest
 from openviking.server.identity import RequestContext, Role
 from openviking.server.routers import resources as resources_router
 from openviking.server.routers.resources import AddResourceRequest
-from openviking.storage.viking_fs import get_viking_fs
 from openviking.telemetry import get_current_telemetry
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -31,6 +30,7 @@ def test_add_resource_request_defaults_processing_mode():
     request = AddResourceRequest(path="https://example.com/demo.md")
 
     assert request.processing_mode == "semantic_and_vectors"
+    assert request.is_active is True
 
 
 def test_add_resource_request_accepts_declared_add_type():
@@ -42,6 +42,40 @@ def test_add_resource_request_accepts_declared_add_type():
 
     assert request.add_type == "feishu"
     assert request.to == "viking://resources/feishu"
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        {"to": "viking://resources/docs"},
+        {"parent": "viking://resources"},
+    ],
+)
+def test_add_resource_request_accepts_paused_watch_with_target(target):
+    request = AddResourceRequest(
+        path="https://example.feishu.cn/docx/doc_token",
+        watch_interval=30,
+        is_active=False,
+        **target,
+    )
+
+    assert request.is_active is False
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"watch_interval": 0, "to": "viking://resources/docs"},
+        {"watch_interval": 30},
+    ],
+)
+def test_add_resource_request_rejects_invalid_paused_watch(kwargs):
+    with pytest.raises(ValueError, match="is_active=false"):
+        AddResourceRequest(
+            path="tos://bucket/docs/",
+            is_active=False,
+            **kwargs,
+        )
 
 
 def test_add_resource_request_rejects_add_type_with_temp_file_id():
@@ -127,10 +161,12 @@ async def test_add_resource_success(
     assert body["result"]["task_id"]
 
 
+@pytest.mark.parametrize("timeout", [None, 0.0])
 async def test_add_resource_with_wait(
     client: httpx.AsyncClient,
     sample_markdown_file,
     upload_temp_dir,
+    timeout,
 ):
     resp = await client.post(
         "/api/v1/resources",
@@ -138,12 +174,62 @@ async def test_add_resource_with_wait(
             "temp_file_id": sample_markdown_file.name,
             "reason": "test resource",
             "wait": True,
+            "timeout": timeout,
         },
     )
+    if timeout == 0.0:
+        assert resp.status_code == 504
+        error = resp.json()["error"]
+        assert error["code"] == "DEADLINE_EXCEEDED"
+        task_id = error["details"]["task_id"]
+        assert error["details"]["timeout"] == timeout
+        assert "Waiting for resource import timed out" in error["message"]
+        assert "does not cancel or fail the background task" in error["message"]
+        assert f"ov task status {task_id}" in error["message"]
+        task = await _wait_task_terminal(client, task_id)
+        assert task["status"] == "completed"
+        assert "root_uri" in task["result"]
+        return
+
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
     assert "root_uri" in body["result"]
+
+
+async def test_add_resource_remote_empty_with_wait_returns_invalid_argument(
+    client: httpx.AsyncClient,
+    temp_dir,
+    monkeypatch,
+):
+    from openviking.parse.accessors.base import LocalResource, SourceType
+    from openviking.parse.accessors.http_accessor import HTTPAccessor
+
+    downloaded = temp_dir / "remote-empty.txt"
+    downloaded.write_bytes(b"")
+
+    async def return_empty_download(self, source, **kwargs):
+        return LocalResource(
+            path=downloaded,
+            source_type=SourceType.HTTP,
+            original_source=str(source),
+            meta={"original_filename": downloaded.name},
+            is_temporary=True,
+        )
+
+    monkeypatch.setattr(HTTPAccessor, "access", return_empty_download)
+
+    resp = await client.post(
+        "/api/v1/resources",
+        json={"path": "https://example.com/remote-empty.txt", "wait": True},
+    )
+
+    assert resp.status_code == 400, resp.text
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "INVALID_ARGUMENT"
+    assert "empty" in body["error"]["message"].lower()
+    assert not downloaded.exists()
 
 
 async def test_add_resource_forwards_args_to_service(
@@ -172,6 +258,57 @@ async def test_add_resource_forwards_args_to_service(
 
     assert resp.status_code == 200
     assert seen["args"] == {"feishu_access_token": "u-test"}
+    assert seen["internal_task"] is False
+
+
+async def test_add_resource_forwards_paused_watch_to_service(
+    client: httpx.AsyncClient,
+    service,
+    monkeypatch,
+):
+    seen = {}
+
+    async def fake_add_resource(**kwargs):
+        seen.update(kwargs)
+        return {"status": "accepted", "task_id": "task-1"}
+
+    monkeypatch.setattr(service.resources, "add_resource", fake_add_resource)
+
+    resp = await client.post(
+        "/api/v1/resources",
+        json={
+            "path": "tos://bucket/docs/",
+            "to": "viking://resources/docs",
+            "watch_interval": 30,
+            "is_active": False,
+        },
+    )
+
+    assert resp.status_code == 200
+    assert seen["watch_interval"] == 30
+    assert seen["is_active"] is False
+
+
+async def test_add_resource_forwards_internal_task_to_service(
+    client: httpx.AsyncClient,
+    service,
+    monkeypatch,
+):
+    seen = {}
+
+    async def fake_add_resource(**kwargs):
+        seen.update(kwargs)
+        return {"status": "success", "root_uri": "viking://resources/demo"}
+
+    monkeypatch.setattr(service.resources, "add_resource", fake_add_resource)
+
+    resp = await client.post(
+        "/api/v1/resources",
+        json={"path": "https://example.com/demo.md", "internal_task": True},
+    )
+
+    assert resp.status_code == 200
+    assert seen["internal_task"] is True
 
 
 async def test_add_resource_forwards_processing_mode_to_service(monkeypatch):
@@ -188,7 +325,10 @@ async def test_add_resource_forwards_processing_mode_to_service(monkeypatch):
     monkeypatch.setattr(resources_router, "get_service", lambda: service)
 
     response = await resources_router.add_resource(
-        SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(config=None))),
+        SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(config=None)),
+            headers={},
+        ),
         AddResourceRequest(
             path="https://example.com/demo.md",
             processing_mode="vectors_only",
@@ -528,10 +668,17 @@ async def test_add_resource_with_resources_root_to_uses_child_uri(
     assert body["result"]["root_uri"] == "viking://resources/tt_b"
 
 
-async def test_add_resource_with_user_resources_short_parent_initializes_root(
+async def test_add_resource_with_home_alias_resources_parent_initializes_root(
+    app,
     client: httpx.AsyncClient,
     upload_temp_dir,
 ):
+    from openviking.server.auth import get_request_context
+
+    app.dependency_overrides[get_request_context] = lambda: RequestContext(
+        user=UserIdentifier("default", "default"),
+        role=Role.USER,
+    )
     archive_path = upload_temp_dir / "user_short_docs.zip"
     with zipfile.ZipFile(archive_path, "w") as zf:
         zf.writestr("user_short_docs/readme.md", "# hello\n")
@@ -540,8 +687,8 @@ async def test_add_resource_with_user_resources_short_parent_initializes_root(
         "/api/v1/resources",
         json={
             "temp_file_id": archive_path.name,
-            "parent": "viking://user/resources",
-            "reason": "test user resource short parent import",
+            "parent": "viking://~/resources",
+            "reason": "test home alias resource parent import",
             "wait": True,
         },
     )
@@ -836,7 +983,7 @@ async def test_add_resource_accepts_temp_uploaded_file(
     assert body["result"]["root_uri"].startswith("viking://")
 
 
-async def test_shared_temp_upload_and_add_resource_deletes_upload_dir(
+async def test_shared_temp_upload_can_be_added_repeatedly(
     client: httpx.AsyncClient,
     service,
 ):
@@ -849,21 +996,15 @@ async def test_shared_temp_upload_and_add_resource_deletes_upload_dir(
     temp_file_id = upload_resp.json()["result"]["temp_file_id"]
     assert temp_file_id.startswith("shared_")
 
-    upload_id = temp_file_id[len("shared_") :]
-    upload_root = f"viking://upload/{upload_id}"
-    vfs = get_viking_fs()
-    assert await vfs.exists(f"{upload_root}/meta.json")
-    assert await vfs.exists(f"{upload_root}/content")
-
-    resp = await client.post(
-        "/api/v1/resources",
-        json={"temp_file_id": temp_file_id, "reason": "shared upload", "wait": True},
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["status"] == "ok"
-    assert body["result"]["root_uri"].startswith("viking://")
-    assert not await vfs.exists(upload_root)
+    for reason in ("first shared upload", "second shared upload"):
+        resp = await client.post(
+            "/api/v1/resources",
+            json={"temp_file_id": temp_file_id, "reason": reason, "wait": True},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["result"]["root_uri"].startswith("viking://")
 
 
 @pytest.mark.parametrize("upload_mode", ["local", "shared"])
@@ -924,6 +1065,7 @@ async def test_shared_temp_upload_failed_consume_is_retryable(
     async def fake_add_resource(**kwargs):
         raise RuntimeError("boom")
 
+    original_add_resource = service.resources.add_resource
     monkeypatch.setattr(service.resources, "add_resource", fake_add_resource)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as http_client:
@@ -933,10 +1075,13 @@ async def test_shared_temp_upload_failed_consume_is_retryable(
         )
     assert resp.status_code == 500
 
-    upload_id = temp_file_id[len("shared_") :]
-    meta_uri = f"viking://upload/{upload_id}/meta.json"
-    meta_raw = await get_viking_fs().read_file(meta_uri)
-    assert '"state": "uploaded"' in meta_raw
+    monkeypatch.setattr(service.resources, "add_resource", original_add_resource)
+    retry = await client.post(
+        "/api/v1/resources",
+        json={"temp_file_id": temp_file_id, "reason": "retry shared upload", "wait": True},
+    )
+    assert retry.status_code == 200
+    assert retry.json()["status"] == "ok"
 
 
 async def test_shared_upload_content_read_rejects_internal_scope(
@@ -953,7 +1098,7 @@ async def test_shared_upload_content_read_rejects_internal_scope(
 
     resp = await client.get(
         "/api/v1/content/read",
-        params={"uri": f"viking://upload/{upload_id}/meta.json"},
+        params={"uri": f"viking://upload/{upload_id}/meta"},
     )
     assert resp.status_code == 400
     body = resp.json()
@@ -1044,10 +1189,6 @@ async def test_add_resource_non_wait_queue_task_queryable(
     sample_markdown_file,
     upload_temp_dir,
 ):
-    from openviking.service.task_tracker import set_task_tracker
-
-    set_task_tracker(None)
-
     resp = await client.post(
         "/api/v1/resources",
         json={

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Tests for schema_models.py - dynamic Pydantic model generation."""
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -15,13 +16,14 @@ from openviking.session.memory.dataclass import (
 )
 from openviking.session.memory.memory_type_registry import (
     MemoryTypeRegistry,
-    create_default_registry,
+    get_default_registry,
 )
 from openviking.session.memory.merge_op.base import FieldType, MergeOp
 from openviking.session.memory.schema_model_generator import (
     SchemaModelGenerator,
     to_pascal_case,
 )
+from openviking.session.memory.utils.json_parser import parse_json_with_stability
 
 
 class TestToPascalCase:
@@ -81,7 +83,7 @@ class TestSchemaModelGenerator:
     @pytest.fixture
     def real_registry(self):
         """Create a registry with real schemas."""
-        return create_default_registry()
+        return get_default_registry()
 
 
     def test_peer_enabled_false_omits_peer_id_field(self):
@@ -142,6 +144,16 @@ class TestSchemaModelGenerator:
         model = generator.create_flat_data_model(sample_memory_type)
 
         assert "First test field" in model.model_fields["field1"].description
+
+    def test_events_ranges_description_requires_user_source(self, real_registry):
+        events = real_registry.get("events")
+        model = SchemaModelGenerator([events]).create_flat_data_model(events)
+
+        description = model.model_fields["ranges"].description
+
+        assert "MUST include at least one user-role message" in description
+        assert "include both the originating user message and the assistant message" in description
+        assert "Never output assistant-only ranges for events" in description
 
     def test_render_description_template_conditional_branch(self):
         memory_type = MemoryTypeSchema(
@@ -260,6 +272,114 @@ class TestSchemaModelGenerator:
         assert schema["properties"]["page_id"]["description"] == (
             "Temporary page_id for identifying the target memory item."
         )
+
+    def test_event_page_id_schema_requires_new_page_range(self):
+        memory_type = MemoryTypeSchema(
+            memory_type="events",
+            operation_mode="add_only",
+            filename_template="{{ event_name }}.md",
+            directory="viking://user/{{ user_space }}/memories/events",
+            fields=[
+                MemoryField(
+                    name="event_name",
+                    field_type=FieldType.STRING,
+                    merge_op=MergeOp.IMMUTABLE,
+                )
+            ],
+        )
+
+        model = SchemaModelGenerator([memory_type]).create_flat_data_model(memory_type)
+        schema = model.model_json_schema()
+
+        assert schema["properties"]["page_id"]["minimum"] == 100
+        assert "MUST be at least 100" in schema["properties"]["page_id"]["description"]
+        # Runtime resolution normalizes bad model output instead of dropping the event.
+        assert model.model_validate({"page_id": 5, "event_name": "demo"}).page_id == 5
+
+    def test_non_event_add_only_page_id_schema_is_unchanged(self):
+        memory_type = MemoryTypeSchema(
+            memory_type="trajectories",
+            operation_mode="add_only",
+            filename_template="{{ trajectory_name }}.md",
+            directory="viking://user/{{ user_space }}/memories/trajectories",
+            fields=[],
+        )
+
+        model = SchemaModelGenerator([memory_type]).create_flat_data_model(memory_type)
+        page_id_schema = model.model_json_schema()["properties"]["page_id"]
+
+        assert "minimum" not in page_id_schema
+        assert page_id_schema["description"] == (
+            "Temporary page_id for identifying the target memory item."
+        )
+
+    def test_existing_patch_can_omit_immutable_fields_but_new_item_cannot(
+        self, real_registry
+    ):
+        entities = real_registry.get("entities")
+        model = SchemaModelGenerator([entities]).create_flat_data_model(entities)
+
+        existing = model.model_validate(
+            {
+                "page_id": 2,
+                "content": {"blocks": [{"search": "old", "replace": "new"}]},
+            }
+        )
+
+        assert existing.category is None
+        assert existing.name is None
+        schema = model.model_json_schema()
+        assert schema["required"] == ["page_id"]
+        assert schema["allOf"][0]["then"]["required"] == ["category", "name"]
+
+        for page_id in (100, "100"):
+            with pytest.raises(ValueError, match="category, name"):
+                model.model_validate({"page_id": page_id, "content": "new entity"})
+
+        created = model.model_validate(
+            {
+                "page_id": 100,
+                "category": "activity",
+                "name": "horse riding",
+                "content": "new entity",
+            }
+        )
+        assert created.category == "activity"
+        assert created.name == "horse riding"
+
+    def test_parser_keeps_existing_patch_without_immutable_fields_alongside_delete(
+        self, real_registry
+    ):
+        generator = SchemaModelGenerator(
+            [real_registry.get("preferences"), real_registry.get("entities")]
+        )
+        operations_model = generator.create_structured_operations_model()
+        content = json.dumps(
+            {
+                "entities": [
+                    {
+                        "page_id": 2,
+                        "content": {
+                            "blocks": [{"search": "一周学习计划", "replace": ""}]
+                        },
+                    }
+                ],
+                "delete_ids": [
+                    {"delete_page_id": 1, "replacement_page_id": None}
+                ],
+            }
+        )
+
+        parsed, error = parse_json_with_stability(
+            content,
+            model_class=operations_model,
+            expected_fields=list(operations_model.model_fields),
+        )
+
+        assert error is None
+        assert len(parsed.entities) == 1
+        assert parsed.entities[0].page_id == 2
+        assert len(parsed.delete_ids) == 1
 
     def test_links_field_is_not_emitted_when_links_disabled(self, registry_with_sample):
         from unittest.mock import patch

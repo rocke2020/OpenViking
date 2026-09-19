@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -17,12 +18,15 @@ from openviking.session.compressor_v3 import (
     _experience_root_uri,
     _experience_snapshot_provenance,
     _experience_trajectory_map,
+    _report_extraction_telemetry,
     _visible_experience_snapshot_uris,
 )
 from openviking.session.memory.dataclass import (
     MemoryFile,
+    MemoryOperationSkipCode,
     ResolvedOperation,
     ResolvedOperations,
+    SkippedMemoryOperation,
     StoredLink,
 )
 from openviking.session.memory.memory_updater import MemoryUpdateResult
@@ -43,6 +47,8 @@ from openviking.session.train import (
     Trajectory,
 )
 from openviking.session.train.components.session_commit import _case_spec_message_to_request
+from openviking.telemetry import OperationTelemetry, bind_telemetry
+from openviking_cli.exceptions import ConflictError
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -85,6 +91,26 @@ def test_factory_defaults_to_v3():
     assert isinstance(compressor, SessionCompressorV3)
 
 
+@pytest.mark.asyncio
+async def test_commit_extraction_propagates_template_conflict():
+    compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=SimpleNamespace())
+    conflict = ConflictError("Conflicting memory template snapshots; Re-extract before retrying")
+    compressor._extract_user_memories = AsyncMock(side_effect=conflict)
+    compressor._write_final_memory_diff = AsyncMock()
+
+    with pytest.raises(ConflictError) as raised:
+        await compressor.extract_long_term_memories(
+            messages=_messages(),
+            ctx=_ctx(),
+            allowed_memory_types={"profile"},
+            # The Session commit worker uses this mode: a conflict must reach it,
+            # not turn into an empty successful extraction or memory diff.
+            strict_extract_errors=True,
+        )
+    assert raised.value is conflict
+    compressor._write_final_memory_diff.assert_not_awaited()
+
+
 def test_factory_ignores_deprecated_memory_version():
     assert isinstance(
         create_session_compressor(vikingdb=None, memory_version="v2"), SessionCompressorV3
@@ -93,6 +119,102 @@ def test_factory_ignores_deprecated_memory_version():
         create_session_compressor(vikingdb=None, memory_version="unsupported"),
         SessionCompressorV3,
     )
+
+
+def test_extract_long_term_memories_preserves_legacy_positional_parameter_order():
+    parameter_names = list(
+        inspect.signature(SessionCompressorV3.extract_long_term_memories).parameters
+    )
+
+    assert parameter_names[-4:] == [
+        "allow_self_memory",
+        "allowed_peer_ids",
+        "event_search_tags",
+        "peer_memory_enabled",
+    ]
+
+
+def test_report_extraction_telemetry_handles_placeholder_error_targets():
+    operations = ResolvedOperations(
+        upsert_operations=[
+            ResolvedOperation(
+                old_memory_file_content=None,
+                memory_fields={},
+                memory_type="events",
+                uris=["unknown"],
+            )
+        ],
+        delete_file_contents=[],
+        errors=[],
+    )
+    result = MemoryUpdateResult()
+    result.add_written("unknown")
+    result.add_edited("viking://user/u/memories/preferences/pref.md")
+    result.add_deleted("viking://user/u/memories/events/old.md")
+    result.add_error("events(page_id=xyz)", ValueError("Missing resolved URI"))
+
+    telemetry = OperationTelemetry(operation="session.commit", enabled=True)
+    with bind_telemetry(telemetry):
+        _report_extraction_telemetry(result, operations)
+
+    summary = telemetry.finish().summary
+    extract = summary["memory"]["extract"]
+    assert extract["actions"] == {
+        "created": 1,
+        "merged": 1,
+        "deleted": 1,
+        "failed": 1,
+    }
+    assert extract["actions_by_type"] == {
+        "events": {"created": 1, "deleted": 1},
+        "preferences": {"merged": 1},
+        "unknown": {"failed": 1},
+    }
+
+
+@pytest.mark.asyncio
+async def test_memory_diff_includes_intentionally_skipped_operations(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_viking_fs",
+        lambda: SimpleNamespace(),
+    )
+    compressor = SessionCompressorV3(vikingdb=None)
+    result = MemoryUpdateResult()
+    result.add_skipped(
+        SkippedMemoryOperation(
+            memory_type="events",
+            page_id=101,
+            reason_code=MemoryOperationSkipCode.INVALID_RANGES,
+            reason="No valid event range could be resolved",
+        )
+    )
+
+    diff = await compressor._build_memory_diff(
+        result=result,
+        operations=ResolvedOperations(
+            upsert_operations=[],
+            delete_file_contents=[],
+            errors=[],
+        ),
+        viking_fs=SimpleNamespace(),
+        ctx=_ctx(),
+        archive_uri="viking://user/u/sessions/s1/history/archive_001",
+    )
+
+    assert diff["skipped_operations"] == [
+        {
+            "memory_type": "events",
+            "page_id": 101,
+            "reason_code": "invalid_ranges",
+            "reason": "No valid event range could be resolved",
+        }
+    ]
+    assert diff["summary"] == {
+        "total_adds": 0,
+        "total_updates": 0,
+        "total_deletes": 0,
+        "total_skipped": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -108,12 +230,19 @@ async def test_v3_skips_agent_training_when_agent_evolution_is_disabled(monkeypa
             cases=[_training_case()],
             memory_diff={"operations": {}},
             case_uri_by_name={},
+            skipped_operations=[
+                {
+                    "memory_type": "profile",
+                    "reason_code": "peer_memory_disabled",
+                    "reason": "Peer memory writes are disabled",
+                }
+            ],
         )
     )
     compressor.train_from_extracted_cases = AsyncMock()
     compressor._write_final_memory_diff = AsyncMock()
 
-    await compressor.extract_long_term_memories(
+    result = await compressor.extract_long_term_memories(
         messages=_messages(),
         ctx=_ctx(),
         allowed_memory_types={"cases", "profile"},
@@ -121,6 +250,7 @@ async def test_v3_skips_agent_training_when_agent_evolution_is_disabled(monkeypa
     )
 
     compressor.train_from_extracted_cases.assert_not_awaited()
+    assert result == []
 
 
 @pytest.mark.asyncio
@@ -315,7 +445,7 @@ async def test_v3_initializes_only_allowed_memory_files(monkeypatch):
         lambda: SimpleNamespace(),
     )
     monkeypatch.setattr(
-        "openviking.session.compressor_v3.create_default_registry",
+        "openviking.session.compressor_v3.get_default_registry",
         lambda: DummyRegistry(),
     )
 
@@ -706,7 +836,7 @@ async def test_v3_extract_uses_patch_merge_without_directory_lock(monkeypatch):
         lambda: SimpleNamespace(write_file=AsyncMock()),
     )
     monkeypatch.setattr(
-        "openviking.session.compressor_v3.create_default_registry",
+        "openviking.session.compressor_v3.get_default_registry",
         lambda: DummyRegistry(),
     )
     monkeypatch.setattr(
@@ -814,7 +944,7 @@ async def test_v3_extract_trains_only_canonical_case_after_patch_merge(monkeypat
 
     monkeypatch.setattr("openviking.session.compressor_v3.get_viking_fs", lambda: FakeFS())
     monkeypatch.setattr(
-        "openviking.session.compressor_v3.create_default_registry",
+        "openviking.session.compressor_v3.get_default_registry",
         lambda: DummyRegistry(),
     )
     monkeypatch.setattr(
@@ -1065,7 +1195,20 @@ async def test_v3_fast_path_writes_final_memory_diff_with_case_traj_and_exp(monk
                     "updates": [],
                     "deletes": [],
                 },
-                "summary": {"total_adds": 1, "total_updates": 0, "total_deletes": 0},
+                "skipped_operations": [
+                    {
+                        "memory_type": "preferences",
+                        "page_id": 102,
+                        "reason_code": "peer_not_allowed",
+                        "reason": "Target peer is outside the allowed memory scope",
+                    }
+                ],
+                "summary": {
+                    "total_adds": 1,
+                    "total_updates": 0,
+                    "total_deletes": 0,
+                    "total_skipped": 1,
+                },
             },
         )
 
@@ -1118,7 +1261,20 @@ async def test_v3_fast_path_writes_final_memory_diff_with_case_traj_and_exp(monk
         "trajectories",
     ]
     assert [item["memory_type"] for item in diff["operations"]["updates"]] == ["experiences"]
-    assert diff["summary"] == {"total_adds": 2, "total_updates": 1, "total_deletes": 0}
+    assert diff["skipped_operations"] == [
+        {
+            "memory_type": "preferences",
+            "page_id": 102,
+            "reason_code": "peer_not_allowed",
+            "reason": "Target peer is outside the allowed memory scope",
+        }
+    ]
+    assert diff["summary"] == {
+        "total_adds": 2,
+        "total_updates": 1,
+        "total_deletes": 0,
+        "total_skipped": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -1190,7 +1346,12 @@ async def test_v3_builds_training_memory_diff_from_streaming_result(monkeypatch)
         archive_uri=archive_uri,
     )
 
-    assert diff["summary"] == {"total_adds": 1, "total_updates": 1, "total_deletes": 0}
+    assert diff["summary"] == {
+        "total_adds": 1,
+        "total_updates": 1,
+        "total_deletes": 0,
+        "total_skipped": 0,
+    }
     assert diff["operations"]["adds"][0]["memory_type"] == "trajectories"
     update = diff["operations"]["updates"][0]
     assert update["memory_type"] == "experiences"
@@ -1287,7 +1448,12 @@ async def test_v3_training_memory_diff_filters_batch_items_by_current_analysis_t
         archive_uri=archive_uri,
     )
 
-    assert diff["summary"] == {"total_adds": 2, "total_updates": 0, "total_deletes": 0}
+    assert diff["summary"] == {
+        "total_adds": 2,
+        "total_updates": 0,
+        "total_deletes": 0,
+        "total_skipped": 0,
+    }
     assert [op["uri"] for op in diff["operations"]["adds"]] == [traj_a, exp_a]
 
 

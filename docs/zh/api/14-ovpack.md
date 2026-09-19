@@ -68,7 +68,7 @@ curl -X POST http://localhost:1933/api/v1/pack/export \
 **Python SDK**
 
 ```python
-import openviking as ov
+import openviking_sdk as ov
 
 client = ov.SyncHTTPClient(url="http://localhost:1933", api_key="your-admin-key")
 client.initialize()
@@ -146,7 +146,7 @@ ov export viking://resources/my-project/ ./exports/my-project.ovpack --include-v
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| temp_file_id | string | 是 | - | 临时上传文件 ID（通过 [temp_upload](02-resources.md#temp_upload) 获取） |
+| temp_file_id | string | 是 | - | 临时上传文件 ID（通过 [temp_upload](02-resources.md#temp-upload) 获取） |
 | parent | string | 是 | - | 目标父级 URI（导入到此处） |
 | on_conflict | string | 否 | fail | 冲突策略：`fail`、`overwrite` 或 `skip` |
 | vector_mode | string | 否 | auto | 向量处理方式：`auto`、`recompute` 或 `require` |
@@ -202,7 +202,7 @@ curl -X POST http://localhost:1933/api/v1/pack/import \
 **Python SDK**
 
 ```python
-import openviking as ov
+import openviking_sdk as ov
 
 client = ov.SyncHTTPClient(url="http://localhost:1933", api_key="your-admin-key")
 client.initialize()
@@ -291,9 +291,12 @@ ov import ./exports/my-project.ovpack viking://resources/imported/ --vector-mode
 ### backup_ovpack
 
 将公开 scope root 备份为只能通过 restore 恢复的 `.ovpack` 文件。备份包含
-`resources` 和 `user`；session 会通过 user 命名空间下的 `user/{user_id}/sessions`
-一起包含，不包含 `temp`、`queue` 等内部运行态数据。
+`resources` 和当前账号下所有 `user/{user_id}` 内容；session 会通过 user 命名空间下的
+`user/{user_id}/sessions` 一起包含，不包含 `temp`、`queue` 等内部运行态数据，也不包含
+用户账号或 API Key。该接口仅允许 ROOT 或 ADMIN 调用。
 设置 `include_vectors=true` 时，会额外导出兼容的纯 dense 向量快照；底层 index type 为 hybrid 时会拒绝导出向量快照。
+
+备份是在线逐文件读取，不保证同一时刻的原子快照。需要严格一致性时，调用方应在备份窗口暂停写入。
 
 ```
 POST /api/v1/pack/backup
@@ -348,6 +351,15 @@ Go SDK 和 CLI 将字节流写入指定路径，并返回或输出该本地路�
 
 恢复 `backup_ovpack` 生成的备份包到原始公开 scope root。普通 import 不接受备份包。
 向量处理遵循 `vector_mode`；user 命名空间下的 session 文件只恢复文件状态，不触发向量化。
+该接口仅允许 ROOT 或 ADMIN 调用，并恢复当前账号下包内所有用户路径。
+
+`on_conflict=overwrite` 使用合并覆盖：包内缺失于目标的路径会创建，同路径会覆盖，目标独有路径
+会保留；不会删除整个 `viking://resources` 或 `viking://user`。向量只更新包内新增或覆盖的
+内容。`skip` 仍是 scope root 级跳过，但返回前也会完整校验 manifest、内容 checksum 和向量元数据。
+损坏的备份不会因为 `skip` 而返回成功。
+
+OVPack 不创建用户账号或恢复 API Key。新环境恢复后，需要使用包内相同的 `user_id` 创建用户，
+并使用目标环境新生成的 API Key。
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
@@ -417,4 +429,4 @@ ov restore ./backups/openviking.ovpack --on-conflict overwrite --vector-mode req
 
 - [OVPack 指南](../guides/09-ovpack.md) - 格式、迁移和操作流程
 - [快照](11-snapshot.md) - 工作区版本管理
-- [临时上传](02-resources.md#temp_upload) - 上传待导入的包
+- [临时上传](02-resources.md#temp-upload) - 上传待导入的包

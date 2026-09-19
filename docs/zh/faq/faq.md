@@ -162,20 +162,43 @@ Embedding、VLM、存储等服务配置由 OpenViking Server 通过 `ov.conf` �
 ```python
 # 添加单个文件
 await client.add_resource(
-    "./document.pdf",
-    reason="项目技术文档",  # 描述资源用途，提升检索质量
-    to="viking://resources/docs/"  # 指定存储位置
+    path="./document.pdf",
+    parent="viking://resources/docs",  # 存到这个目录下面，文件名由来源决定
+    options={"reason": "项目技术文档"},  # 描述资源用途，提升检索质量
 )
 
 # 添加网页
 await client.add_resource(
-    "https://example.com/api-docs",
-    reason="API 参考文档"
+    path="https://example.com/api-docs",
+    options={"reason": "API 参考文档"},
 )
 
 # 等待处理完成
 await client.wait_processed()
 ```
+
+### `to` 和 `parent` 有什么区别？该用哪个？
+
+|  | `to` | `parent` |
+|---|---|---|
+| 传什么 | 完整最终 URI，**含叶子名** | 一个**已存在的目录**，叶子名由来源决定 |
+| 撞名怎么办 | 不改名。目标已存在时按新来源同步，来源里没有的可见条目会被删除 | 不覆盖。退到 `name_1`、`name_2`……并返回一条 warning |
+| 什么时候用 | 名字已知且必须逐字生效；或者要原地更新一个已有资源 | 叶子名由服务端派生（URL / 仓库导入、大文件切分），或者目标下已有的内容一点都不能动 |
+
+两个都留空 = 目录和叶子名都从来源推导，撞名行为同 `parent`。
+
+`to` 和 `parent` 不能同时传，会直接报错。
+
+### `to` 指到一个已存在的目录会发生什么？
+
+内容被同步成新来源的样子，metadata 保留。具体是：
+
+- **点号开头的条目原样保留** —— `.abstract.md`、`.overview.md`、`.search_tags.json`、`.image_mappings.json` 等；同步时两侧都不枚举它们，所以既不会被删也不会被覆盖。
+- **其余可见内容和新来源对齐** —— 来源里没有的删掉，变了的覆盖，没变的留在原地（URI 不变，挂在上面的向量和 tags 都还在）。
+
+所以这是「保留 metadata、替换内容本身」，不是把目录删掉重建。不想动目标里已有的东西就用 `parent`。
+
+注意：`processing_mode="vectors_only"` 不跑语义处理，保留下来的 `.abstract.md` / `.overview.md` **不会重算**，会继续描述已经被替换掉的旧内容。需要摘要跟着更新，就用默认的 `semantic_and_vectors`。
 
 ### `find()` 和 `search()` 有什么区别？应该用哪个？
 
@@ -189,14 +212,14 @@ await client.wait_processed()
 ```python
 # find(): 简单直接的语义搜索
 results = await client.find(
-    "OAuth 认证流程",
-    target_uri="viking://resources/"
+    query="OAuth 认证流程",
+    target_uri="viking://resources/",
 )
 
 # search(): 复杂任务，需要意图分析
 results = await client.search(
-    "帮我实现用户登录功能",
-    session_info=session
+    query="帮我实现用户登录功能",
+    session_id=session.session_id,
 )
 ```
 
@@ -209,15 +232,21 @@ results = await client.search(
 会话管理是 OpenViking 的核心能力，支持对话追踪和记忆提取：
 
 ```python
+from openviking_sdk import TextPart
+
 # 创建会话
-session = client.session()
+session_info = await client.create_session()
+session = client.session(session_id=session_info["session_id"])
 
 # 添加对话消息
-await session.add_message("user", [{"type": "text", "text": "帮我分析这段代码的性能问题"}])
-await session.add_message("assistant", [{"type": "text", "text": "我来分析一下..."}])
-
-# 标记使用的上下文（用于追踪）
-await session.used(["viking://resources/code/main.py"])
+await session.add_message(
+    role="user",
+    parts=[TextPart(text="帮我分析这段代码的性能问题")],
+)
+await session.add_message(
+    role="assistant",
+    parts=[TextPart(text="我来分析一下...")],
+)
 
 # 提交会话，触发记忆提取
 await session.commit()
@@ -233,16 +262,16 @@ OpenViking 内置 `profile`、`preferences`、`entities`、`events`、`identity`
 
 ```python
 # 列出目录内容
-items = await client.ls("viking://resources/")
+items = await client.ls(uri="viking://resources/")
 
 # 读取完整内容（L2）
-content = await client.read("viking://resources/doc.md")
+content = await client.read(uri="viking://resources/doc.md")
 
 # 获取摘要（L0）
-abstract = await client.abstract("viking://resources")
+abstract = await client.abstract(uri="viking://resources")
 
 # 获取概览（L1）
-overview = await client.overview("viking://resources")
+overview = await client.overview(uri="viking://resources")
 ```
 
 ## 检索优化
@@ -285,7 +314,7 @@ OpenViking 使用分数传播机制：
 
 1. **未等待处理完成**
    ```python
-   await client.add_resource("./doc.pdf")
+   await client.add_resource(path="./doc.pdf")
    await client.wait_processed()  # 必须等待
    ```
 
@@ -310,7 +339,7 @@ OpenViking 使用分数传播机制：
 1. **确认资源已处理完成**
    ```python
    # 检查资源是否存在
-   items = await client.ls("viking://resources/")
+   items = await client.ls(uri="viking://resources/")
    ```
 
 2. **检查 `target_uri` 过滤条件**
@@ -323,7 +352,7 @@ OpenViking 使用分数传播机制：
 
 4. **检查 L0 摘要质量**
    ```python
-   abstract = await client.abstract("viking://resources/your-doc")
+   abstract = await client.abstract(uri="viking://resources/your-doc")
    print(abstract)  # 确认摘要是否准确反映内容
    ```
 
@@ -346,7 +375,10 @@ OpenViking 使用分数传播机制：
 
 4. **查看提取的记忆**
    ```python
-   memories = await client.find("", target_uri="viking://user/memories/")
+   memories = await client.find(
+       query="",
+       target_uri="viking://~/memories/",
+   )
    ```
 
 ### 性能问题

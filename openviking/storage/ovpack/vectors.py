@@ -4,21 +4,25 @@
 
 from __future__ import annotations
 
-import hashlib
 import struct
 import zipfile
 from typing import Any
 
-from openviking.core.namespace import context_type_for_uri, is_session_uri, owner_fields_for_uri
+from openviking.core.namespace import (
+    content_owner_context_for_uri,
+    context_type_for_uri,
+    is_session_uri,
+    owner_fields_for_uri,
+)
 from openviking.server.identity import RequestContext
 from openviking.storage.ovpack.format import (
     OVPACK_DENSE_PATH,
     dense_values_bytes,
     internal_zip_path,
-    join_uri,
     sha256_hex,
 )
-from openviking.storage.ovpack.manifest import manifest_dense_info
+from openviking.storage.ovpack.manifest import manifest_dense_info, manifest_entry_target_uri
+from openviking.storage.vector_ids import vector_record_id
 from openviking.storage.ovpack.validation import dense_record_count, record_dense_ref
 from openviking.utils.time_utils import get_current_timestamp
 from openviking_cli.exceptions import InvalidArgumentError
@@ -252,17 +256,7 @@ def choose_vector_restore_action(
 
 
 def _vector_record_id(target_uri: str, level: int, ctx: RequestContext) -> str:
-    if level == 0:
-        seed_uri = (
-            target_uri if target_uri.endswith("/.abstract.md") else f"{target_uri}/.abstract.md"
-        )
-    elif level == 1:
-        seed_uri = (
-            target_uri if target_uri.endswith("/.overview.md") else f"{target_uri}/.overview.md"
-        )
-    else:
-        seed_uri = target_uri
-    return hashlib.md5(f"{ctx.account_id}:{seed_uri}".encode("utf-8")).hexdigest()
+    return vector_record_id(ctx.account_id, target_uri, level)
 
 
 async def _upsert_vector_snapshot_record(
@@ -274,7 +268,7 @@ async def _upsert_vector_snapshot_record(
 ) -> None:
     level = int(record.get("level", 2))
     scalars = dict(record.get("scalars") or {})
-    owner_fields = owner_fields_for_uri(target_uri, ctx=ctx)
+    owner_fields = owner_fields_for_uri(target_uri)
     timestamp = get_current_timestamp()
     payload = {
         **scalars,
@@ -305,6 +299,7 @@ async def restore_vector_snapshot(
     root_uri: str,
     index_records: list[dict[str, Any]],
     dense_vectors: dict[str, list[float]],
+    manifest_entries: dict[str, dict[str, Any]],
     ctx: RequestContext,
 ) -> None:
     for record in index_records:
@@ -314,13 +309,17 @@ async def restore_vector_snapshot(
         rel_path = record.get("path")
         if not isinstance(rel_path, str):
             continue
-        target_uri = join_uri(root_uri, rel_path)
-        if is_session_uri(target_uri):
+        manifest_entry = manifest_entries.get(rel_path)
+        if manifest_entry is None:
             continue
+        target_uri = manifest_entry_target_uri(root_uri, rel_path, manifest_entry)
+        if target_uri == "viking://user" or is_session_uri(target_uri):
+            continue
+        owner_ctx = content_owner_context_for_uri(target_uri, ctx)
         await _upsert_vector_snapshot_record(
             vector_store,
             target_uri,
             record,
             dense_vectors[record_id],
-            ctx,
+            owner_ctx,
         )

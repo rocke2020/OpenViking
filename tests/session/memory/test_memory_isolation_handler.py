@@ -6,12 +6,16 @@ Tests for MemoryIsolationHandler.
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from openviking.message.message import Message
 from openviking.message.part import TextPart
 from openviking.server.identity import RequestContext, Role
+from openviking.session.memory.dataclass import MemoryOperationSkipCode
 from openviking.session.memory.memory_isolation_handler import (
     MemoryIsolationHandler,
 )
+from openviking.session.memory.memory_updater import ExtractContext
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -79,6 +83,14 @@ class TestGetReadScope:
 
         assert scope.user_ids == ["user_a"]
         assert scope.peer_ids == []
+
+    def test_explicit_self_sentinel_message_is_not_a_writable_target(self):
+        ctx = create_ctx()
+        message = create_message("user", peer_id="__self")
+        extract_ctx = create_mock_extract_context([message])
+        handler = MemoryIsolationHandler(ctx, extract_ctx, allow_self=True)
+
+        assert handler._message_target_id(message) is None
 
     def test_deduplicate_users(self):
         """Test that duplicate users are deduplicated."""
@@ -288,6 +300,21 @@ class TestFillIdentityFields:
 
         assert item_dict["user_id"] == "user_a"
         assert item_dict["peer_id"] == "web-visitor-alice"
+
+    def test_invalid_peer_classification_does_not_change_identity_field_semantics(self):
+        ctx = create_ctx()
+        extract_ctx = create_mock_extract_context([create_message("user")])
+        handler = MemoryIsolationHandler(ctx, extract_ctx)
+        role_scope = handler.get_read_scope()
+
+        item_dict = {"peer_id": "web/visitor/alice"}
+        resolution_skip = handler._classify_identity_fields(item_dict)
+        result = handler.fill_identity_fields(item_dict, role_scope)
+
+        assert resolution_skip is not None
+        assert resolution_skip.reason_code == MemoryOperationSkipCode.INVALID_PEER_ID
+        assert result is None
+        assert item_dict == {"user_id": "user_a"}
 
 
 class TestPrepareMessages:
@@ -544,6 +571,301 @@ class TestCalculateMemoryUris:
         assert "peer_id" not in operation.memory_fields
 
     @patch("openviking.session.memory.memory_isolation_handler.generate_uri")
+    def test_ranges_without_user_fall_back_to_unique_user_peer(self, mock_generate_uri):
+        mock_generate_uri.side_effect = lambda **kwargs: (
+            f"viking://user/{kwargs.get('user_space')}/memories/events/demo"
+        )
+
+        ctx = create_ctx(user_id="support_bot")
+        messages = [
+            create_message("user", "peer event", peer_id="peer-a"),
+            create_message("assistant", "processed", peer_id="peer-a"),
+        ]
+        extract_ctx = create_mock_extract_context(messages)
+        mock_range = MagicMock()
+        mock_range.elements = [[messages[1]]]
+        extract_ctx.read_message_ranges.return_value = mock_range
+        handler = MemoryIsolationHandler(
+            ctx,
+            extract_ctx,
+            allow_self=False,
+            allowed_peer_ids={"peer-a"},
+        )
+
+        from openviking.session.memory.dataclass import MemoryTypeSchema, ResolvedOperation
+
+        schema = MemoryTypeSchema(
+            memory_type="events",
+            filename_template="demo.md",
+            directory="viking://user/{user_space}/memories/events",
+        )
+        operation = ResolvedOperation(
+            old_memory_file_content=None,
+            memory_fields={"event_name": "demo", "ranges": "1-1"},
+            memory_type="events",
+            uris=[],
+        )
+
+        uris = handler.calculate_memory_uris(schema, operation, extract_ctx)
+
+        assert uris == ["viking://user/support_bot/peers/peer-a/memories/events/demo"]
+        assert "peer_id" not in operation.memory_fields
+
+    @patch("openviking.session.memory.memory_isolation_handler.generate_uri")
+    def test_ranges_without_user_fall_back_to_unique_self(self, mock_generate_uri):
+        mock_generate_uri.side_effect = lambda **kwargs: (
+            f"viking://user/{kwargs.get('user_space')}/memories/events/demo"
+        )
+
+        ctx = create_ctx(user_id="support_bot")
+        messages = [
+            create_message("user", "self event"),
+            create_message("assistant", "processed", peer_id="assistant-peer"),
+        ]
+        extract_ctx = create_mock_extract_context(messages)
+        mock_range = MagicMock()
+        mock_range.elements = [[messages[1]]]
+        extract_ctx.read_message_ranges.return_value = mock_range
+        handler = MemoryIsolationHandler(
+            ctx,
+            extract_ctx,
+            allow_self=True,
+            allowed_peer_ids={"assistant-peer"},
+        )
+
+        from openviking.session.memory.dataclass import MemoryTypeSchema, ResolvedOperation
+
+        schema = MemoryTypeSchema(
+            memory_type="events",
+            filename_template="demo.md",
+            directory="viking://user/{user_space}/memories/events",
+        )
+        operation = ResolvedOperation(
+            old_memory_file_content=None,
+            memory_fields={"event_name": "demo", "ranges": "1-1"},
+            memory_type="events",
+            uris=[],
+        )
+
+        uris = handler.calculate_memory_uris(schema, operation, extract_ctx)
+
+        assert uris == ["viking://user/support_bot/memories/events/demo"]
+        assert "peer_id" not in operation.memory_fields
+
+    @patch("openviking.session.memory.memory_isolation_handler.generate_uri")
+    def test_ranges_with_unowned_assistant_fall_back_to_unique_user_peer(self, mock_generate_uri):
+        mock_generate_uri.side_effect = lambda **kwargs: (
+            f"viking://user/{kwargs.get('user_space')}/memories/events/demo"
+        )
+
+        ctx = create_ctx(user_id="support_bot")
+        messages = [
+            create_message("user", "peer event", peer_id="peer-a"),
+            create_message("assistant", "processed"),
+        ]
+        extract_ctx = create_mock_extract_context(messages)
+        mock_range = MagicMock()
+        mock_range.elements = [[messages[1]]]
+        extract_ctx.read_message_ranges.return_value = mock_range
+        handler = MemoryIsolationHandler(
+            ctx,
+            extract_ctx,
+            allow_self=True,
+            allowed_peer_ids={"peer-a"},
+        )
+
+        from openviking.session.memory.dataclass import MemoryTypeSchema, ResolvedOperation
+
+        schema = MemoryTypeSchema(
+            memory_type="events",
+            filename_template="demo.md",
+            directory="viking://user/{user_space}/memories/events",
+        )
+        operation = ResolvedOperation(
+            old_memory_file_content=None,
+            memory_fields={"event_name": "demo", "ranges": "1-1"},
+            memory_type="events",
+            uris=[],
+        )
+
+        uris = handler.calculate_memory_uris(schema, operation, extract_ctx)
+
+        assert uris == ["viking://user/support_bot/peers/peer-a/memories/events/demo"]
+        assert "peer_id" not in operation.memory_fields
+
+    @patch("openviking.session.memory.memory_isolation_handler.generate_uri")
+    def test_ranges_without_user_do_not_fallback_to_ambiguous_users(self, mock_generate_uri):
+        mock_generate_uri.side_effect = lambda **kwargs: (
+            f"viking://user/{kwargs.get('user_space')}/memories/events/demo"
+        )
+
+        ctx = create_ctx(user_id="support_bot")
+        messages = [
+            create_message("user", "event a", peer_id="peer-a"),
+            create_message("user", "event b", peer_id="peer-b"),
+            create_message("assistant", "processed", peer_id="peer-a"),
+        ]
+        extract_ctx = create_mock_extract_context(messages)
+        mock_range = MagicMock()
+        mock_range.elements = [[messages[2]]]
+        extract_ctx.read_message_ranges.return_value = mock_range
+        handler = MemoryIsolationHandler(
+            ctx,
+            extract_ctx,
+            allow_self=False,
+            allowed_peer_ids={"peer-a", "peer-b"},
+        )
+
+        from openviking.session.memory.dataclass import MemoryTypeSchema, ResolvedOperation
+
+        schema = MemoryTypeSchema(
+            memory_type="events",
+            filename_template="demo.md",
+            directory="viking://user/{user_space}/memories/events",
+        )
+        operation = ResolvedOperation(
+            old_memory_file_content=None,
+            memory_fields={"event_name": "demo", "ranges": "2-2"},
+            memory_type="events",
+            uris=[],
+        )
+
+        assert handler.calculate_memory_uris(schema, operation, extract_ctx) == []
+        mock_generate_uri.assert_not_called()
+
+    @patch("openviking.session.memory.memory_isolation_handler.generate_uri")
+    def test_ranges_without_user_ignore_assistant_only_peer(self, mock_generate_uri):
+        ctx = create_ctx(user_id="support_bot")
+        messages = [create_message("assistant", "processed", peer_id="peer-a")]
+        extract_ctx = create_mock_extract_context(messages)
+        mock_range = MagicMock()
+        mock_range.elements = [messages]
+        extract_ctx.read_message_ranges.return_value = mock_range
+        handler = MemoryIsolationHandler(
+            ctx,
+            extract_ctx,
+            allow_self=False,
+            allowed_peer_ids={"peer-a"},
+        )
+
+        from openviking.session.memory.dataclass import MemoryTypeSchema, ResolvedOperation
+
+        schema = MemoryTypeSchema(
+            memory_type="events",
+            filename_template="demo.md",
+            directory="viking://user/{user_space}/memories/events",
+        )
+        operation = ResolvedOperation(
+            old_memory_file_content=None,
+            memory_fields={"event_name": "demo", "ranges": "0-0"},
+            memory_type="events",
+            uris=[],
+        )
+
+        assert handler.calculate_memory_uris(schema, operation, extract_ctx) == []
+        mock_generate_uri.assert_not_called()
+
+    @patch("openviking.session.memory.memory_isolation_handler.generate_uri")
+    def test_unallowed_range_user_does_not_fallback_to_another_user(self, mock_generate_uri):
+        ctx = create_ctx(user_id="support_bot")
+        messages = [
+            create_message("user", "allowed event", peer_id="peer-a"),
+            create_message("user", "denied event", peer_id="peer-b"),
+        ]
+        extract_ctx = create_mock_extract_context(messages)
+        mock_range = MagicMock()
+        mock_range.elements = [[messages[1]]]
+        extract_ctx.read_message_ranges.return_value = mock_range
+        handler = MemoryIsolationHandler(
+            ctx,
+            extract_ctx,
+            allow_self=False,
+            allowed_peer_ids={"peer-a"},
+        )
+
+        from openviking.session.memory.dataclass import MemoryTypeSchema, ResolvedOperation
+
+        schema = MemoryTypeSchema(
+            memory_type="events",
+            filename_template="demo.md",
+            directory="viking://user/{user_space}/memories/events",
+        )
+        operation = ResolvedOperation(
+            old_memory_file_content=None,
+            memory_fields={"event_name": "demo", "ranges": "1-1"},
+            memory_type="events",
+            uris=[],
+        )
+
+        assert handler.calculate_memory_uris(schema, operation, extract_ctx) == []
+        mock_generate_uri.assert_not_called()
+
+    @patch("openviking.session.memory.memory_isolation_handler.generate_uri")
+    def test_invalid_ranges_do_not_fallback_to_all_messages(self, mock_generate_uri):
+        ctx = create_ctx(user_id="support_bot")
+        messages = [create_message("user", "peer event", peer_id="peer-a")]
+        extract_ctx = create_mock_extract_context(messages)
+        extract_ctx.read_message_ranges.side_effect = ValueError("invalid ranges")
+        handler = MemoryIsolationHandler(
+            ctx,
+            extract_ctx,
+            allow_self=False,
+            allowed_peer_ids={"peer-a"},
+        )
+
+        from openviking.session.memory.dataclass import MemoryTypeSchema, ResolvedOperation
+
+        schema = MemoryTypeSchema(
+            memory_type="events",
+            filename_template="demo.md",
+            directory="viking://user/{user_space}/memories/events",
+        )
+        operation = ResolvedOperation(
+            old_memory_file_content=None,
+            memory_fields={"event_name": "demo", "ranges": "invalid"},
+            memory_type="events",
+            uris=[],
+        )
+
+        assert handler.calculate_memory_uris(schema, operation, extract_ctx) == []
+        mock_generate_uri.assert_not_called()
+
+    @pytest.mark.parametrize("ranges", ["99", "0,99", " , "])
+    @patch("openviking.session.memory.memory_isolation_handler.generate_uri")
+    def test_invalid_real_ranges_do_not_fallback_to_conversation_owner(
+        self, mock_generate_uri, ranges
+    ):
+        ctx = create_ctx(user_id="support_bot")
+        messages = [
+            create_message("assistant", "processed", peer_id="peer-a"),
+            create_message("user", "peer event", peer_id="peer-a"),
+        ]
+        extract_ctx = ExtractContext(messages, split_long_text_messages=False)
+        handler = MemoryIsolationHandler(
+            ctx,
+            extract_ctx,
+            allow_self=False,
+            allowed_peer_ids={"peer-a"},
+        )
+
+        from openviking.session.memory.dataclass import MemoryTypeSchema, ResolvedOperation
+
+        schema = MemoryTypeSchema(
+            memory_type="events",
+            filename_template="demo.md",
+            directory="viking://user/{user_space}/memories/events",
+        )
+        operation = ResolvedOperation(
+            old_memory_file_content=None,
+            memory_fields={"event_name": "demo", "ranges": ranges},
+            memory_type="events",
+            uris=[],
+        )
+
+        assert handler.calculate_memory_uris(schema, operation, extract_ctx) == []
+        mock_generate_uri.assert_not_called()
+
+    @patch("openviking.session.memory.memory_isolation_handler.generate_uri")
     def test_calculate_memory_uris_unallowed_peer_id_does_not_fallback(self, mock_generate_uri):
         mock_generate_uri.side_effect = lambda **kwargs: (
             f"viking://user/{kwargs.get('user_space')}/memories/preferences"
@@ -578,8 +900,75 @@ class TestCalculateMemoryUris:
         uris = handler.calculate_memory_uris(schema, operation, extract_ctx)
 
         assert uris == []
+        assert operation.resolution_skip is not None
+        assert operation.resolution_skip.reason_code == MemoryOperationSkipCode.PEER_NOT_ALLOWED
         assert "peer_id" not in operation.memory_fields
         mock_generate_uri.assert_not_called()
+
+    def test_calculate_memory_uris_classifies_peer_policy_skip(self):
+        from openviking.session.memory.dataclass import MemoryTypeSchema, ResolvedOperation
+
+        ctx = create_ctx(user_id="support_bot")
+        extract_ctx = create_mock_extract_context(
+            [create_message("user", peer_id="web-visitor-alice")]
+        )
+        handler = MemoryIsolationHandler(
+            ctx,
+            extract_ctx,
+            allow_self=False,
+            allowed_peer_ids=set(),
+            peer_memory_enabled=False,
+        )
+        operation = ResolvedOperation(
+            old_memory_file_content=None,
+            memory_fields={"peer_id": "web-visitor-alice"},
+            memory_type="preferences",
+            uris=[],
+        )
+
+        uris = handler.calculate_memory_uris(
+            MemoryTypeSchema(
+                memory_type="preferences",
+                filename_template="preferences.md",
+                directory="viking://user/{user_space}/memories",
+            ),
+            operation,
+            extract_ctx,
+        )
+
+        assert uris == []
+        assert operation.resolution_skip is not None
+        assert operation.resolution_skip.reason_code == (
+            MemoryOperationSkipCode.PEER_MEMORY_DISABLED
+        )
+
+    def test_calculate_memory_uris_classifies_invalid_ranges(self):
+        from openviking.session.memory.dataclass import MemoryTypeSchema, ResolvedOperation
+
+        ctx = create_ctx(user_id="support_bot")
+        extract_ctx = create_mock_extract_context([create_message("user")])
+        handler = MemoryIsolationHandler(ctx, extract_ctx)
+        operation = ResolvedOperation(
+            old_memory_file_content=None,
+            memory_fields={"ranges": "10-20"},
+            memory_type="preferences",
+            uris=[],
+        )
+
+        uris = handler.calculate_memory_uris(
+            MemoryTypeSchema(
+                memory_type="preferences",
+                filename_template="preferences.md",
+                directory="viking://user/{user_space}/memories",
+            ),
+            operation,
+            extract_ctx,
+        )
+
+        assert uris == []
+        assert operation.resolution_skip is not None
+        assert operation.resolution_skip.reason_code == MemoryOperationSkipCode.INVALID_RANGES
+        extract_ctx.read_message_ranges.assert_called_once_with("10-20")
 
     @patch("openviking.session.memory.memory_isolation_handler.generate_uri")
     def test_calculate_memory_uris_missing_peer_id_prefers_self_when_allowed(
@@ -898,5 +1287,7 @@ class TestCalculateMemoryUris:
         uris = handler.calculate_memory_uris(schema, operation, extract_ctx)
 
         assert uris == []
+        assert operation.resolution_skip is not None
+        assert operation.resolution_skip.reason_code == MemoryOperationSkipCode.INVALID_PEER_ID
         assert "peer_id" not in operation.memory_fields
         mock_generate_uri.assert_not_called()

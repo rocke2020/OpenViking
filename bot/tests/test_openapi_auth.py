@@ -19,6 +19,7 @@ from vikingbot.channels.openapi_models import ChatRequest, ChatResponse
 from vikingbot.compile.models import CompileAccepted
 from vikingbot.config.schema import BotChannelConfig, SessionKey
 from vikingbot.session.manager import Session
+from vikingbot.utils.session_paths import portable_session_name
 
 
 @pytest.fixture
@@ -35,6 +36,7 @@ def message_bus():
 def _make_client(channel: OpenAPIChannel) -> TestClient:
     app = FastAPI()
     app.include_router(channel.get_router(), prefix="/bot/v1")
+    app.include_router(channel.get_gateway_router())
     return TestClient(app)
 
 
@@ -52,16 +54,20 @@ class _AsyncBytesStream(httpx.AsyncByteStream):
 
 
 class TestOpenAPIAuth:
-    def test_compile_routes_use_existing_principal_resolver(
-        self, message_bus, temp_workspace
-    ):
+    def test_compile_routes_use_existing_principal_resolver(self, message_bus, temp_workspace):
         class FakeCompileService:
             def __init__(self):
                 self.scope = None
+                self.idempotency_key = None
 
-            async def create_task(self, request, *, principal_scope):
+            async def create_task(self, request, *, principal_scope, task_id=None):
                 self.scope = principal_scope
-                return CompileAccepted(task_id="cmp_test", to=request.to)
+                self.idempotency_key = task_id
+                return CompileAccepted(
+                    session_id="cmp_test",
+                    task_id="cmp_test",
+                    to=request.to,
+                )
 
             async def get_task(self, task_id, *, principal_scope):
                 if task_id != "cmp_test" or principal_scope != self.scope:
@@ -74,6 +80,13 @@ class TestOpenAPIAuth:
                     "updated_at": "2026-07-20T00:00:01Z",
                 }
 
+            async def cancel_task(self, task_id, *, principal_scope):
+                task = await self.get_task(task_id, principal_scope=principal_scope)
+                if task is not None:
+                    task["status"] = "cancelled"
+                    task["stage"] = "cancelled"
+                return task
+
         service = FakeCompileService()
         channel = OpenAPIChannel(
             OpenAPIChannelConfig(),
@@ -82,18 +95,53 @@ class TestOpenAPIAuth:
             compile_service=service,
         )
         client = _make_client(channel)
-        created = client.post(
-            "/bot/v1/compile",
-            json={
+        request_body = {
+            "task_type": "compile",
+            "payload": {
                 "from": ["viking://resources/source"],
                 "to": "viking://resources/wiki",
                 "skill": "viking://agent/skills/wiki",
+                "instruction": "Keep supporting evidence.",
             },
+        }
+        unsupported = client.post(
+            "/runtime/v1/tasks",
+            json={**request_body, "task_type": "chat"},
+        )
+        assert unsupported.status_code == 422
+        invalid_payload = client.post(
+            "/runtime/v1/tasks",
+            json={**request_body, "payload": {**request_body["payload"], "skill": ""}},
+        )
+        assert invalid_payload.status_code == 422
+        assert service.scope is None
+        created = client.post(
+            "/runtime/v1/tasks",
+            headers={"Idempotency-Key": "cmp_test"},
+            json=request_body,
         )
         assert created.status_code == 202
+        assert created.json()["session_id"] == "cmp_test"
         assert created.json()["task_id"] == "cmp_test"
+        assert service.idempotency_key == "cmp_test"
         assert client.get("/bot/v1/compile/cmp_test").status_code == 200
         assert client.get("/bot/v1/compile/cmp_other").status_code == 404
+        status_response = client.post(
+            "/runtime/v1/tasks/status",
+            json={"session_id": "cmp_test"},
+        )
+        assert status_response.status_code == 200
+        assert status_response.json()["stage"] == "compile: agent"
+        cancelled = client.post("/bot/v1/compile/cmp_test/cancel")
+        assert cancelled.status_code == 200
+        assert cancelled.json()["status"] == "cancelled"
+        session_cancelled = client.post(
+            "/runtime/v1/tasks/cancel",
+            json={"session_id": "cmp_test"},
+        )
+        assert session_cancelled.status_code == 200
+        assert session_cancelled.json()["status"] == "cancelled"
+        assert client.post("/bot/v1/compile/cmp_other/cancel").status_code == 404
 
     def test_dev_compile_with_forwarded_connection_uses_same_principal_for_status(
         self, message_bus, temp_workspace, monkeypatch
@@ -103,10 +151,15 @@ class TestOpenAPIAuth:
                 self.scope = None
                 self.connection = "unset"
 
-            async def create_task(self, request, *, principal_scope):
+            async def create_task(self, request, *, principal_scope, task_id=None):
+                assert task_id is None
                 self.scope = principal_scope
                 self.connection = request.openviking_connection
-                return CompileAccepted(task_id="cmp_dev", to=request.to)
+                return CompileAccepted(
+                    session_id="cmp_dev",
+                    task_id="cmp_dev",
+                    to=request.to,
+                )
 
             async def get_task(self, task_id, *, principal_scope):
                 if task_id != "cmp_dev" or principal_scope != self.scope:
@@ -144,6 +197,7 @@ class TestOpenAPIAuth:
         monkeypatch.setattr(channel, "_assert_runtime_upstream_auth_mode", fake_runtime_probe)
         app = FastAPI()
         app.include_router(channel.get_router(), prefix="/bot/v1")
+        app.include_router(channel.get_gateway_router())
         client = TestClient(app, client=("127.0.0.1", 50000))
         headers = {
             "X-Gateway-Token": "gateway-secret",
@@ -153,21 +207,28 @@ class TestOpenAPIAuth:
         }
 
         created = client.post(
-            "/bot/v1/compile",
+            "/runtime/v1/tasks",
             headers=headers,
             json={
-                "from": ["viking://resources/source"],
-                "to": "viking://resources/wiki",
-                "skill": "viking://agent/skills/wiki",
-                "openviking_connection": {
-                    "api_key": "stale-dev-key",
-                    "account_id": "default",
-                    "user_id": "default",
-                    "server_url": "http://127.0.0.1:1933",
+                "task_type": "compile",
+                "payload": {
+                    "from": ["viking://resources/source"],
+                    "to": "viking://resources/wiki",
+                    "skill": "viking://agent/skills/wiki",
+                    "openviking_connection": {
+                        "api_key": "stale-dev-key",
+                        "account_id": "default",
+                        "user_id": "default",
+                        "server_url": "http://127.0.0.1:1933",
+                    },
                 },
             },
         )
-        status_response = client.get("/bot/v1/compile/cmp_dev", headers=headers)
+        status_response = client.post(
+            "/runtime/v1/tasks/status",
+            headers=headers,
+            json={"session_id": "cmp_dev"},
+        )
 
         assert created.status_code == 202
         assert status_response.status_code == 200
@@ -208,6 +269,20 @@ class TestOpenAPIAuth:
 
         assert response.status_code == 409
         assert message_bus.inbound_size == 0
+
+    def test_scoped_session_id_stays_logical_while_storage_path_is_portable(
+        self, message_bus, temp_workspace
+    ):
+        channel = OpenAPIChannel(OpenAPIChannelConfig(), message_bus, temp_workspace)
+        scope = channel._principal_scope("standalone")
+        storage_key = channel._scoped_session_id(scope, "order:123")
+        session_key = SessionKey(type="cli", channel_id="default", chat_id=storage_key)
+
+        assert storage_key == f"{scope}:order:123"
+        assert session_key.safe_name() == f"cli__default__{scope}:order:123"
+        assert channel._session_manager._get_session_path(session_key).name == (
+            f"{portable_session_name(session_key)}.jsonl"
+        )
 
     def test_delete_rotation_survives_restart_and_session_id_reuse(
         self, message_bus, temp_workspace
@@ -609,10 +684,6 @@ class TestOpenAPIAuth:
             "agent_id": "web-playground",
             "role": "user",
             "api_key_type": "user",
-            "namespace_policy": {
-                "isolate_user_scope_by_agent": False,
-                "isolate_agent_scope_by_user": False,
-            },
             "server_url": "http://ov.local",
             "actor_peer_id": "peer-a",
         }
@@ -1570,7 +1641,7 @@ class TestOpenAPIAuth:
 
         assert response.status_code == 200
 
-        session_path = temp_workspace / "sessions" / "cli__default__session-1.jsonl"
+        session_path = channel._session_manager._get_session_path(session_key)
         lines = session_path.read_text(encoding="utf-8").splitlines()
         metadata = json.loads(lines[0])
         messages = [json.loads(line) for line in lines[1:]]

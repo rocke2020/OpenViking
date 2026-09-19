@@ -108,6 +108,7 @@ class TelegramChannelConfig(BaseChannelConfig):
 
     type: ChannelType = ChannelType.TELEGRAM
     token: str = ""
+    groq_api_key: str = Field(default="", description="Groq API key for voice transcription")
     allow_from: list[str] = Field(default_factory=list)
     proxy: str | None = None
 
@@ -125,6 +126,10 @@ class FeishuChannelConfig(BaseChannelConfig):
     app_secret: str = ""
     encrypt_key: str = ""
     verification_token: str = ""
+    domain: str = Field(
+        default="https://open.feishu.cn",
+        description="开放平台域名：飞书用 https://open.feishu.cn，Lark 国际版用 https://open.larksuite.com",
+    )
     allow_from: list[str] = Field(default_factory=list)
     allow_cmd_from: list[str] = Field(default_factory=list)  ## 允许执行命令的Feishu用户ID列表
     thread_require_mention: bool = Field(
@@ -469,6 +474,11 @@ class AgentsConfig(BaseModel):
         default=True,
         description="Enable the spawn tool so the main agent can start background subagents.",
     )
+    subagent_max_concurrency: int = Field(
+        default=4,
+        ge=1,
+        description="Maximum number of background subagents running at once.",
+    )
     session_context_enabled: bool = True
     session_context_token_budget: int = 3000
     commit_token_threshold: int = 200000
@@ -534,26 +544,6 @@ class ProviderConfig(BaseModel):
     extra_headers: Optional[dict[str, str]] = Field(
         default_factory=dict
     )  # Custom headers (e.g. APP-Code for AiHubMix)
-
-
-class ProvidersConfig(BaseModel):
-    """Configuration for LLM providers."""
-
-    anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
-    openai: ProviderConfig = Field(default_factory=ProviderConfig)
-    openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
-    deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
-    groq: ProviderConfig = Field(default_factory=ProviderConfig)
-    zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
-    dashscope: ProviderConfig = Field(default_factory=ProviderConfig)  # 阿里云通义千问
-    vllm: ProviderConfig = Field(default_factory=ProviderConfig)
-    gemini: ProviderConfig = Field(default_factory=ProviderConfig)
-    moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
-    minimax: ProviderConfig = Field(default_factory=ProviderConfig)
-    volcengine: ProviderConfig = Field(
-        default_factory=ProviderConfig
-    )  # VolcEngine (火山引擎) API gateway
-    aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
 
 
 class HeartbeatConfig(BaseModel):
@@ -696,6 +686,12 @@ class WebToolsConfig(BaseModel):
     search: WebSearchConfig = Field(default_factory=WebSearchConfig)
 
 
+class CronConfig(BaseModel):
+    """Scheduled task tool and scheduler configuration."""
+
+    enabled: bool = False
+
+
 class ExecToolConfig(BaseModel):
     """Shell exec tool configuration."""
 
@@ -724,6 +720,7 @@ class ToolsConfig(BaseModel):
     """Tools configuration."""
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
+    cron: CronConfig = Field(default_factory=CronConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
@@ -763,7 +760,7 @@ class DirectBackendConfig(BaseModel):
     """Direct backend configuration."""
 
     restrict_to_workspace: bool = False  # If true, restrict file access to workspace directory
-    allow_compile_exec: bool = False
+    allow_compile_exec: bool = True
 
 
 class SrtBackendConfig(BaseModel):
@@ -846,6 +843,20 @@ class SandboxConfig(BaseModel):
     restrict_workspaces: dict[str, str] = Field(default_factory=dict)
 
 
+class RemoteSkillsConfig(BaseModel):
+    """OpenViking-backed Skill runtime configuration."""
+
+    discovery_limit: int = Field(default=8, ge=1, le=50)
+    score_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
+    discovery_timeout_seconds: float = Field(default=2.0, gt=0.0, le=30.0)
+    max_files: int = Field(default=128, ge=1)
+    max_file_bytes: int = Field(default=8 * 1024 * 1024, ge=1)
+    max_total_bytes: int = Field(default=32 * 1024 * 1024, ge=1)
+    cache_idle_ttl_seconds: float = Field(default=10 * 60, gt=0.0)
+    cache_max_entries: int = Field(default=32, ge=1)
+    cache_max_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
+
+
 class Config(BaseSettings):
     """Root configuration for vikingbot."""
 
@@ -854,12 +865,10 @@ class Config(BaseSettings):
     inherits_root_vlm_state: SkipJsonSchema[bool] = Field(default=False, repr=False)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: list[Any] = Field(default_factory=list)
-    providers: ProvidersConfig = Field(
-        default_factory=ProvidersConfig, deprecated=True
-    )  # Deprecated: Use ov.conf vlm config instead
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     ov_server: OpenVikingConfig = Field(default_factory=OpenVikingConfig)
+    remote_skills: RemoteSkillsConfig = Field(default_factory=RemoteSkillsConfig)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
     langfuse: LangfuseConfig = Field(default_factory=LangfuseConfig)
@@ -1055,7 +1064,9 @@ class SessionKey(BaseModel):
 
     @staticmethod
     def from_safe_name(safe_name: str):
-        file_name_split = safe_name.split("__")
+        file_name_split = safe_name.split("__", 2)
+        if len(file_name_split) != 3:
+            raise ValueError(f"Invalid session key: {safe_name!r}")
         return SessionKey(
             type=file_name_split[0], channel_id=file_name_split[1], chat_id=file_name_split[2]
         )

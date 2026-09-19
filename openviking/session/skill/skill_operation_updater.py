@@ -14,6 +14,7 @@ from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import ResolvedOperation, ResolvedOperations
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking.session.memory.merge_op import MergeOpFactory
+from openviking.storage.abstract_overview import body_for_preview
 from openviking.storage.content_write import ContentWriteCoordinator
 from openviking.storage.viking_fs import VikingFS, get_viking_fs
 from openviking.utils.skill_processor import SkillProcessor
@@ -60,6 +61,8 @@ class SkillOperationUpdater:
         self,
         operations: ResolvedOperations,
         ctx: RequestContext,
+        *,
+        transaction_handle: Any = None,
     ) -> SkillOperationUpdateResult:
         result = SkillOperationUpdateResult()
         if not self._viking_fs:
@@ -72,7 +75,9 @@ class SkillOperationUpdater:
 
         for operation in operations.upsert_operations:
             try:
-                op_result = await self._apply_upsert(operation, ctx)
+                op_result = await self._apply_upsert(
+                    operation, ctx, transaction_handle=transaction_handle
+                )
                 result.add_result(op_result)
                 if op_result.get("action") == "create":
                     result.add_written(op_result["skill_md_uri"])
@@ -89,6 +94,8 @@ class SkillOperationUpdater:
         self,
         operation: ResolvedOperation,
         ctx: RequestContext,
+        *,
+        transaction_handle: Any = None,
     ) -> Dict[str, Any]:
         if not operation.uris:
             raise ValueError("Session skill operation does not have a target URI")
@@ -104,6 +111,7 @@ class SkillOperationUpdater:
                 viking_fs=self._viking_fs,
                 ctx=ctx,
                 allow_local_path_resolution=False,
+                lease_ref=transaction_handle,
             )
             created_root_uri = (
                 processor_result.get("root_uri") or processor_result.get("uri") or root_uri
@@ -213,7 +221,7 @@ class SkillOperationUpdater:
             )
         except (FileNotFoundError, NotFoundError):
             return None
-        parsed = yaml.safe_load(abstract)
+        parsed = yaml.safe_load(body_for_preview(abstract))
         return parsed if isinstance(parsed, dict) else None
 
     @staticmethod

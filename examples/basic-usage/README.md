@@ -104,35 +104,33 @@ Add a URL, local file, or directory:
 ```python
 result = client.add_resource(
     path="https://example.com/docs",
-    wait=False,
 )
 
 result = client.add_resource(path="/path/to/manual.pdf")
 
 result = client.add_resource(
     path="/path/to/repo",
-    instruction="This is a Python web application",
+    options={"instruction": "This is a Python web application"},
 )
 ```
 
-For scripts and demos, `wait=True` is fine. In long-running applications, it is often better to ingest
-asynchronously and call `wait_processed()` when you actually need the indexed result.
+Imports return a `task_id` by default. Query `client.get_task(result["task_id"])` and read summaries or search the imported content only after the task reaches `completed`. See [Background Tasks](../../docs/en/api/17-tasks.md) for polling examples.
 
 ### Filesystem Access
 
 OpenViking organizes context as a virtual filesystem:
 
 ```python
-files = client.ls("viking://resources/")
-tree = client.tree("viking://resources/my-project", level_limit=3)
-content = client.read("viking://resources/my-project/README.md")
+files = client.ls(uri="viking://resources/")
+tree = client.tree(uri="viking://resources/my-project", level_limit=3)
+content = client.read(uri="viking://resources/my-project/README.md")
 ```
 
 This same URI model applies to memories and skills as well:
 
 - `viking://resources/`
-- `viking://user/memories/`
-- `viking://user/skills/`
+- `viking://~/memories/`
+- `viking://~/skills/`
 
 ### Retrieval
 
@@ -141,14 +139,12 @@ Use `find` for fast semantic search and `search` for more advanced retrieval:
 ```python
 results = client.find(
     query="how does authentication work",
-    target_uri="viking://resources/my-project",
-    limit=5,
+    options={"target_uri": "viking://resources/my-project", "limit": 5},
 )
 
 results = client.search(
     query="database configuration and failure handling",
-    target_uri="viking://resources/",
-    limit=10,
+    options={"target_uri": "viking://resources/", "limit": 10},
 )
 ```
 
@@ -157,15 +153,19 @@ Use tiered loading after retrieval:
 ```python
 uri = "viking://resources/my-project/docs/api.md"
 
-abstract = client.abstract(uri)
-overview = client.overview(uri)
-content = client.read(uri)
+abstract = client.abstract(uri=uri)
+overview = client.overview(uri=uri)
+content = client.read(uri=uri)
 ```
 
 Use `grep` when you need literal text matching instead of semantic retrieval:
 
 ```python
-result = client.grep("viking://resources/my-project", "Agent", case_insensitive=True)
+result = client.grep(
+    uri="viking://resources/my-project",
+    pattern="Agent",
+    case_insensitive=True,
+)
 matches = result.get("matches", [])
 ```
 
@@ -177,14 +177,22 @@ The example script creates a session and appends messages:
 session_info = client.create_session()
 session_id = session_info["session_id"]
 
-client.add_message(session_id, "user", "I prefer TypeScript over JavaScript")
-client.add_message(session_id, "assistant", "Understood. I will use TypeScript where appropriate.")
+client.add_message(
+    session_id=session_id,
+    role="user",
+    content="I prefer TypeScript over JavaScript",
+)
+client.add_message(
+    session_id=session_id,
+    role="assistant",
+    content="Understood. I will use TypeScript where appropriate.",
+)
 ```
 
 To extract durable memories from that conversation, commit the session:
 
 ```python
-client.commit_session(session_id)
+client.commit_session(session_id=session_id)
 ```
 
 After commit, you can retrieve those memories through normal search APIs:
@@ -192,7 +200,7 @@ After commit, you can retrieve those memories through normal search APIs:
 ```python
 memories = client.find(
     query="user programming preferences",
-    target_uri="viking://user/memories/",
+    target_uri="viking://~/memories/",
 )
 ```
 
@@ -240,7 +248,7 @@ You can also use Volcengine or Azure OpenAI. For current provider-specific examp
 | `ImportError` or local extension issues | Reinstall `openviking`; if developing from source, ensure local build dependencies are available. |
 | `Connection refused` in HTTP mode | Start `openviking-server` and verify `http://localhost:1933/health`. |
 | Tenant/auth errors | Prefer `user_key` for normal data APIs; use `root_key` only with explicit tenant headers. |
-| Slow or empty search results right after ingestion | Wait for `wait_processed()` or ingest with `wait=True`. |
+| Slow or empty search results right after ingestion | Query the import task by `task_id` and search after its status reaches `completed`. |
 | Multiple clients or sessions competing for local storage | Use HTTP server mode instead of spinning up separate local processes. |
 
 ## License

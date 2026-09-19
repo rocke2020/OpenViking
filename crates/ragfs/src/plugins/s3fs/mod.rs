@@ -28,6 +28,7 @@ use futures::stream::{self, StreamExt};
 use regex::Regex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::core::context::FsContextView;
 use crate::core::filesystem::{relative_depth, relative_match_file, sort_directory_entries};
 use crate::core::glob::PreparedGlob;
 use crate::core::{
@@ -282,12 +283,16 @@ impl S3FileSystem {
                 page_offset: 0,
                 last_rel_parts: Vec::new(),
             }),
-            Some(raw) if raw.is_empty() => Err(Error::invalid_operation("empty continuation token")),
+            Some(raw) if raw.is_empty() => {
+                Err(Error::invalid_operation("empty continuation token"))
+            }
             Some(raw) => {
                 let state: S3GlobToken = serde_json::from_str(raw)
                     .map_err(|_| Error::invalid_operation("invalid continuation token"))?;
                 if state.scope != scope {
-                    return Err(Error::invalid_operation("continuation token scope mismatch"));
+                    return Err(Error::invalid_operation(
+                        "continuation token scope mismatch",
+                    ));
                 }
                 Ok(state)
             }
@@ -353,7 +358,6 @@ impl S3FileSystem {
 
         Ok((matched, next_last_rel_parts))
     }
-
 
     /// Get file name from path
     fn file_name(path: &str) -> String {
@@ -598,7 +602,9 @@ impl FileSystem for S3FileSystem {
 
         match flags {
             WriteFlag::CreateNew => {
-                self.client.put_object_create_new(&key, data.to_vec()).await?;
+                self.client
+                    .put_object_create_new(&key, data.to_vec())
+                    .await?;
             }
             _ => {
                 // S3 always replaces the full object for non-exclusive writes.
@@ -655,12 +661,21 @@ impl FileSystem for S3FileSystem {
         Ok(changed)
     }
 
-    async fn read_dir(&self, path: &str) -> Result<Vec<FileInfo>> {
+    async fn read_dir(
+        &self,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+        sort_by: Option<crate::core::ListSortBy>,
+        sort_order: Option<crate::core::SortOrder>,
+    ) -> Result<Vec<FileInfo>> {
         let normalized = Self::normalize_path(path);
 
         // Check cache
         if let Some(files) = self.dir_cache.get(&normalized).await {
-            return Ok(files);
+            return Ok(crate::core::filesystem::apply_read_dir_options(
+                files, offset, limit, sort_by, sort_order,
+            ));
         }
 
         // Build prefix for listing
@@ -719,7 +734,9 @@ impl FileSystem for S3FileSystem {
         // Cache
         self.dir_cache.put(normalized.clone(), files.clone()).await;
 
-        Ok(files)
+        Ok(crate::core::filesystem::apply_read_dir_options(
+            files, offset, limit, sort_by, sort_order,
+        ))
     }
 
     async fn stat(&self, path: &str) -> Result<FileInfo> {
@@ -736,9 +753,16 @@ impl FileSystem for S3FileSystem {
             });
         }
 
+        // Bypass the stat cache when the caller demands fresh backend metadata
+        // (e.g. read replicas polling the API-key store for writer-side changes).
+        // The sliding-TTL cache would otherwise pin stale size/modTime forever.
+        let bypass_cache = FsContextView::current().bypass_cache();
+
         // Check stat cache
-        if let Some(cached) = self.stat_cache.get(&normalized).await {
-            return cached.ok_or_else(|| Error::not_found(&normalized));
+        if !bypass_cache {
+            if let Some(cached) = self.stat_cache.get(&normalized).await {
+                return cached.ok_or_else(|| Error::not_found(&normalized));
+            }
         }
 
         let key = self.client.build_key(&normalized);
@@ -848,7 +872,6 @@ impl FileSystem for S3FileSystem {
 
         Err(Error::not_found(&old_normalized))
     }
-
 
     async fn replace(&self, src_path: &str, dst_path: &str) -> Result<()> {
         let src_normalized = Self::normalize_path(src_path);
@@ -1003,8 +1026,29 @@ impl FileSystem for S3FileSystem {
         show_hidden: bool,
         node_limit: Option<usize>,
         level_limit: Option<usize>,
+        offset: Option<usize>,
+        sort_by: Option<crate::core::ListSortBy>,
+        sort_order: Option<crate::core::SortOrder>,
     ) -> Result<Vec<TreeEntry>> {
         let normalized = Self::normalize_path(path);
+        if sort_by.is_some() {
+            let mut result = Vec::new();
+            let traversal_limit = node_limit.map(|limit| offset.unwrap_or(0).saturating_add(limit));
+            self.tree_directory_internal(
+                &normalized,
+                &normalized,
+                show_hidden,
+                traversal_limit,
+                level_limit,
+                sort_by,
+                sort_order,
+                &mut result,
+            )
+            .await?;
+            return Ok(crate::core::filesystem::paginate_entries(
+                result, offset, node_limit,
+            ));
+        }
 
         let prefix = if normalized == "/" {
             self.client.build_key("")
@@ -1022,15 +1066,9 @@ impl FileSystem for S3FileSystem {
             |key| self.client.strip_prefix(key),
         )?;
 
-        let mut result = Vec::new();
-        for entry in ordered {
-            if node_limit.is_some_and(|limit| result.len() >= limit) {
-                break;
-            }
-            result.push(entry);
-        }
-
-        Ok(result)
+        Ok(crate::core::filesystem::paginate_entries(
+            ordered, offset, node_limit,
+        ))
     }
 
     async fn glob_directory(

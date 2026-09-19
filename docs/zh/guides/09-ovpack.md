@@ -7,6 +7,8 @@ OVPack 不是裸 ZIP 拷贝，也不是可信发布格式。导入会校验 mani
 checksum，保证包内容没有偏离 manifest；如果攻击者能同时篡改文件和 manifest，仍需要依赖
 外部签名、传输安全和访问控制。
 
+存储加密不会加密导出的备份包。导出会经过透明解密层读取文件，再把明文内容写入普通 ZIP 归档。应独立保护 `.ovpack` 文件的存储和传输；拿到归档即可读取内容，无需源存储的密钥。
+
 ## 支持范围
 
 普通 `export/import` 处理一个包根：
@@ -17,7 +19,10 @@ checksum，保证包内容没有偏离 manifest；如果攻击者能同时篡改
 全量迁移使用单独的 `backup/restore`，它会把公开 scope root 一起打进备份包：
 
 - `viking://resources`
-- `viking://user`
+- 当前账号下所有 `viking://user/{user_id}` 内容
+
+`backup/restore` 仅允许 ROOT 或 ADMIN 调用，并以账号为边界访问所有用户内容。备份包不包含
+用户账号、API Key 或其他鉴权数据。
 
 Session 通过 user 命名空间一起迁移，路径为
 `viking://user/{user_id}/sessions/{session_id}`。`viking://session/...`
@@ -28,15 +33,22 @@ Session 通过 user 命名空间一起迁移，路径为
 
 ## 与多写存储配合
 
-多写存储只复制启用之后的新写入，不会自动同步启用之前已经存在的历史文件。将已有环境迁移到多写模式时，建议先用 OVPack 完成存量数据迁移，再开启 `storage.agfs.backups`。
+多写存储只复制启用之后的新写入，不会自动同步启用之前已经存在的历史文件。如需同时为 primary 和副本写入存量，应在**空目标环境恢复之前**启用多写：
 
-推荐流程：
+1. 暂停业务写入，按源 account 分别导出或备份。
+2. 配置目标 primary、backup backend 及其写策略，启动目标服务并创建恢复身份。
+3. 通过该服务恢复或导入，使存量内容经过已配置的多写分发。
+4. 对每个恢复的 scope 检查同步状态，并在切流前验证各副本中的文件。恢复返回时，异步复制仍可能未完成。
+5. 验证内容和索引完整性后再恢复业务写入；验证完成前保留源数据和备份。
 
-1. 使用 `ov backup` 或 `ov export` 导出现有内容。
-2. 在目标存储环境恢复或导入数据。
-3. 校验目标环境内容和索引状态。
-4. 配置并启用多写存储。
-5. 恢复正常写入，让后续增量由多写机制复制。
+例如，使用目标 account 的 admin key 检查：
+
+```bash
+ov system backend sync-status viking://resources
+ov system backend sync-status viking://user
+```
+
+先恢复再启用 backups 只会复制后续写入，不能把历史内容补到副本。
 
 更多说明见 [多写存储指南](./13-multi-write-storage.md)。
 
@@ -104,7 +116,7 @@ ov system consistency viking://resources/my-project
 Python SDK：
 
 ```python
-report = await client.check_consistency("viking://resources/my-project")
+report = await client.check_consistency(uri="viking://resources/my-project")
 print(report["ok"], report["missing_records"])
 ```
 
@@ -138,6 +150,38 @@ ov restore ./backups/openviking.ovpack --on-conflict overwrite
 
 备份包只能通过 `restore` 恢复，不能通过普通 `import` 导入到任意父目录。
 
+备份是在线逐文件读取，不是同一时刻的原子快照。备份期间仍在变化的内容可能来自不同时间点；
+需要严格一致性时，应由使用方在备份窗口暂停写入。
+
+API Key 模式下，新目标必须在恢复**之前**具备 account 和管理员身份。root key 可以创建这个身份，但不能调用租户级 pack API。先将 `OPENVIKING_ROOT_API_KEY` 设置为目标 root key，再调用目标服务创建 account，并选择一个不在备份包中的用户 ID 作为恢复操作用户：
+
+```bash
+curl -f -X POST http://localhost:1933/api/v1/admin/accounts \
+  -H "X-API-Key: $OPENVIKING_ROOT_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"account_id": "acme", "admin_user_id": "restore-operator"}'
+```
+
+把返回的 `user_key` 作为 `api_key` 写入专用的目标客户端配置，例如 `restore.ovcli.conf`：
+
+```json
+{
+  "url": "http://localhost:1933",
+  "api_key": "<target-admin-user-key>"
+}
+```
+
+创建 account 已会生成 scope 目录。因此，即使新 account 还没有业务数据，`fail` 也会拒绝恢复；使用不同的恢复操作用户不能避开这个 scope 级检查。确认目标**只有新建 account 的预置内容**后，再使用 `overwrite`：
+
+```bash
+OPENVIKING_CLI_CONFIG_FILE=./restore.ovcli.conf \
+  ov restore ./backups/openviking.ovpack --on-conflict overwrite
+```
+
+如果目标 account 已存在，使用它的 admin key，不要重复创建。如果其中已有业务数据，不要直接照抄这条恢复命令：先暂停写入、备份目标，并比对包内路径和目标内容，明确允许覆盖的内容，或使用独立的干净目标。`overwrite` 会替换同路径内容；文件与目录的类型冲突可能删除已有子树。`fail` 检查 scope 根是否存在，不是逐文件冲突预检；`skip` 在 scope 已存在时跳过整次恢复。每次备份/恢复均以 account 为边界；其他 account 需要使用对应身份分别处理。
+
+恢复内容后，再按备份中的相同 `user_id` 注册其余用户。用户目录已存在不代表用户账号已创建。目标会生成新 API Key，不会恢复源 key；切换客户端前，应使用各目标用户的 key 验证读取。
+
 ## Python SDK
 
 ```python
@@ -169,9 +213,12 @@ async def migrate_project():
 全量备份：
 
 ```python
-await client.backup_ovpack("./backups/openviking.ovpack", include_vectors=True)
+await client.backup_ovpack(
+    to="./backups/openviking.ovpack",
+    include_vectors=True,
+)
 await client.restore_ovpack(
-    "./backups/openviking.ovpack",
+    file_path="./backups/openviking.ovpack",
     on_conflict="overwrite",
     vector_mode="auto",
 )
@@ -289,6 +336,16 @@ curl -X POST http://localhost:1933/api/v1/pack/backup \
 
 `skip` 是 root 级跳过，不是文件级补齐导入。
 
+文件和目录类型冲突是合并覆盖的例外：如果包内文件替换目标目录（或反向替换），恢复会先删除冲突目标；该目录已有的后代也会被删除。
+
+上表描述普通 `import`。全量 `restore` 的 `overwrite` 使用合并覆盖：包内不存在的目标路径会
+创建，同路径内容会覆盖，目标环境中仅有而备份中没有的路径会保留。恢复不会删除整个
+`viking://resources` 或 `viking://user`，也不会创建或写入 `viking://user` 聚合目录本身。
+向量只恢复或重建包内新增、覆盖的内容，目标环境独有内容的向量保持不变。
+
+无论使用哪种冲突策略，都会先完整校验 manifest、文件、checksum 和向量元数据。损坏的包
+即使使用 `skip` 也会报错，不会返回成功。
+
 ## 包结构
 
 OVPack v3 是标准 ZIP。ZIP 内部有一个包根目录：
@@ -388,6 +445,8 @@ type, context_type, level, name, description, tags, abstract
 id, uri, account_id, owner_user_id, owner_space,
 created_at, updated_at, active_count
 ```
+
+用户归属从 `viking://user/{user_id}` 路径重建；用户账号和 API Key 不属于 OVPack 内容。
 
 如果使用 `--include-vectors`，会额外导出纯 dense 向量和 embedding 元数据。导入时即使恢复
 dense 快照，也会按目标 URI、目标账号和当前时间重建运行态字段。hybrid index 当前不支持

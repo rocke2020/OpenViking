@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
 # OpenViking Memory Plugin shared installer for Claude Code, Codex, Cursor,
-# TRAE / TRAE CN, ZCode, OpenCode, and pi.
+# TRAE / TRAE CN, TraeCode CLI 2.0, ZCode, OpenCode, and pi.
 #
 # One-liner (GitHub):
 #   bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh)
 # One-liner (TOS mirror, for regions where GitHub is unreachable):
 #   bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) --dist tos
 # Non-interactive:
-#   bash install.sh --harness claude,codex,cursor,trae,trae-cn,zcode,opencode,pi --dist github --lang en --url http://127.0.0.1:1933 --api-key ''
+#   bash install.sh --harness claude,codex,cursor,trae,trae-cn,trae-cli,zcode,opencode,pi,dsh --dist github --lang en --url http://127.0.0.1:1933
 # Format-compatible CLI aliases:
-#   bash install.sh --harness codex --codex-bin codex,traex
+#   bash install.sh --harness trae-cli
 #   bash install.sh --harness claude --claude-bin claude,seed
 # Fork / branch verification:
 #   OPENVIKING_REPO_URL=https://github.com/you/OpenViking.git \
@@ -61,13 +61,8 @@ OVCLI_CONF="${OPENVIKING_CLI_CONFIG_FILE:-$OV_HOME/ovcli.conf}"
 # (openviking-memory@openviking) and its per-id config stable across modes.
 MARKETPLACE_NAME="${OPENVIKING_MARKETPLACE_NAME:-openviking}"
 PLUGIN_NAME="openviking-memory"
+DSH_PACKAGE="@openviking/dsh-memory-plugin"
 PLUGIN_ID="${PLUGIN_NAME}@${MARKETPLACE_NAME}"
-
-# Pre-unification names, cleaned up on upgrade.
-OLD_MARKETPLACE_NAME='openviking-plugins-local'
-CC_OLD_IDS="claude-code-memory-plugin@${OLD_MARKETPLACE_NAME} ${PLUGIN_NAME}@${OLD_MARKETPLACE_NAME}"
-CODEX_OLD_ID="${PLUGIN_NAME}@${OLD_MARKETPLACE_NAME}"
-CODEX_OLD_MARKETPLACE_ROOT="$HOME/.codex/${OLD_MARKETPLACE_NAME}-marketplace"
 
 CODEX_CONFIG="${CODEX_CONFIG_FILE:-$HOME/.codex/config.toml}"
 CC_SETTINGS="$HOME/.claude/settings.json"
@@ -79,8 +74,13 @@ CC_REMOTE_MKT_DIR="$OV_HOME/marketplaces/openviking-claude"
 CC_REMOTE_MANIFEST="$CC_REMOTE_MKT_DIR/.claude-plugin/marketplace.json"
 
 REQUESTED_HARNESSES=""
+PUBLIC_SELECTED_HARNESSES=""
+TRAECODE_CLI_BIN=""
 CLAUDE_BINS_ARG="${OPENVIKING_CLAUDE_BINS:-${OPENVIKING_CLAUDE_BIN:-}}"
 CODEX_BINS_ARG="${OPENVIKING_CODEX_BINS:-${OPENVIKING_CODEX_BIN:-}}"
+DSH_PROFILE_ARG="${OPENVIKING_DSH_PROFILE:-}"
+DSH_PROFILE_DEFAULT="web"
+DSH_PROFILE=""
 SOURCE_ARG=""
 DIST_ARG=""
 LANG_ARG=""
@@ -122,7 +122,7 @@ report_unexpected_error() { # report_unexpected_error <status> <line> <command>
   if [ "${BASH_SUBSHELL:-0}" -gt 0 ]; then
     return "$status"
   fi
-  printf '\033[?25h' >/dev/tty 2>/dev/null || true
+  printf '\033[?25h' 2>/dev/null >/dev/tty || true
   printf '\n' >&2
   err "$(t 'OpenViking installer stopped unexpectedly.' 'OpenViking 安装程序意外退出。')"
   printf '    %s: %s\n' "$(t 'Exit status' '状态码')" "$status" >&2
@@ -143,9 +143,11 @@ usage() {
 Usage: install.sh [options]
 
 Options:
-  --harness LIST     Comma-separated harnesses: claude, codex, cursor, trae, trae-cn, zcode, opencode, pi.
+  --harness LIST     Comma-separated harnesses: claude, codex, cursor, trae, trae-cn, trae-cli, zcode, opencode, pi, dsh.
+                     Use trae-cli for TraeCode CLI 2.0 (installed through its Codex-compatible plugin format).
   --claude-bin LIST  Comma-separated Claude-format CLI commands (default: claude).
   --codex-bin LIST   Comma-separated Codex-format CLI commands (default: codex).
+  --dsh-profile NAME DeepSeek Harness profile to install into (default: web).
   --dist CHANNEL     github (default) | tos (mirror for GitHub-blocked regions).
   --lang LANG        en | zh (interactive prompts language; auto-detected).
   --source MODE      Advanced: remote | archive | dev (default: auto-detect).
@@ -155,7 +157,9 @@ Options:
   --user ID          Optional OpenViking user.
   --statusline       Register the Claude Code statusline without asking.
   --no-statusline    Skip the statusline prompt.
-  --uninstall        Remove Cursor/TRAE OpenViking integration files and config.
+  --uninstall        Remove Cursor/TRAE/TRAE CN/ZCode integration files and config,
+                     plus any legacy TraeCode CLI hook config.
+                     For Codex-format plugins, use the client's plugin uninstall command.
   --yes, -y          Use defaults for prompts when possible.
 EOF
 }
@@ -165,6 +169,7 @@ while [ "$#" -gt 0 ]; do
     --harness) REQUESTED_HARNESSES="${2:-}"; shift 2 ;;
     --claude-bin|--claude-bins) CLAUDE_BINS_ARG="${2:-}"; shift 2 ;;
     --codex-bin|--codex-bins) CODEX_BINS_ARG="${2:-}"; shift 2 ;;
+    --dsh-profile) DSH_PROFILE_ARG="${2:-}"; shift 2 ;;
     --dist) DIST_ARG="${2:-}"; shift 2 ;;
     --lang) LANG_ARG="${2:-}"; shift 2 ;;
     --source) SOURCE_ARG="${2:-}"; shift 2 ;;
@@ -244,7 +249,7 @@ tui_menu() { # tui_menu <title> <default-index> <option...>  -> TUI_MENU_CHOICE
       fi
       i=$((i + 1))
     done
-    printf '\r\033[K   %s%s%s\n' "$CYAN" "$(t '↑/↓ move · 1-9 jump · enter confirm' '↑/↓ 移动 · 数字直选 · 回车确认')" "$RESET" >/dev/tty
+    printf '\r\033[K   %s%s%s\n' "$CYAN" "$(t '↑/↓ move · 1-9 jump · enter confirm' '↑/↓ 移动 · 数字跳转 · 回车确认')" "$RESET" >/dev/tty
     lines=$((n + 1))
     IFS= read -rsn1 key <&3 || key=""
     case "$key" in
@@ -259,9 +264,11 @@ tui_menu() { # tui_menu <title> <default-index> <option...>  -> TUI_MENU_CHOICE
       k) cursor=$(( (cursor + n - 1) % n )) ;;
       j) cursor=$(( (cursor + 1) % n )) ;;
       [1-9])
+        # Jump only. Confirming on the digit leaves the Enter most users press
+        # right after it in the tty buffer, where the next prompt reads it as
+        # an empty answer.
         if [ "$key" -le "$n" ]; then
           cursor=$((key - 1))
-          break
         fi
         ;;
       ''|$'\n'|$'\r') break ;;
@@ -306,14 +313,20 @@ select_language() {
 split_harnesses() {
   printf '%s\n' "$1" | tr ',' '\n' | while IFS= read -r h; do
     h=$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-    [ -n "$h" ] && printf '%s\n' "$h"
+    if [ -n "$h" ]; then
+      printf '%s\n' "$h"
+    fi
   done
 }
 
 split_csv_list() {
   printf '%s\n' "$1" | tr ',' '\n' | while IFS= read -r item; do
     item=$(printf '%s' "$item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-    [ -n "$item" ] && printf '%s\n' "$item"
+    # An `&& ...` here would make an empty last element the loop's -- and so the
+    # function's -- exit status, which `set -e` turns into an abort at the call.
+    if [ -n "$item" ]; then
+      printf '%s\n' "$item"
+    fi
   done
 }
 
@@ -369,16 +382,73 @@ EOF
 }
 
 refresh_available_harnesses() {
-  HAVE_CLAUDE=0; HAVE_CODEX=0; HAVE_CURSOR=0; HAVE_TRAE=0; HAVE_TRAE_CN=0; HAVE_OPENCODE=0; HAVE_PI=0; HAVE_ZCODE=0
+  HAVE_CLAUDE=0; HAVE_CODEX=0; HAVE_CURSOR=0; HAVE_TRAE=0; HAVE_TRAE_CN=0; HAVE_TRAE_CLI=0; HAVE_OPENCODE=0; HAVE_PI=0; HAVE_ZCODE=0; HAVE_DSH=0
   has_available_bin "$CLAUDE_BINS" && HAVE_CLAUDE=1
   has_available_bin "$CODEX_BINS" && HAVE_CODEX=1
   { command -v cursor >/dev/null 2>&1 || command -v cursor-agent >/dev/null 2>&1 || [ -d "/Applications/Cursor.app" ] || [ -d "$HOME/.cursor" ]; } && HAVE_CURSOR=1
   { [ -d "/Applications/Trae.app" ] || [ -d "/Applications/TRAE.app" ] || [ -d "$HOME/.trae" ]; } && HAVE_TRAE=1
   { [ -d "/Applications/Trae CN.app" ] || [ -d "/Applications/TRAE SOLO CN.app" ] || [ -d "$HOME/.trae-cn" ]; } && HAVE_TRAE_CN=1
+  { command -v trae-cli >/dev/null 2>&1 || command -v traecli >/dev/null 2>&1 || command -v traex >/dev/null 2>&1; } && HAVE_TRAE_CLI=1
   command -v opencode >/dev/null 2>&1 && HAVE_OPENCODE=1
   command -v pi >/dev/null 2>&1 && HAVE_PI=1
+  command -v dsh >/dev/null 2>&1 && HAVE_DSH=1
   { command -v zcode >/dev/null 2>&1 || [ -d "$HOME/.zcode" ]; } && HAVE_ZCODE=1
   return 0
+}
+
+resolve_traecode_cli_bin() {
+  local bin
+  for bin in trae-cli traecli traex; do
+    if command -v "$bin" >/dev/null 2>&1; then
+      printf '%s' "$bin"
+      return 0
+    fi
+  done
+  printf '%s' 'trae-cli'
+}
+
+normalize_trae_cli_harness() {
+  local h normalized="" found=0 trae_cli_bin
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    if [ "$h" = "trae-cli" ]; then
+      found=1
+      continue
+    fi
+    list_contains_line "$(split_harnesses "$normalized")" "$h" \
+      || normalized="${normalized:+$normalized,}$h"
+  done <<EOF
+$(split_harnesses "$SELECTED_HARNESSES")
+EOF
+  [ "$found" -eq 1 ] || return 0
+  PUBLIC_SELECTED_HARNESSES="$SELECTED_HARNESSES"
+  [ "$UNINSTALL" -eq 0 ] || return 0
+
+  trae_cli_bin="$(resolve_traecode_cli_bin)"
+  TRAECODE_CLI_BIN="$trae_cli_bin"
+  if [ -z "$CODEX_BINS_ARG" ] \
+    && ! list_contains_line "$(split_harnesses "$normalized")" codex; then
+    CODEX_BINS="$trae_cli_bin"
+    TUI_CODEX_BINS="$trae_cli_bin"
+  else
+    CODEX_BINS="$(append_csv_list "$CODEX_BINS" "$trae_cli_bin")"
+    TUI_CODEX_BINS="$(append_csv_list "$TUI_CODEX_BINS" "$trae_cli_bin")"
+  fi
+  if list_contains_line "$(split_harnesses "$normalized")" codex; then
+    SELECTED_HARNESSES="$normalized"
+  else
+    SELECTED_HARNESSES="${normalized:+$normalized,}codex"
+  fi
+}
+
+add_detected_traecode_cli_alias() {
+  local trae_cli_bin
+  [ -z "$CODEX_BINS_ARG" ] || return 0
+  [ "$HAVE_TRAE_CLI" -eq 1 ] || return 0
+  [ -z "$REQUESTED_HARNESSES" ] || return 0
+  trae_cli_bin="$(resolve_traecode_cli_bin)"
+  CODEX_BINS="$(append_csv_list "$CODEX_BINS" "$trae_cli_bin")"
+  TUI_CODEX_BINS="$(append_csv_list "$TUI_CODEX_BINS" "$trae_cli_bin")"
 }
 
 bin_basename() {
@@ -444,15 +514,18 @@ NODE
 CLAUDE_BINS="$(normalize_bin_list "$CLAUDE_BINS_ARG" claude)"
 CODEX_BINS="$(normalize_bin_list "$CODEX_BINS_ARG" codex)"
 
-HAVE_CLAUDE=0; HAVE_CODEX=0; HAVE_CURSOR=0; HAVE_TRAE=0; HAVE_TRAE_CN=0; HAVE_OPENCODE=0; HAVE_PI=0; HAVE_ZCODE=0
+HAVE_CLAUDE=0; HAVE_CODEX=0; HAVE_CURSOR=0; HAVE_TRAE=0; HAVE_TRAE_CN=0; HAVE_TRAE_CLI=0; HAVE_OPENCODE=0; HAVE_PI=0; HAVE_ZCODE=0; HAVE_DSH=0
 refresh_available_harnesses
 
 TUI_CLAUDE_BINS="$CLAUDE_BINS"
 TUI_CODEX_BINS="$CODEX_BINS"
+add_detected_traecode_cli_alias
+refresh_available_harnesses
 SEL_CLAUDE_BINS=""
 SEL_CODEX_BINS=""
 SEL_OPENCODE=0
 SEL_PI=0
+SEL_DSH=0
 SEL_CURSOR_APP=0
 SEL_TRAE=0
 SEL_TRAE_CN=0
@@ -470,7 +543,7 @@ EOF
 }
 
 tui_selectable_count() {
-  printf '%s' $(( $(list_count "$TUI_CLAUDE_BINS") + $(list_count "$TUI_CODEX_BINS") + 6 ))
+  printf '%s' $(( $(list_count "$TUI_CLAUDE_BINS") + $(list_count "$TUI_CODEX_BINS") + 7 ))
 }
 
 tui_total_count() {
@@ -496,6 +569,8 @@ EOF
   if [ "$i" -eq "$idx" ]; then printf 'opencode|opencode'; return 0; fi
   i=$((i + 1))
   if [ "$i" -eq "$idx" ]; then printf 'pi|pi'; return 0; fi
+  i=$((i + 1))
+  if [ "$i" -eq "$idx" ]; then printf 'dsh|dsh'; return 0; fi
   i=$((i + 1))
   if [ "$i" -eq "$idx" ]; then printf 'cursor|cursor'; return 0; fi
   i=$((i + 1))
@@ -528,8 +603,10 @@ tui_bin_label() {
   case "$kind:$bin" in
     claude:claude) printf 'Claude Code' ;;
     codex:codex) printf 'Codex' ;;
+    codex:trae-cli|codex:traecli|codex:traex) printf 'TraeCode CLI 2.0' ;;
     opencode:*) printf 'OpenCode' ;;
     pi:*) printf 'pi' ;;
+    dsh:*) printf 'DeepSeek Harness' ;;
     cursor:*) printf 'Cursor' ;;
     trae:*) printf 'TRAE' ;;
     trae-cn:*) printf 'TRAE CN' ;;
@@ -549,14 +626,16 @@ tui_bin_selected() {
     [ "$SEL_OPENCODE" -eq 1 ]
   elif [ "$kind" = "pi" ]; then
     [ "$SEL_PI" -eq 1 ]
+  elif [ "$kind" = "dsh" ]; then
+    [ "$SEL_DSH" -eq 1 ]
   elif [ "$kind" = "cursor" ]; then
     [ "$SEL_CURSOR_APP" -eq 1 ]
   elif [ "$kind" = "trae" ]; then
     [ "$SEL_TRAE" -eq 1 ]
-  elif [ "$kind" = "zcode" ]; then
-    [ "$SEL_ZCODE" -eq 1 ]
-  else
+  elif [ "$kind" = "trae-cn" ]; then
     [ "$SEL_TRAE_CN" -eq 1 ]
+  else
+    [ "$SEL_ZCODE" -eq 1 ]
   fi
 }
 
@@ -575,6 +654,7 @@ tui_set_all_bins() {
   SEL_CODEX_BINS="$TUI_CODEX_BINS"
   SEL_OPENCODE=1
   SEL_PI=1
+  SEL_DSH=1
   SEL_CURSOR_APP=1
   SEL_TRAE=1
   SEL_TRAE_CN=1
@@ -593,14 +673,17 @@ tui_toggle_bin() {
   elif [ "$kind" = "pi" ]; then
     SEL_PI=$((1 - SEL_PI))
     return 0
+  elif [ "$kind" = "dsh" ]; then
+    SEL_DSH=$((1 - SEL_DSH))
+    return 0
   elif [ "$kind" = "cursor" ]; then
     SEL_CURSOR_APP=$((1 - SEL_CURSOR_APP)); return 0
   elif [ "$kind" = "trae" ]; then
     SEL_TRAE=$((1 - SEL_TRAE)); return 0
-  elif [ "$kind" = "zcode" ]; then
-    SEL_ZCODE=$((1 - SEL_ZCODE)); return 0
-  else
+  elif [ "$kind" = "trae-cn" ]; then
     SEL_TRAE_CN=$((1 - SEL_TRAE_CN)); return 0
+  else
+    SEL_ZCODE=$((1 - SEL_ZCODE)); return 0
   fi
   if list_contains_line "$selected" "$bin"; then
     while IFS= read -r item; do
@@ -666,6 +749,7 @@ tui_reset_bin_selection() {
   SEL_CODEX_BINS=""
   SEL_OPENCODE=0
   SEL_PI=0
+  SEL_DSH=0
   SEL_CURSOR_APP=0
   SEL_TRAE=0
   SEL_TRAE_CN=0
@@ -690,6 +774,7 @@ $TUI_CODEX_BINS
 EOF
   if command -v opencode >/dev/null 2>&1; then SEL_OPENCODE=1; any=1; fi
   if command -v pi >/dev/null 2>&1; then SEL_PI=1; any=1; fi
+  if command -v dsh >/dev/null 2>&1; then SEL_DSH=1; any=1; fi
   if [ "$HAVE_CURSOR" -eq 1 ]; then SEL_CURSOR_APP=1; any=1; fi
   if [ "$HAVE_TRAE" -eq 1 ]; then SEL_TRAE=1; any=1; fi
   if [ "$HAVE_TRAE_CN" -eq 1 ]; then SEL_TRAE_CN=1; any=1; fi
@@ -728,8 +813,8 @@ tui_choose_cli_format() {
         esac
         ;;
       k|j) cursor=$((1 - cursor)) ;;
-      1) TUI_FORMAT_CHOICE="claude"; break ;;
-      2) TUI_FORMAT_CHOICE="codex"; break ;;
+      1) cursor=0 ;;
+      2) cursor=1 ;;
       ''|$'\n'|$'\r')
         if [ "$cursor" -eq 0 ]; then TUI_FORMAT_CHOICE="claude"; else TUI_FORMAT_CHOICE="codex"; fi
         break
@@ -780,7 +865,7 @@ tui_add_compatible_cli() {
 
 tui_has_selection() {
   [ -n "$(list_words "$SEL_CLAUDE_BINS")" ] || [ -n "$(list_words "$SEL_CODEX_BINS")" ] \
-    || [ "$SEL_OPENCODE" -eq 1 ] || [ "$SEL_PI" -eq 1 ] || [ "$SEL_CURSOR_APP" -eq 1 ] \
+    || [ "$SEL_OPENCODE" -eq 1 ] || [ "$SEL_PI" -eq 1 ] || [ "$SEL_DSH" -eq 1 ] || [ "$SEL_CURSOR_APP" -eq 1 ] \
     || [ "$SEL_TRAE" -eq 1 ] || [ "$SEL_TRAE_CN" -eq 1 ] || [ "$SEL_ZCODE" -eq 1 ]
 }
 
@@ -792,6 +877,7 @@ tui_finish_selection() {
   [ -n "$(list_words "$CODEX_BINS")" ] && SELECTED_HARNESSES="${SELECTED_HARNESSES:+$SELECTED_HARNESSES,}codex"
   [ "$SEL_OPENCODE" -eq 1 ] && SELECTED_HARNESSES="${SELECTED_HARNESSES:+$SELECTED_HARNESSES,}opencode"
   [ "$SEL_PI" -eq 1 ] && SELECTED_HARNESSES="${SELECTED_HARNESSES:+$SELECTED_HARNESSES,}pi"
+  [ "$SEL_DSH" -eq 1 ] && SELECTED_HARNESSES="${SELECTED_HARNESSES:+$SELECTED_HARNESSES,}dsh"
   [ "$SEL_CURSOR_APP" -eq 1 ] && SELECTED_HARNESSES="${SELECTED_HARNESSES:+$SELECTED_HARNESSES,}cursor"
   [ "$SEL_TRAE" -eq 1 ] && SELECTED_HARNESSES="${SELECTED_HARNESSES:+$SELECTED_HARNESSES,}trae"
   [ "$SEL_TRAE_CN" -eq 1 ] && SELECTED_HARNESSES="${SELECTED_HARNESSES:+$SELECTED_HARNESSES,}trae-cn"
@@ -866,10 +952,12 @@ select_harnesses() {
   [ "$HAVE_TRAE_CN" -eq 1 ] && detected="${detected:+$detected,}trae-cn"
   [ "$HAVE_OPENCODE" -eq 1 ] && detected="${detected:+$detected,}opencode"
   [ "$HAVE_PI" -eq 1 ] && detected="${detected:+$detected,}pi"
+  [ "$HAVE_DSH" -eq 1 ] && detected="${detected:+$detected,}dsh"
   [ "$HAVE_ZCODE" -eq 1 ] && detected="${detected:+$detected,}zcode"
 
   if [ -n "$REQUESTED_HARNESSES" ]; then
     SELECTED_HARNESSES="$REQUESTED_HARNESSES"
+    normalize_trae_cli_harness
     return
   fi
   default="${detected:-claude,codex}"
@@ -883,6 +971,113 @@ select_harnesses() {
   else
     SELECTED_HARNESSES="$default"
   fi
+}
+
+select_dsh_profile() {
+  local reply
+  contains_harness dsh || return 0
+  if [ -n "$DSH_PROFILE_ARG" ]; then
+    DSH_PROFILE="$DSH_PROFILE_ARG"
+    return 0
+  fi
+  DSH_PROFILE="$DSH_PROFILE_DEFAULT"
+  [ "$INTERACTIVE" -eq 1 ] || return 0
+  ask "$(t 'DeepSeek Harness profile to install into' '要安装到的 DeepSeek Harness profile') [$DSH_PROFILE_DEFAULT]: "
+  read_tty reply
+  DSH_PROFILE="${reply:-$DSH_PROFILE_DEFAULT}"
+}
+
+install_dsh() {
+  heading "$(t '4. DeepSeek Harness bundle' '4. DeepSeek Harness 插件')"
+  if ! command -v dsh >/dev/null 2>&1; then
+    warn "$(t 'dsh CLI not found; skipping DeepSeek Harness install.' '未找到 dsh 命令，跳过 DeepSeek Harness 安装。')"
+    return 0
+  fi
+  # `@latest` rather than a bare name: pnpm keeps an already-satisfying install
+  # when the name carries no version, so a profile holding a dev build would
+  # never fall back to the published package.
+  local profile="${DSH_PROFILE:-$DSH_PROFILE_DEFAULT}" spec="$DSH_PACKAGE@latest" origin="npm" local_dir
+  # npm is the bundle's only distribution channel, so the github/tos choice does
+  # not apply here; only dev mode installs something other than the published
+  # package. It still has to arrive as a real package rather than a link: a
+  # linked source tree resolves its dsh peers from its own realpath and misses
+  # the profile's hoisted node_modules, so the checkout gets packed first.
+  if [ "$SOURCE_MODE" = "dev" ] && local_dir="$(plugin_dir_on_disk dsh-memory-plugin)"; then
+    local packed
+    if packed="$(dsh_pack_local "$local_dir")"; then
+      spec="$packed"
+      origin="$local_dir"
+      # A dev re-install usually carries the same version, and pnpm treats an
+      # already-satisfied version as a no-op no matter which tarball it is
+      # pointed at, so the edited sources would never reach the profile.
+      # Dropping the package first forces the reinstall. Only done for local
+      # sources: it is a downgrade in robustness when `add` can fail on network.
+      dsh plugin --profile "$profile" rm "$DSH_PACKAGE" >/dev/null 2>&1 || true
+    fi
+  fi
+  if dsh plugin --profile "$profile" add "$spec" >/dev/null 2>&1; then
+    info "$(t 'DeepSeek Harness bundle installed into profile:' 'DeepSeek Harness 插件已安装到 profile：') $profile ($(t 'source' '来源'): $origin)"
+  else
+    warn "$(t 'dsh plugin add failed; run it manually:' 'dsh plugin add 失败；请手动执行：') dsh plugin --profile $profile add $spec"
+  fi
+}
+
+# Fingerprint of the checkout's shipped sources. pnpm keys a file: dependency by
+# path, so a re-pack under the same name is treated as already satisfied and the
+# edited sources never reach the profile. Naming the tarball after its content
+# means an unchanged checkout stays a no-op while an edited one reinstalls.
+dsh_sha256() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum
+  else
+    return 1
+  fi
+}
+
+dsh_have_sha256() {
+  command -v shasum >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1
+}
+
+dsh_source_files() { # dsh_source_files <plugin-dir>
+  ( cd "$1" 2>/dev/null && find . -type f \
+      -not -path "./node_modules/*" -not -name "*.tgz" -print0 ) | LC_ALL=C sort -z
+}
+
+dsh_source_fingerprint() { # dsh_source_fingerprint <plugin-dir>
+  local dir="$1"
+  dsh_have_sha256 || return 1
+  {
+    dsh_source_files "$dir" | tr '\0' '\n'
+    dsh_source_files "$dir" | ( cd "$dir" && xargs -0 cat 2>/dev/null )
+  } | dsh_sha256 | cut -c1-12
+}
+
+dsh_pack_local() { # dsh_pack_local <plugin-dir> -> tarball path
+  local dir="$1" dest="$OV_HOME/dsh-memory-plugin" name fingerprint target
+  command -v npm >/dev/null 2>&1 || {
+    warn "$(t 'npm not found; installing the published dsh package instead of the local checkout.' '未找到 npm，将安装已发布的 dsh 包而非本地 checkout。')" >&2
+    return 1
+  }
+  fingerprint="$(dsh_source_fingerprint "$dir")" || {
+    warn "$(t 'no sha256 tool found; installing the published dsh package instead of the local checkout.' '未找到 sha256 工具，将安装已发布的 dsh 包而非本地 checkout。')" >&2
+    return 1
+  }
+  target="$dest/$fingerprint/openviking-dsh-memory-plugin.tgz"
+  if [ -f "$target" ]; then
+    printf '%s' "$target"
+    return 0
+  fi
+  rm -rf "$dest"
+  mkdir -p "$dest/$fingerprint" || return 1
+  name="$( (cd "$dir" && npm pack --pack-destination "$dest/$fingerprint" 2>/dev/null) | tail -1 )"
+  [ -n "$name" ] && [ -f "$dest/$fingerprint/$name" ] || {
+    warn "$(t 'npm pack failed for the local dsh checkout; installing the published package instead.' '本地 dsh checkout 打包失败，将改装已发布的包。')" >&2
+    return 1
+  }
+  mv "$dest/$fingerprint/$name" "$target" || return 1
+  printf '%s' "$target"
 }
 
 select_compatible_bins() {
@@ -912,7 +1107,8 @@ validate_selected_harnesses() {
   local h bad=0
   while IFS= read -r h; do
     case "$h" in
-      claude|codex|cursor|trae|trae-cn|opencode|pi|zcode) ;;
+      claude|codex|cursor|trae|trae-cn|opencode|pi|zcode|dsh) ;;
+      trae-cli) [ "$UNINSTALL" -eq 1 ] || bad=1 ;;
       *) err "Unsupported harness: $h"; bad=1 ;;
     esac
   done <<EOF
@@ -949,9 +1145,10 @@ EOF
   fi
   if contains_harness opencode && command -v opencode >/dev/null 2>&1; then ok=1; fi
   if contains_harness pi && command -v pi >/dev/null 2>&1; then ok=1; fi
+  if contains_harness dsh && command -v dsh >/dev/null 2>&1; then ok=1; fi
   # Cursor and TRAE are config-driven integrations. They may be installed
   # before the desktop app itself, so a CLI in PATH is not required.
-  if contains_harness cursor || contains_harness trae || contains_harness trae-cn || contains_harness zcode; then ok=1; fi
+  if contains_harness cursor || contains_harness trae || contains_harness trae-cn || contains_harness trae-cli || contains_harness zcode; then ok=1; fi
   if [ "$ok" -ne 1 ]; then
     err "$(t 'No selected compatible CLI command was found in PATH.' '未在 PATH 中找到任何已选择的兼容 CLI 命令。')"
     exit 2
@@ -1020,8 +1217,12 @@ prompt_connection() { # sets WIZ_URL / WIZ_KEY (WIZ_KEY may stay __OPENVIKING_KE
   elif [ -n "$reply" ]; then
     WIZ_KEY="$reply"
   else
+    # Not `[ -z ... ] && ...`: as the function's last command a false test makes
+    # prompt_connection return 1, and `set -e` aborts the whole installer.
     WIZ_KEY="__OPENVIKING_KEEP__"
-    [ -z "$current_key" ] && WIZ_KEY=""
+    if [ -z "$current_key" ]; then
+      WIZ_KEY=""
+    fi
   fi
 }
 
@@ -1077,8 +1278,11 @@ configure_ovcli() {
     cp "$OVCLI_CONF" "$OVCLI_CONF.bak.$(date +%s)"
   fi
   json_merge_ovcli "$OVCLI_CONF" "$url" "$key" "$account" "$user"
-  if [ "$url" != "$current_url" ] || { [ "$key" != "__OPENVIKING_KEEP__" ] && [ "$key" != "$current_key" ]; }; then
+  if [ "$url" != "$current_url" ]; then
     info "$(t 'Updated:' '已更新：') url: ${current_url:-—} -> $url"
+  fi
+  if [ "$key" != "__OPENVIKING_KEEP__" ] && [ "$key" != "$current_key" ]; then
+    info "$(t 'Updated:' '已更新：') api_key: $(mask_secret "$current_key") -> $(mask_secret "$key")"
   fi
   info "$(t 'Credentials ready:' '凭据已就绪：') $OVCLI_CONF"
   info "$(t 'Reconfigure later by re-running this installer.' '之后可重跑本安装脚本重新配置。')"
@@ -1125,7 +1329,9 @@ resolve_self_checkout() {
   local src dir
   src="${BASH_SOURCE[0]}"
   dir="$(cd "$(dirname "$src")" >/dev/null 2>&1 && pwd -P)" || return 0
-  if [ -d "$dir/../../.git" ] && [ -d "$dir/../claude-code-memory-plugin" ]; then
+  # A linked worktree keeps `.git` as a file pointing at the real gitdir, so
+  # test for existence rather than for a directory.
+  if [ -e "$dir/../../.git" ] && [ -d "$dir/../claude-code-memory-plugin" ]; then
     CHECKOUT_DIR="$(cd "$dir/../.." >/dev/null 2>&1 && pwd -P)"
   fi
 }
@@ -1202,6 +1408,42 @@ plugin_dir_on_disk() { # plugin_dir_on_disk <plugin-subdir>
   return 1
 }
 
+# The installer's own JavaScript: the JSONC editor OpenCode's config needs and
+# the hooks/mcp merge every config-driven host installs through. It is not part
+# of the runtime the plugins ship, so it travels with whatever copy of this
+# script is running rather than with `lib/MANIFEST`.
+#
+# `--uninstall` runs before any source is resolved, and the documented uninstall
+# pipes this script from a URL, where there is no sibling directory to read. So
+# this only ever looks at what is already on disk — the running script's
+# sibling, the assembled runtime, and a marketplace or source root an earlier
+# step resolved. Never plugin_dir_on_disk: it would clone a repository, or exit
+# for want of git, just to remove hooks.
+install_lib_dir() {
+  local src self candidate
+  src="${BASH_SOURCE[0]:-}"
+  self=""
+  if [ -n "$src" ]; then
+    self="$(cd "$(dirname "$src")" >/dev/null 2>&1 && pwd -P)" || self=""
+  fi
+  for candidate in \
+    "${self:+$self/lib/install}" \
+    "$OV_HOME/agent-integrations/memory-plugin-shared/lib/install" \
+    "${MKT_DIR:+$MKT_DIR/memory-plugin-shared/lib/install}" \
+    "${SRC_ROOT:+$SRC_ROOT/examples/memory-plugin-shared/lib/install}"; do
+    [ -n "$candidate" ] && [ -d "$candidate" ] || continue
+    printf '%s' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+require_install_lib_dir() {
+  install_lib_dir && return 0
+  err "$(t 'Installer runtime not found:' '未找到安装器运行时：') memory-plugin-shared/lib/install"
+  return 1
+}
+
 prepare_marketplace_dir() {
   case "$SOURCE_MODE" in
     dev)
@@ -1228,38 +1470,6 @@ prepare_marketplace_dir() {
     err "marketplace dir $MKT_DIR is missing .claude-plugin/marketplace.json"
     exit 1
   fi
-}
-
-# ---------------------------------------------------------------------------
-# Legacy wrapper cleanup (pre-stdio installs)
-# ---------------------------------------------------------------------------
-
-strip_rc_block() {
-  local rc="$1" begin="$2" end="$3"
-  [ -n "$rc" ] && [ -f "$rc" ] || return 0
-  grep -qF "$begin" "$rc" || return 0
-  if ! grep -qF "$end" "$rc"; then
-    warn "Found $begin in $rc but missing end marker; leaving it untouched."
-    return 0
-  fi
-  awk -v b="$begin" -v e="$end" '
-    $0 == b {skip=1; next}
-    $0 == e {skip=0; next}
-    !skip
-  ' "$rc" > "$rc.tmp" && mv "$rc.tmp" "$rc"
-  info "$(t 'Removed legacy rc block from' '已移除旧的 rc 注入块：') $rc"
-}
-
-cleanup_rc_wrappers() {
-  local rc
-  for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
-    if contains_harness claude; then
-      strip_rc_block "$rc" '# >>> openviking claude-code memory plugin >>>' '# <<< openviking claude-code memory plugin <<<'
-    fi
-    if contains_harness codex; then
-      strip_rc_block "$rc" '# >>> openviking-codex-plugin >>>' '# <<< openviking-codex-plugin <<<'
-    fi
-  done
 }
 
 # ---------------------------------------------------------------------------
@@ -1307,22 +1517,6 @@ claude_marketplace_current_source() {
       if (s) process.stdout.write(String(s.path || s.repo || s.url || ""));
     } catch {}
   ' "$CC_KNOWN_MARKETPLACES" "$MARKETPLACE_NAME" 2>/dev/null || true
-}
-
-migrate_claude_legacy_marketplace() {
-  local id plugin_list marketplace_list
-  plugin_list="$(claude_cmd plugin list 2>/dev/null || true)"
-  for id in $CC_OLD_IDS; do
-    if str_contains "$plugin_list" "$id"; then
-      info "$(t 'Removing pre-unification plugin install' '移除旧命名的插件安装') ($id)"
-      claude_cmd plugin uninstall "$id" >/dev/null 2>&1 || true
-    fi
-  done
-  marketplace_list="$(claude_cmd plugin marketplace list 2>/dev/null || true)"
-  if str_contains "$marketplace_list" "$OLD_MARKETPLACE_NAME"; then
-    info "$(t 'Removing pre-unification marketplace' '移除旧命名的 marketplace') ($OLD_MARKETPLACE_NAME)"
-    claude_cmd plugin marketplace remove "$OLD_MARKETPLACE_NAME" >/dev/null 2>&1 || true
-  fi
 }
 
 write_claude_remote_manifest() {
@@ -1496,7 +1690,6 @@ install_claude() {
     return 0
   }
   if has_plugin_subcommand; then
-    migrate_claude_legacy_marketplace
     install_claude_modern || return 1
   else
     warn "$(t "This Claude-format CLI doesn't expose 'plugin'." '当前 Claude 格式 CLI 没有 plugin 子命令。') ($CLAUDE_BIN)"
@@ -1534,6 +1727,37 @@ codex_cmd() {
   command "$CODEX_BIN" "$@"
 }
 
+codex_bin_label() {
+  case "$(bin_basename "$CODEX_BIN")" in
+    trae-cli|traecli|traex) printf 'TraeCode CLI 2.0' ;;
+    codex) printf 'Codex' ;;
+    *) printf '%s %s' "$CODEX_BIN" "$(t '(Codex-format)' '（Codex 格式）')" ;;
+  esac
+}
+
+remove_legacy_trae_cli_integration() {
+  case "$(bin_basename "$CODEX_BIN")" in
+    trae-cli|traecli|traex) ;;
+    *) return 0 ;;
+  esac
+  local trae_home="${TRAE_HOME:-$HOME/.trae}"
+  local trae_cli_home="${TRAECLI_HOME:-$trae_home/cli}"
+  if grep -qi 'openviking' "$trae_cli_home/hooks.json" 2>/dev/null \
+    || [ -d "$OV_HOME/agent-integrations/trae-cli" ] \
+    || grep -qF '[mcp_servers."openviking-memory"]' "$trae_home/traecli.toml" 2>/dev/null; then
+    agent_remove_trae_cli_configs "$trae_cli_home/hooks.json" "$trae_home/traecli.toml"
+    rm -rf "$OV_HOME/agent-integrations/trae-cli"
+    info "$(t 'Removed the deprecated TRAE CLI Hooks integration after installing the TraeCode CLI 2.0 plugin.' 'TraeCode CLI 2.0 插件安装成功后，已移除弃用的 TRAE CLI Hooks 集成。')"
+  fi
+  if [ ! -d "$OV_HOME/agent-integrations/cursor" ] \
+    && [ ! -d "$OV_HOME/agent-integrations/trae" ] \
+    && [ ! -d "$OV_HOME/agent-integrations/trae-cn" ] \
+    && [ ! -d "$OV_HOME/agent-integrations/trae-cli" ] \
+    && [ ! -d "$OV_HOME/agent-integrations/zcode" ]; then
+    rm -rf "$OV_HOME/agent-integrations/memory-plugin-shared"
+  fi
+}
+
 codex_marketplace_current_source() {
   local raw
   raw="$(codex_cmd plugin marketplace list --json 2>/dev/null || true)"
@@ -1551,36 +1775,6 @@ codex_marketplace_current_source() {
       } catch {}
     });
   ' "$MARKETPLACE_NAME" 2>/dev/null || true
-}
-
-migrate_codex_legacy_marketplace() {
-  codex_cmd plugin remove "$CODEX_OLD_ID" >/dev/null 2>&1 || true
-  codex_cmd plugin uninstall "$CODEX_OLD_ID" >/dev/null 2>&1 || true
-  if str_contains "$(codex_cmd plugin marketplace list 2>/dev/null || true)" "$OLD_MARKETPLACE_NAME"; then
-    info "$(t 'Removing pre-unification marketplace' '移除旧命名的 marketplace') ($OLD_MARKETPLACE_NAME)"
-    codex_cmd plugin marketplace remove "$OLD_MARKETPLACE_NAME" >/dev/null 2>&1 || true
-  fi
-  if is_native_codex_bin; then
-    [ -d "$CODEX_OLD_MARKETPLACE_ROOT" ] && rm -rf "$CODEX_OLD_MARKETPLACE_ROOT"
-    [ -d "$HOME/.codex/plugins/cache/$OLD_MARKETPLACE_NAME" ] && rm -rf "$HOME/.codex/plugins/cache/$OLD_MARKETPLACE_NAME"
-  fi
-  # Drop the old plugin id's config.toml section; the unified id gets its own.
-  if is_native_codex_bin && [ -f "$CODEX_CONFIG" ] && grep -qF "plugins.\"$CODEX_OLD_ID\"" "$CODEX_CONFIG"; then
-    node - "$CODEX_CONFIG" "$CODEX_OLD_ID" <<'NODE' || true
-const fs = require("node:fs");
-const [path, oldId] = process.argv.slice(2);
-const lines = fs.readFileSync(path, "utf8").split(/\n/);
-const out = [];
-let skip = false;
-for (const line of lines) {
-  const trimmed = line.trim();
-  if (/^\[/.test(trimmed)) skip = trimmed.startsWith(`[plugins."${oldId}"`);
-  if (!skip) out.push(line);
-}
-fs.writeFileSync(path, out.join("\n").replace(/\n*$/, "\n"));
-NODE
-    info "Removed old config.toml section for $CODEX_OLD_ID"
-  fi
 }
 
 codex_marketplace_sync() { # codex_marketplace_sync <expected-source> <add-args...>
@@ -1643,12 +1837,16 @@ NODE
 }
 
 install_codex() {
-  heading "$(t '4. Codex plugin' '4. Codex 插件')"
+  local plugin_installed=0
+  if is_native_codex_bin; then
+    heading "$(t '4. Codex plugin' '4. Codex 插件')"
+  else
+    heading "4. $(codex_bin_label)"
+  fi
   command -v "$CODEX_BIN" >/dev/null 2>&1 || {
     warn "$(t 'Codex-format CLI not found; skipping:' '未找到 Codex 格式 CLI，跳过：') $CODEX_BIN"
     return 0
   }
-  migrate_codex_legacy_marketplace
   case "$SOURCE_MODE" in
     remote)
       # Codex doesn't expose which --ref a registered git marketplace is
@@ -1678,11 +1876,20 @@ install_codex() {
       codex_marketplace_sync "$MKT_DIR" "$MKT_DIR" || return 1
       ;;
   esac
-  if ! codex_cmd plugin add "$PLUGIN_ID" >/dev/null 2>&1; then
-    codex_cmd plugin install "$PLUGIN_ID" >/dev/null 2>&1 || \
-      warn "$CODEX_BIN plugin add/install returned non-zero for $PLUGIN_ID"
+  if codex_cmd plugin add "$PLUGIN_ID" >/dev/null 2>&1; then
+    plugin_installed=1
+  elif codex_cmd plugin install "$PLUGIN_ID" >/dev/null 2>&1; then
+    plugin_installed=1
+  else
+    warn "$CODEX_BIN plugin add/install returned non-zero for $PLUGIN_ID"
   fi
-  codex_cmd plugin enable "$PLUGIN_ID" >/dev/null 2>&1 || true
+  if [ "$plugin_installed" -eq 1 ]; then
+    if codex_cmd plugin enable "$PLUGIN_ID" >/dev/null 2>&1; then
+      remove_legacy_trae_cli_integration
+    elif ! is_native_codex_bin; then
+      warn "$(t 'Plugin installed but could not be enabled; keeping the deprecated TRAE CLI Hooks integration.' '插件已安装但未能启用；保留弃用的 TRAE CLI Hooks 集成。')"
+    fi
+  fi
   if is_native_codex_bin; then
     ensure_codex_config
     info "$(t 'Codex plugin enabled in' 'Codex 插件已在配置中启用：') $CODEX_CONFIG"
@@ -1721,10 +1928,12 @@ install_codex_tos_git() {
 # Cursor / TRAE lifecycle hooks
 # ---------------------------------------------------------------------------
 
-copy_agent_integration() { # copy_agent_integration <source-subdir> <dest-name>
-  local source_subdir="$1" dest_name="$2" source dest tmp
-  source="$(plugin_dir_on_disk "$source_subdir")" || {
-    err "$(t 'Agent integration sources not found:' '未找到 Agent 接入源码：') $source_subdir"
+AGENT_HOOK_HOSTS="cursor trae zcode"
+
+copy_agent_integration() { # copy_agent_integration <host> <dest-name>
+  local host="$1" dest_name="$2" source dest tmp other
+  source="$(plugin_dir_on_disk agent-hook-plugin)" || {
+    err "$(t 'Agent integration sources not found:' '未找到 Agent 接入源码：') agent-hook-plugin"
     return 1
   }
   dest="$OV_HOME/agent-integrations/$dest_name"
@@ -1732,6 +1941,11 @@ copy_agent_integration() { # copy_agent_integration <source-subdir> <dest-name>
   rm -rf "$tmp"
   mkdir -p "$tmp"
   (cd "$source" && tar --exclude node_modules --exclude .git -cf - .) | (cd "$tmp" && tar -xf -)
+  # One plugin serves every config-driven host; an installation is for one
+  # client, so the other hosts' configuration directories do not travel with it.
+  for other in $AGENT_HOOK_HOSTS; do
+    [ "$other" = "$host" ] || rm -rf "$tmp/hosts/$other"
+  done
   # Preserve the first-install timestamp across managed upgrades. The package
   # descriptor is copied from source; integration.json records this machine's
   # installation and must survive replacing the runtime directory.
@@ -1742,27 +1956,35 @@ copy_agent_integration() { # copy_agent_integration <source-subdir> <dest-name>
   printf '%s' "$dest"
 }
 
-# Cursor and TRAE keep only their client-specific adapters in the repository.
+# Cursor, TRAE and ZCode keep only their client-specific adapters in the repository.
 # Assemble a self-contained installation by adding the canonical shared runtime
 # at install time instead of committing generated copies for every client.
-assemble_agent_integration() { # assemble_agent_integration <source-subdir> <dest-name>
-  local source_subdir="$1" dest_name="$2" root shared shared_dest file
-  root="$(copy_agent_integration "$source_subdir" "$dest_name")" || return 1
+assemble_agent_integration() { # assemble_agent_integration <host> <dest-name>
+  local host="$1" dest_name="$2" root shared shared_dest manifest file
+  root="$(copy_agent_integration "$host" "$dest_name")" || return 1
   shared="$(plugin_dir_on_disk memory-plugin-shared)" || {
     err "$(t 'Shared agent runtime not found.' '未找到共享 Agent 运行时。')"
     return 1
   }
   shared_dest="$OV_HOME/agent-integrations/memory-plugin-shared/lib"
+  # The closure of what cursor, trae and zcode import, written by sync.mjs and
+  # shipped beside the modules. Regenerating it here is not an option: the
+  # generator finds no plugin sources in a flat marketplace archive.
+  manifest="$shared/lib/MANIFEST"
+  [ -s "$manifest" ] || {
+    err "$(t 'Shared runtime manifest is missing or empty:' '共享运行时清单缺失或为空：') $manifest"
+    return 1
+  }
   rm -rf "$shared_dest.tmp"
   mkdir -p "$shared_dest.tmp"
-  for file in \
-    agent-hook-runtime.mjs agent-uri-guard.mjs credentials.mjs debug-log.mjs \
-    batch-send.mjs mcp-proxy-core.mjs pending-queue.mjs plugin-config.mjs profile-inject.mjs \
-    retryable.mjs \
-    recall-compress-core.mjs recall-core.mjs \
-    session-model.mjs uri-guard.mjs workspace-peer.mjs; do
-    cp "$shared/lib/$file" "$shared_dest.tmp/$file"
-  done
+  while read -r file || [ -n "$file" ]; do
+    [ -n "$file" ] || continue
+    cp "$shared/lib/$file" "$shared_dest.tmp/$file" || return 1
+  done < "$manifest"
+  cp "$manifest" "$shared_dest.tmp/MANIFEST"
+  # Not part of the closure and never imported by a hook; it is here so that an
+  # uninstall piped from a URL can reclaim this host's entries without a source.
+  cp -R "$shared/lib/install" "$shared_dest.tmp/install" || return 1
   rm -rf "$shared_dest"
   mkdir -p "$(dirname "$shared_dest")"
   mv "$shared_dest.tmp" "$shared_dest"
@@ -1770,243 +1992,44 @@ assemble_agent_integration() { # assemble_agent_integration <source-subdir> <des
 }
 
 agent_write_json_configs() { # agent_write_json_configs <kind> <hooks> <mcp> <root> <client-id> <node-bin>
-  local kind="$1" hooks_path="$2" mcp_path="$3" root="$4" client_id="$5" node_bin="$6"
-  "$NODE_BIN" - "$kind" "$hooks_path" "$mcp_path" "$root" "$client_id" "$node_bin" "$SOURCE_MODE" <<'NODE'
-const fs = require("node:fs");
-const path = require("node:path");
-const [kind, hooksPath, mcpPath, root, clientId, nodeBin, sourceMode] = process.argv.slice(2);
+  local lib
+  lib="$(require_install_lib_dir)" || return 1
+  "$NODE_BIN" "$lib/host-json-config.mjs" write "$1" "$2" "$3" "$4" "$5" "$6" "$SOURCE_MODE"
+}
 
-function readJson(file) {
-  if (!fs.existsSync(file)) return {};
-  try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new Error("top-level value must be an object");
+agent_remove_json_configs() { # agent_remove_json_configs <hooks> [mcp]
+  local lib
+  # An uninstall that cannot find the runtime still has to remove everything it
+  # can and tell the user what it left behind; aborting here would leave both
+  # the host's entries and the integration directory they point at.
+  lib="$(install_lib_dir)" || {
+    warn "$(t 'Installer runtime not found; remove the OpenViking hook and MCP entries by hand from:' '未找到安装器运行时，请手动移除以下文件中的 OpenViking hook 与 MCP 条目：') $1${2:+, $2}"
+    return 0
+  }
+  "$NODE_BIN" "$lib/host-json-config.mjs" remove "$1" "${2:-}"
+}
+
+agent_remove_trae_cli_configs() { # agent_remove_trae_cli_configs <hooks> <traecli.toml>
+  local hooks_path="$1" config_path="$2"
+  # The hooks file answers to the same "is this entry ours" the other hosts use;
+  # only the TOML this host keeps its MCP servers in is its own problem.
+  agent_remove_json_configs "$hooks_path"
+  [ -f "$config_path" ] || return 0
+  local stripped tmp="$config_path.$$.tmp"
+  stripped="$(awk -v target='mcp_servers."openviking-memory"' '
+    BEGIN { prefix = target "." }
+    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+      name = $0
+      sub(/^[[:space:]]*\[/, "", name)
+      sub(/\][[:space:]]*$/, "", name)
+      skip = (name == target || index(name, prefix) == 1)
     }
-    return parsed;
-  } catch (error) {
-    throw new Error(`Cannot safely update ${file}: ${error.message}`);
-  }
-}
-
-function atomicWrite(file, value) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const next = JSON.stringify(value, null, 2) + "\n";
-  let previous = "";
-  try { previous = fs.readFileSync(file, "utf8"); } catch {}
-  if (previous === next) return;
-  if (previous) fs.writeFileSync(`${file}.bak`, previous, { mode: 0o600 });
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, next, { mode: 0o600 });
-  fs.renameSync(tmp, file);
-}
-
-function shellArg(value) {
-  return `'${String(value).replace(/'/g, `'"'"'`)}'`;
-}
-
-function isOpenVikingHook(value) {
-  const text = JSON.stringify(value || {});
-  return text.includes("OPENVIKING_INTEGRATION_ID") || (text.includes("openviking") && [
-    "cursor-hook.mjs",
-    "trae-hook.mjs",
-    "zcode-hook.mjs",
-    "session-start.mjs",
-    "auto-recall.mjs",
-    "auto-capture.mjs",
-    "pre-compact.mjs",
-    "session-end.mjs",
-    "trae-auto-recall.mjs",
-    "trae-auto-capture.mjs",
-    "claude-code-memory-plugin/scripts/session-start.mjs",
-  ].some((name) => text.includes(name)));
-}
-
-const packageManifest = readJson(path.join(root, "openviking.integration.json"));
-if (packageManifest.id !== "openviking-memory" || !Array.isArray(packageManifest.clients)
-  || !packageManifest.clients.includes(clientId)) {
-  throw new Error(`Invalid OpenViking integration manifest for ${clientId}`);
-}
-const integrationEnv = {
-  OPENVIKING_INTEGRATION_ID: packageManifest.id,
-  OPENVIKING_INTEGRATION_VERSION: packageManifest.version,
-  OPENVIKING_HOOK_SOURCE: clientId,
-};
-const envPrefix = Object.entries(integrationEnv)
-  .map(([key, value]) => `${key}=${shellArg(value)}`)
-  .join(" ");
-
-function renderHookCommand(command) {
-  let rendered = command;
-  const cursorMatch = /^node\s+\$\{CURSOR_PLUGIN_ROOT\}\/(.+)$/u.exec(rendered);
-  if (cursorMatch) {
-    rendered = `${shellArg(nodeBin)} ${shellArg(path.join(root, cursorMatch[1]))}`;
-  } else {
-    const pluginRootMatch = /^node\s+"?\$\{(?:CLAUDE_PLUGIN_ROOT|ZCODE_PLUGIN_ROOT)\}"?\/(.+?)"?$/u.exec(rendered);
-    if (pluginRootMatch) {
-      rendered = `${shellArg(nodeBin)} ${shellArg(path.join(root, pluginRootMatch[1]))}`;
-    } else {
-      const traeMatch = /^node\s+__OPENVIKING_TRAE_ROOT__\/(\S+)\s+(.+)$/u.exec(rendered);
-      if (!traeMatch) throw new Error(`Unsupported ${clientId} hook command template: ${command}`);
-      rendered = `${shellArg(nodeBin)} ${shellArg(path.join(root, traeMatch[1]))} ${traeMatch[2]
-        .replaceAll("__OPENVIKING_CLIENT_ID__", clientId)}`;
-    }
-  }
-  return `${envPrefix} ${rendered} # openviking-memory`;
-}
-
-function renderHookValue(value) {
-  if (Array.isArray(value)) return value.map(renderHookValue);
-  if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(Object.entries(value).map(([key, child]) => [
-    key,
-    key === "command" && typeof child === "string" ? renderHookCommand(child) : renderHookValue(child),
-  ]));
-}
-
-const hookTemplate = readJson(path.join(root, "hooks", "hooks.json"));
-if (!hookTemplate.hooks || typeof hookTemplate.hooks !== "object" || Array.isArray(hookTemplate.hooks)) {
-  throw new Error(`Invalid ${clientId} hooks template`);
-}
-const hooksConfig = readJson(hooksPath);
-hooksConfig.version = Number.isFinite(Number(hooksConfig.version)) ? Number(hooksConfig.version) : 1;
-hooksConfig.hooks = hooksConfig.hooks && typeof hooksConfig.hooks === "object" && !Array.isArray(hooksConfig.hooks)
-  ? hooksConfig.hooks : {};
-
-for (const [event, entries] of Object.entries(hookTemplate.hooks)) {
-  if (!Array.isArray(entries)) throw new Error(`Invalid ${clientId} hook entries for ${event}`);
-  const current = Array.isArray(hooksConfig.hooks[event]) ? hooksConfig.hooks[event] : [];
-  hooksConfig.hooks[event] = [
-    ...current.filter((item) => !isOpenVikingHook(item)),
-    ...renderHookValue(entries),
-  ];
-}
-if (kind === "cursor") {
-  if (Array.isArray(hooksConfig.hooks.postToolUse)) {
-    const remaining = hooksConfig.hooks.postToolUse.filter((item) => !isOpenVikingHook(item));
-    if (remaining.length) hooksConfig.hooks.postToolUse = remaining;
-    else delete hooksConfig.hooks.postToolUse;
-  }
-}
-atomicWrite(hooksPath, hooksConfig);
-
-const mcpTemplate = readJson(path.join(root, ".mcp.json"));
-const templateServer = mcpTemplate.mcpServers?.openviking;
-if (!templateServer || typeof templateServer !== "object" || Array.isArray(templateServer)) {
-  throw new Error(`Invalid ${clientId} MCP template`);
-}
-const mcp = readJson(mcpPath);
-mcp.mcpServers = mcp.mcpServers && typeof mcp.mcpServers === "object" && !Array.isArray(mcp.mcpServers)
-  ? mcp.mcpServers : {};
-function isKnownLegacyOpenVikingServer(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  if (value.env?.OPENVIKING_INTEGRATION_ID === "openviking-memory") return true;
-  if (typeof value.url !== "string") return false;
-  try {
-    const url = new URL(value.url);
-    const local = ["127.0.0.1", "localhost", "::1"].includes(url.hostname)
-      && url.port === "1933" && url.pathname.replace(/\/$/u, "") === "/mcp";
-    const cloud = url.hostname === "api.vikingdb.cn-beijing.volces.com"
-      && url.pathname.replace(/\/$/u, "") === "/openviking/mcp";
-    return local || cloud;
-  } catch {
-    return false;
-  }
-}
-// Migrate only the exact OpenViking endpoints published by the earlier manual
-// guides. A coincidentally named third-party server must remain untouched.
-if (isKnownLegacyOpenVikingServer(mcp.mcpServers["ov-mcp-server"])) {
-  delete mcp.mcpServers["ov-mcp-server"];
-}
-const server = {
-  ...templateServer,
-  command: nodeBin,
-  args: [path.join(root, "servers", "mcp-proxy.mjs")],
-  env: { ...(templateServer.env || {}), ...integrationEnv },
-};
-mcp.mcpServers.openviking = server;
-atomicWrite(mcpPath, mcp);
-
-const installedManifestPath = path.join(root, "integration.json");
-const previousManifest = readJson(installedManifestPath);
-const now = new Date().toISOString();
-const unchangedInstall = previousManifest.version === packageManifest.version
-  && previousManifest.source === sourceMode
-  && previousManifest.hooksConfig === hooksPath
-  && previousManifest.mcpConfig === mcpPath;
-atomicWrite(installedManifestPath, {
-  schemaVersion: 1,
-  id: packageManifest.id,
-  version: packageManifest.version,
-  client: clientId,
-  installMode: "managed-native",
-  source: sourceMode,
-  capabilities: packageManifest.capabilities,
-  hooksConfig: hooksPath,
-  mcpConfig: mcpPath,
-  installedAt: previousManifest.installedAt || now,
-  updatedAt: unchangedInstall ? previousManifest.updatedAt || previousManifest.installedAt || now : now,
-});
-NODE
-}
-
-agent_remove_json_configs() { # agent_remove_json_configs <hooks> <mcp>
-  local hooks_path="$1" mcp_path="$2"
-  "$NODE_BIN" - "$hooks_path" "$mcp_path" <<'NODE'
-const fs = require("node:fs");
-const [hooksPath, mcpPath] = process.argv.slice(2);
-function read(file) {
-  if (!fs.existsSync(file)) return null;
-  try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new Error("top-level value must be an object");
-    }
-    return parsed;
-  } catch (error) {
-    throw new Error(`Cannot safely update ${file}: ${error.message}`);
-  }
-}
-function write(file, value) {
-  const next = JSON.stringify(value, null, 2) + "\n";
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, next, { mode: 0o600 });
-  fs.renameSync(tmp, file);
-}
-function ownsHook(value) {
-  const text = JSON.stringify(value || {});
-  return text.includes("openviking") && [
-    "cursor-hook.mjs",
-    "trae-hook.mjs",
-    "zcode-hook.mjs",
-    "session-start.mjs",
-    "auto-recall.mjs",
-    "auto-capture.mjs",
-    "pre-compact.mjs",
-    "session-end.mjs",
-    "trae-auto-recall.mjs",
-    "trae-auto-capture.mjs",
-    "claude-code-memory-plugin/scripts/session-start.mjs",
-  ].some((name) => text.includes(name));
-}
-const hooks = read(hooksPath);
-const mcp = read(mcpPath);
-if (hooks?.hooks && typeof hooks.hooks === "object") {
-  for (const event of Object.keys(hooks.hooks)) {
-    if (!Array.isArray(hooks.hooks[event])) continue;
-    hooks.hooks[event] = hooks.hooks[event].filter((item) => !ownsHook(item));
-    if (hooks.hooks[event].length === 0) delete hooks.hooks[event];
-  }
-  write(hooksPath, hooks);
-}
-if (mcp?.mcpServers?.openviking) {
-  const text = JSON.stringify(mcp.mcpServers.openviking);
-  if (text.includes("agent-integrations") && text.includes("mcp-proxy.mjs")) {
-    delete mcp.mcpServers.openviking;
-    write(mcpPath, mcp);
-  }
-}
-NODE
+    skip { next }
+    /^[[:space:]]*$/ { blank = 1; next }
+    { if (started && blank) print ""; print; started = 1; blank = 0 }
+  ' "$config_path")"
+  ( umask 077; printf '%s\n' "$stripped" >"$tmp" )
+  mv "$tmp" "$config_path"
 }
 
 uninstall_agent_integrations() {
@@ -2026,6 +2049,13 @@ uninstall_agent_integrations() {
     agent_remove_json_configs "$HOME/.trae-cn/hooks.json" "$(trae_mcp_path trae-cn)"
     rm -rf "$OV_HOME/agent-integrations/trae-cn"
     info "$(t 'Removed TRAE CN OpenViking hooks and MCP config.' '已移除 TRAE CN OpenViking hooks 与 MCP 配置。')"
+  fi
+  if contains_harness trae-cli; then
+    local trae_home="${TRAE_HOME:-$HOME/.trae}"
+    local trae_cli_home="${TRAECLI_HOME:-$trae_home/cli}"
+    agent_remove_trae_cli_configs "$trae_cli_home/hooks.json" "$trae_home/traecli.toml"
+    rm -rf "$OV_HOME/agent-integrations/trae-cli"
+    info "$(t 'Removed TRAE CLI OpenViking hooks and MCP config.' '已移除 TRAE CLI OpenViking hooks 与 MCP 配置。')"
   fi
   if contains_harness zcode; then
     # ZCode reads hooks/MCP from config.json, not standalone files.
@@ -2073,6 +2103,7 @@ CLEAN_NODE
   if [ ! -d "$OV_HOME/agent-integrations/cursor" ] \
     && [ ! -d "$OV_HOME/agent-integrations/trae" ] \
     && [ ! -d "$OV_HOME/agent-integrations/trae-cn" ] \
+    && [ ! -d "$OV_HOME/agent-integrations/trae-cli" ] \
     && [ ! -d "$OV_HOME/agent-integrations/zcode" ]; then
     rm -rf "$OV_HOME/agent-integrations/memory-plugin-shared"
   fi
@@ -2112,15 +2143,15 @@ trae_mcp_path() { # trae_mcp_path <client-id>
 install_cursor() {
   heading "$(t '4. Cursor integration' '4. Cursor 集成')"
   local root hooks_path mcp_path skill_tmp legacy_plugins
-  root="$(assemble_agent_integration cursor-memory-plugin cursor)" || return 1
+  root="$(assemble_agent_integration cursor cursor)" || return 1
   hooks_path="$HOME/.cursor/hooks.json"
   mcp_path="$(cursor_mcp_path)"
   agent_write_json_configs cursor "$hooks_path" "$mcp_path" "$root" cursor "$NODE_BIN"
   mkdir -p "$HOME/.cursor/rules" "$HOME/.cursor/skills"
-  cp "$root/rules/openviking-memory.mdc" "$HOME/.cursor/rules/openviking-memory.mdc"
+  cp "$root/hosts/cursor/rules/openviking-memory.mdc" "$HOME/.cursor/rules/openviking-memory.mdc"
   skill_tmp="$HOME/.cursor/skills/openviking-memory.tmp"
   rm -rf "$skill_tmp"
-  cp -R "$root/skills/openviking-memory" "$skill_tmp"
+  cp -R "$root/hosts/cursor/skills/openviking-memory" "$skill_tmp"
   rm -rf "$HOME/.cursor/skills/openviking-memory"
   mv "$skill_tmp" "$HOME/.cursor/skills/openviking-memory"
   info "$(t 'Cursor hooks installed:' 'Cursor hooks 已安装：') $hooks_path"
@@ -2138,83 +2169,15 @@ zcode_mcp_path() {
 }
 
 zcode_merge_config() { # zcode_merge_config <config_path> <hooks_path> <mcp_path>
-  "$NODE_BIN" - "$1" "$2" "$3" <<'ZCODE_MERGE_NODE'
-const fs = require("node:fs");
-const path = require("node:path");
-const [configPath, hooksPath, mcpPath] = process.argv.slice(2);
-
-// --- Safe read: ENOENT → empty config; parse error → abort, do NOT overwrite ---
-let config = {};
-const exists = fs.existsSync(configPath);
-if (exists) {
-  let raw;
-  try {
-    raw = fs.readFileSync(configPath, "utf8");
-  } catch (e) {
-    process.stderr.write(`Cannot read ${configPath}: ${e.message}\n`);
-    process.exit(1);
-  }
-  try {
-    config = JSON.parse(raw);
-  } catch (e) {
-    process.stderr.write(`${configPath} is malformed and will NOT be overwritten: ${e.message}\n`);
-    process.exit(1);
-  }
-  if (typeof config !== "object" || config === null || Array.isArray(config)) {
-    process.stderr.write(`${configPath} top-level value is not an object; refusing to overwrite\n`);
-    process.exit(1);
-  }
-}
-
-// --- Merge hooks ---
-if (fs.existsSync(hooksPath)) {
-  const hooks = JSON.parse(fs.readFileSync(hooksPath, "utf8"));
-  config.hooks = config.hooks || {};
-  config.hooks.enabled = true;
-  config.hooks.events = config.hooks.events || {};
-  if (hooks.hooks) {
-    for (const [event, handlers] of Object.entries(hooks.hooks)) {
-      const existing = (config.hooks.events[event] || []).filter(
-        (group) => !JSON.stringify(group).includes("openviking-memory"),
-      );
-      config.hooks.events[event] = [...existing, ...handlers];
-    }
-  }
-}
-
-// --- Merge MCP: only manage entries tagged as openviking-memory ---
-if (fs.existsSync(mcpPath)) {
-  const stat = fs.statSync(mcpPath);
-  if (stat.size > 0) {
-    const mcp = JSON.parse(fs.readFileSync(mcpPath, "utf8"));
-    config.mcp = config.mcp || {};
-    config.mcp.servers = config.mcp.servers || {};
-    const incoming = mcp.mcpServers || {};
-    if (mcp.openviking) incoming.openviking = mcp.openviking;
-    for (const [name, server] of Object.entries(incoming)) {
-      const existing = config.mcp.servers[name];
-      // Only replace if the entry doesn't exist OR is already managed by us
-      if (existing && !JSON.stringify(existing).includes("openviking-memory")) {
-        process.stderr.write(`Skipping ${name} MCP server: already exists and is not managed by OpenViking\n`);
-        continue;
-      }
-      config.mcp.servers[name] = server;
-    }
-  }
-}
-
-// --- Atomic write: backup + tmp + rename ---
-if (exists) fs.copyFileSync(configPath, `${configPath}.bak`);
-const tmp = `${configPath}.${process.pid}.tmp`;
-fs.writeFileSync(tmp, JSON.stringify(config, null, 2) + "\n");
-fs.renameSync(tmp, configPath);
-ZCODE_MERGE_NODE
+  local lib
+  lib="$(require_install_lib_dir)" || return 1
+  "$NODE_BIN" "$lib/host-json-config.mjs" merge-zcode "$1" "$2" "$3"
 }
 
 install_zcode() {
   heading "$(t 'ZCode integration' 'ZCode 集成')"
   local root hooks_path mcp_path config_path
-  root="$(assemble_agent_integration zcode-memory-plugin zcode)" || return 1
+  root="$(assemble_agent_integration zcode zcode)" || return 1
   hooks_path="$HOME/.zcode/hooks.json"
   mcp_path="$(zcode_mcp_path)"
   config_path="$HOME/.zcode/cli/config.json"
@@ -2230,7 +2193,7 @@ install_zcode() {
 
 install_trae_variant() { # install_trae_variant <trae|trae-cn>
   local client_id="$1" root hooks_path mcp_path
-  root="$(assemble_agent_integration trae-memory-hooks "$client_id")" || return 1
+  root="$(assemble_agent_integration trae "$client_id")" || return 1
   hooks_path="$HOME/.$client_id/hooks.json"
   mcp_path="$(trae_mcp_path "$client_id")"
   agent_write_json_configs trae "$hooks_path" "$mcp_path" "$root" "$client_id" "$NODE_BIN"
@@ -2282,6 +2245,7 @@ opencode_register_npm_plugin() {
 
 opencode_install_mcp_proxy_snapshot() {
   local plugin_dir="$1" dest="$2"
+  prepare_opencode_runtime "$plugin_dir" || return 1
   rm -rf "$dest.tmp"
   mkdir -p "$dest.tmp"
   (cd "$plugin_dir" && tar --exclude node_modules --exclude .git -cf - package.json lib servers) | (cd "$dest.tmp" && tar -xf -)
@@ -2292,340 +2256,12 @@ opencode_install_mcp_proxy_snapshot() {
 }
 
 opencode_write_config() {
-  local cfg="$1" plugin_spec="$2" mcp_proxy="$3"
+  local cfg="$1" plugin_spec="$2" mcp_proxy="$3" lib
+  lib="$(require_install_lib_dir)" || return 1
   mkdir -p "$(dirname "$cfg")"
   [ -f "$cfg" ] || printf '{\n}\n' > "$cfg"
   cp "$cfg" "$cfg.bak.$(date +%Y%m%d-%H%M%S)"
-  node - "$cfg" "$plugin_spec" "$mcp_proxy" <<'NODE'
-const fs = require("node:fs");
-const file = process.argv[2];
-const pluginSpec = process.argv[3] || "";
-const mcpProxy = process.argv[4] || "";
-let raw = "";
-try { raw = fs.readFileSync(file, "utf8"); } catch {}
-
-function stripJsonc(s) {
-  let out = "";
-  let i = 0;
-  while (i < s.length) {
-    const ch = s[i];
-    const next = s[i + 1];
-    if (ch === '"' || ch === "'") {
-      const end = readStringEnd(s, i);
-      out += s.slice(i, end);
-      i = end;
-    } else if (ch === "/" && next === "/") {
-      i += 2;
-      while (i < s.length && s[i] !== "\n") i++;
-    } else if (ch === "/" && next === "*") {
-      i += 2;
-      while (i < s.length && !(s[i] === "*" && s[i + 1] === "/")) i++;
-      i = Math.min(s.length, i + 2);
-    } else {
-      out += ch;
-      i++;
-    }
-  }
-  return out.replace(/,\s*([}\]])/g, "$1");
-}
-
-function readStringEnd(s, start) {
-  const quote = s[start];
-  let i = start + 1;
-  while (i < s.length) {
-    if (s[i] === "\\") {
-      i += 2;
-    } else if (s[i] === quote) {
-      return i + 1;
-    } else {
-      i++;
-    }
-  }
-  return s.length;
-}
-
-function skipTrivia(s, i, end = s.length) {
-  while (i < end) {
-    if (/\s/.test(s[i])) {
-      i++;
-    } else if (s[i] === "/" && s[i + 1] === "/") {
-      i += 2;
-      while (i < end && s[i] !== "\n") i++;
-    } else if (s[i] === "/" && s[i + 1] === "*") {
-      i += 2;
-      while (i < end && !(s[i] === "*" && s[i + 1] === "/")) i++;
-      i = Math.min(end, i + 2);
-    } else {
-      break;
-    }
-  }
-  return i;
-}
-
-function parseStringLiteral(s, start) {
-  const end = readStringEnd(s, start);
-  try {
-    return { value: JSON.parse(s.slice(start, end)), end };
-  } catch {
-    return { value: "", end };
-  }
-}
-
-function findTopLevelObject(s) {
-  const start = skipTrivia(s, 0);
-  if (s[start] !== "{") return null;
-  let depth = 0;
-  let i = start;
-  while (i < s.length) {
-    if (s[i] === '"' || s[i] === "'") {
-      i = readStringEnd(s, i);
-      continue;
-    }
-    if (s[i] === "/" && (s[i + 1] === "/" || s[i + 1] === "*")) {
-      i = skipTrivia(s, i);
-      continue;
-    }
-    if (s[i] === "{" || s[i] === "[") depth++;
-    if (s[i] === "}" || s[i] === "]") {
-      depth--;
-      if (depth === 0 && s[i] === "}") return { start, end: i };
-    }
-    i++;
-  }
-  return null;
-}
-
-function findObjectRangeAt(s, start, end = s.length) {
-  const objectStart = skipTrivia(s, start, end);
-  if (s[objectStart] !== "{") return null;
-  let depth = 0;
-  let i = objectStart;
-  while (i < end) {
-    if (s[i] === '"' || s[i] === "'") {
-      i = readStringEnd(s, i);
-      continue;
-    }
-    if (s[i] === "/" && (s[i + 1] === "/" || s[i + 1] === "*")) {
-      i = skipTrivia(s, i, end);
-      continue;
-    }
-    if (s[i] === "{" || s[i] === "[") depth++;
-    if (s[i] === "}" || s[i] === "]") {
-      depth--;
-      if (depth === 0 && s[i] === "}") return { start: objectStart, end: i };
-    }
-    i++;
-  }
-  return null;
-}
-
-function findArrayRangeAt(s, start, end = s.length) {
-  const arrayStart = skipTrivia(s, start, end);
-  if (s[arrayStart] !== "[") return null;
-  let depth = 0;
-  let i = arrayStart;
-  while (i < end) {
-    if (s[i] === '"' || s[i] === "'") {
-      i = readStringEnd(s, i);
-      continue;
-    }
-    if (s[i] === "/" && (s[i + 1] === "/" || s[i + 1] === "*")) {
-      i = skipTrivia(s, i, end);
-      continue;
-    }
-    if (s[i] === "{" || s[i] === "[") depth++;
-    if (s[i] === "}" || s[i] === "]") {
-      depth--;
-      if (depth === 0 && s[i] === "]") return { start: arrayStart, end: i };
-    }
-    i++;
-  }
-  return null;
-}
-
-function findTopLevelProperty(s, objectRange, name) {
-  let depth = 1;
-  let i = objectRange.start + 1;
-  while (i < objectRange.end) {
-    if (s[i] === "/" && (s[i + 1] === "/" || s[i + 1] === "*")) {
-      i = skipTrivia(s, i, objectRange.end);
-      continue;
-    }
-    if (s[i] === '"' || s[i] === "'") {
-      const keyStart = i;
-      const parsed = parseStringLiteral(s, i);
-      i = parsed.end;
-      const afterKey = skipTrivia(s, i, objectRange.end);
-      if (depth === 1 && parsed.value === name && s[afterKey] === ":") {
-        const valueStart = skipTrivia(s, afterKey + 1, objectRange.end);
-        return {
-          keyStart,
-          valueStart,
-          replaceEnd: findPropertyReplaceEnd(s, valueStart, objectRange.end),
-        };
-      }
-      continue;
-    }
-    if (s[i] === "{" || s[i] === "[") depth++;
-    if (s[i] === "}" || s[i] === "]") depth--;
-    i++;
-  }
-  return null;
-}
-
-function findPropertyReplaceEnd(s, valueStart, objectEnd) {
-  let depth = 0;
-  let i = skipTrivia(s, valueStart, objectEnd);
-  let lastTokenEnd = i;
-  while (i < objectEnd) {
-    if (s[i] === '"' || s[i] === "'") {
-      i = readStringEnd(s, i);
-      lastTokenEnd = i;
-      continue;
-    }
-    if (s[i] === "/" && (s[i + 1] === "/" || s[i + 1] === "*")) {
-      i = skipTrivia(s, i, objectEnd);
-      continue;
-    }
-    if (depth === 0 && s[i] === ",") return lastTokenEnd;
-    if (s[i] === "{" || s[i] === "[") depth++;
-    if (s[i] === "}" || s[i] === "]") depth--;
-    if (!/\s/.test(s[i])) lastTokenEnd = i + 1;
-    i++;
-  }
-  return lastTokenEnd;
-}
-
-function findLineIndent(s, index) {
-  const lineStart = s.lastIndexOf("\n", index - 1) + 1;
-  const prefix = s.slice(lineStart, index);
-  return /^[ \t]*$/.test(prefix) ? prefix : "";
-}
-
-function detectPropertyIndent(s, objectRange) {
-  let i = objectRange.start + 1;
-  while (i < objectRange.end) {
-    i = skipTrivia(s, i, objectRange.end);
-    if (s[i] === '"' || s[i] === "'") return findLineIndent(s, i) || "  ";
-    if (s[i] === "{" || s[i] === "[") break;
-    i++;
-  }
-  const closeIndent = findLineIndent(s, objectRange.end);
-  return `${closeIndent}  `;
-}
-
-function hasTopLevelProperty(s, objectRange) {
-  let i = objectRange.start + 1;
-  while (i < objectRange.end) {
-    i = skipTrivia(s, i, objectRange.end);
-    if (s[i] === '"' || s[i] === "'") return true;
-    i++;
-  }
-  return false;
-}
-
-function objectEndsWithComma(s, objectRange) {
-  const body = s.slice(objectRange.start + 1, objectRange.end);
-  return body.trimEnd().endsWith(",");
-}
-
-function rangeHasValue(s, range) {
-  let i = range.start + 1;
-  while (i < range.end) {
-    i = skipTrivia(s, i, range.end);
-    if (i < range.end) return true;
-  }
-  return false;
-}
-
-function formatProperty(name, value, indent) {
-  const json = JSON.stringify(value, null, 2);
-  const formatted = json.split("\n").map((line, idx) => idx === 0 ? line : `${indent}${line}`).join("\n");
-  return `${JSON.stringify(name)}: ${formatted}`;
-}
-
-function setPropertyInObject(s, objectRange, name, value) {
-  const existing = findTopLevelProperty(s, objectRange, name);
-  if (existing) {
-    const indent = findLineIndent(s, existing.keyStart) || detectPropertyIndent(s, objectRange);
-    return `${s.slice(0, existing.keyStart)}${formatProperty(name, value, indent)}${s.slice(existing.replaceEnd)}`;
-  }
-
-  const indent = detectPropertyIndent(s, objectRange);
-  const closeIndent = findLineIndent(s, objectRange.end);
-  const needsComma = hasTopLevelProperty(s, objectRange) && !objectEndsWithComma(s, objectRange);
-  const prefix = needsComma ? "," : "";
-  const insertion = `${prefix}\n${indent}${formatProperty(name, value, indent)}\n${closeIndent}`;
-  return `${s.slice(0, objectRange.end)}${insertion}${s.slice(objectRange.end)}`;
-}
-
-function setTopLevelProperty(s, name, value) {
-  let objectRange = findTopLevelObject(s);
-  if (!objectRange) {
-    s = "{\n}\n";
-    objectRange = findTopLevelObject(s);
-  }
-  return setPropertyInObject(s, objectRange, name, value);
-}
-
-function setNestedObjectProperty(s, parentName, childName, childValue, fallbackParentValue) {
-  let objectRange = findTopLevelObject(s);
-  if (!objectRange) {
-    s = "{\n}\n";
-    objectRange = findTopLevelObject(s);
-  }
-  const parent = findTopLevelProperty(s, objectRange, parentName);
-  if (!parent) return setPropertyInObject(s, objectRange, parentName, fallbackParentValue);
-  const parentRange = findObjectRangeAt(s, parent.valueStart, parent.replaceEnd);
-  if (!parentRange) return setPropertyInObject(s, objectRange, parentName, fallbackParentValue);
-  return setPropertyInObject(s, parentRange, childName, childValue);
-}
-
-function appendStringToTopLevelArray(s, name, value) {
-  let objectRange = findTopLevelObject(s);
-  if (!objectRange) {
-    s = "{\n}\n";
-    objectRange = findTopLevelObject(s);
-  }
-  const prop = findTopLevelProperty(s, objectRange, name);
-  if (!prop) return setPropertyInObject(s, objectRange, name, [value]);
-  const arrayRange = findArrayRangeAt(s, prop.valueStart, prop.replaceEnd);
-  if (!arrayRange) return setPropertyInObject(s, objectRange, name, [value]);
-  const propIndent = findLineIndent(s, prop.keyStart) || detectPropertyIndent(s, objectRange);
-  const itemIndent = `${propIndent}  `;
-  const closeIndent = findLineIndent(s, arrayRange.end) || propIndent;
-  const needsComma = rangeHasValue(s, arrayRange) && !s.slice(arrayRange.start + 1, arrayRange.end).trimEnd().endsWith(",");
-  const prefix = needsComma ? "," : "";
-  const insertion = `${prefix}\n${itemIndent}${JSON.stringify(value)}\n${closeIndent}`;
-  return `${s.slice(0, arrayRange.end)}${insertion}${s.slice(arrayRange.end)}`;
-}
-
-let data = {};
-try { data = raw.trim() ? JSON.parse(stripJsonc(raw)) : {}; } catch { data = {}; }
-let nextRaw = raw.trim() ? raw : "{\n}\n";
-if (pluginSpec) {
-  const next = Array.isArray(data.plugin) ? data.plugin.slice() : [];
-  if (!next.includes(pluginSpec)) {
-    next.push(pluginSpec);
-    nextRaw = appendStringToTopLevelArray(nextRaw, "plugin", pluginSpec);
-  }
-  data.plugin = next;
-}
-if (mcpProxy) {
-  data.mcp = data.mcp && typeof data.mcp === "object" && !Array.isArray(data.mcp) ? data.mcp : {};
-  if (!data.mcp.openviking || data.mcp.openviking.enabled !== false) {
-    data.mcp.openviking = {
-      type: "local",
-      command: ["node", mcpProxy],
-      enabled: true,
-      timeout: 15000,
-    };
-    nextRaw = setNestedObjectProperty(nextRaw, "mcp", "openviking", data.mcp.openviking, data.mcp);
-  }
-}
-if (!nextRaw.endsWith("\n")) nextRaw += "\n";
-fs.writeFileSync(file, nextRaw);
-NODE
+  "$NODE_BIN" "$lib/jsonc-edit.mjs" "$cfg" "$plugin_spec" "$mcp_proxy"
 }
 
 opencode_install_file_plugin() {
@@ -2634,6 +2270,7 @@ opencode_install_file_plugin() {
     warn "$(t 'OpenCode plugin sources not found; skipping.' '未找到 OpenCode 插件源码，跳过。')"
     return 0
   }
+  prepare_opencode_runtime "$plugin_dir" || return 1
   dest="$HOME/.config/opencode/plugins/openviking"
   mkdir -p "$(dirname "$dest")"
   if [ "$SOURCE_MODE" = "dev" ]; then
@@ -2658,32 +2295,59 @@ opencode_install_file_plugin() {
 # pi
 # ---------------------------------------------------------------------------
 
+# Whole-directory installs need generated dependencies before copying. Flat
+# marketplace archives already contain them and have no source generator.
+sync_shared_runtime() {
+  local shared root
+  shared="$(plugin_dir_on_disk memory-plugin-shared)" || return 0
+  shared="$(cd "$shared" && pwd -P)" || return 1
+  root="$(cd "$shared/../.." 2>/dev/null && pwd)" || return 0
+  [ -f "$shared/sync.mjs" ] && [ -d "$root/examples/memory-plugin-shared" ] || return 0
+  "$NODE_BIN" "$shared/sync.mjs" >/dev/null
+}
+
+prepare_opencode_runtime() {
+  local plugin_dir="$1"
+  sync_shared_runtime || return 1
+  # Import resolves the complete dependency graph; node --check only parses.
+  "$NODE_BIN" --input-type=module -e 'import { pathToFileURL } from "node:url"; await import(pathToFileURL(process.argv[2]));' \
+    check-runtime "$plugin_dir/servers/mcp-proxy.mjs" || return 1
+}
+
 install_pi() {
   heading "$(t '4. pi extension' '4. pi 扩展')"
   if ! command -v pi >/dev/null 2>&1; then
     warn "$(t 'pi CLI not found; skipping pi extension install.' '未找到 pi 命令，跳过 pi 扩展安装。')"
     return 0
   fi
-  local plugin_dir dest tmp keep_config
+  local plugin_dir dest tmp
   plugin_dir="$(plugin_dir_on_disk pi-coding-agent-extension)" || {
     warn "$(t 'pi extension sources not found; skipping.' '未找到 pi 扩展源码，跳过。')"
     return 0
   }
+  sync_shared_runtime
+  if [ ! -f "$plugin_dir/shared/credentials.mjs" ]; then
+    warn "$(t 'pi extension shared runtime is missing; run node examples/memory-plugin-shared/sync.mjs and retry.' '未找到 pi 扩展的共享运行时；请先运行 node examples/memory-plugin-shared/sync.mjs 再重试。')"
+    return 0
+  fi
   dest="$HOME/.pi/agent/extensions/openviking"
   tmp="$dest.tmp"
-  keep_config=""
-  [ -f "$dest/config.json" ] && keep_config="$dest/config.json"
   rm -rf "$tmp"
   mkdir -p "$tmp"
   (cd "$plugin_dir" && tar --exclude node_modules --exclude .git -cf - .) | (cd "$tmp" && tar -xf -)
-  if [ -n "$keep_config" ]; then
-    cp "$keep_config" "$tmp/config.json"
-  fi
   rm -rf "$dest"
   mkdir -p "$(dirname "$dest")"
   mv "$tmp" "$dest"
-  pi install "$dest" || warn "$(t 'pi extension copied but pi install registration failed; run pi install manually.' 'pi 扩展文件已复制，但 pi install 注册失败；请手动运行 pi install。')"
-  info "$(t 'pi extension installed:' 'pi 扩展已安装：') $dest"
+  # ~/.pi/agent/extensions/ is one of pi's auto-discovery roots, so copying the
+  # extension there is enough for pi to load it. Do NOT also `pi install` the
+  # same path: that adds a "packages" entry pointing at the directory while
+  # auto-discovery already found its index.ts, and pi dedupes on the canonical
+  # path — a directory and its index.ts don't match, so the extension loads
+  # twice (duplicate /viking command). Instead, purge any stale packages entry
+  # left by older installer versions; `pi remove` on a local path only edits
+  # settings and never deletes the copied files.
+  pi remove "$dest" >/dev/null 2>&1 || true
+  info "$(t 'pi extension installed (auto-discovered):' 'pi 扩展已安装（自动发现）：') $dest"
 }
 
 # ---------------------------------------------------------------------------
@@ -2734,25 +2398,24 @@ $CODEX_BINS
 EOF
   fi
   if contains_harness cursor; then
-    if grep -q 'scripts/session-start.mjs' "$HOME/.cursor/hooks.json" 2>/dev/null \
-      && grep -q 'scripts/auto-recall.mjs' "$HOME/.cursor/hooks.json" 2>/dev/null \
-      && grep -q 'scripts/auto-capture.mjs' "$HOME/.cursor/hooks.json" 2>/dev/null \
+    if grep -q 'scripts/hook.mjs' "$HOME/.cursor/hooks.json" 2>/dev/null \
       && grep -q 'scripts/uri-guard.mjs' "$HOME/.cursor/hooks.json" 2>/dev/null \
       && grep -q 'OPENVIKING_INTEGRATION_ID' "$HOME/.cursor/hooks.json" 2>/dev/null \
       && grep -q 'mcp-proxy.mjs' "$HOME/.cursor/mcp.json" 2>/dev/null \
-      && [ -f "$OV_HOME/agent-integrations/cursor/scripts/cursor-hook.mjs" ] \
+      && [ -f "$OV_HOME/agent-integrations/cursor/scripts/hook.mjs" ] \
       && [ -f "$OV_HOME/agent-integrations/cursor/scripts/uri-guard.mjs" ] \
-      && [ -f "$OV_HOME/agent-integrations/memory-plugin-shared/lib/agent-uri-guard.mjs" ] \
-      && [ -f "$OV_HOME/agent-integrations/cursor/.cursor-plugin/plugin.json" ] \
+      && [ -f "$OV_HOME/agent-integrations/memory-plugin-shared/lib/uri-guard.mjs" ] \
+      && [ -f "$OV_HOME/agent-integrations/memory-plugin-shared/lib/agent-hook-runtime.mjs" ] \
+      && [ -f "$OV_HOME/agent-integrations/cursor/plugin.json" ] \
       && [ -f "$OV_HOME/agent-integrations/cursor/integration.json" ] \
       && [ -f "$HOME/.cursor/rules/openviking-memory.mdc" ] \
       && [ -f "$HOME/.cursor/skills/openviking-memory/SKILL.md" ]; then
-      "$NODE_BIN" --check "$OV_HOME/agent-integrations/cursor/scripts/cursor-hook.mjs" \
+      "$NODE_BIN" --check "$OV_HOME/agent-integrations/cursor/scripts/hook.mjs" \
         || { ok=0; agent_fatal=1; }
       "$NODE_BIN" --check "$OV_HOME/agent-integrations/cursor/scripts/uri-guard.mjs" \
         || { ok=0; agent_fatal=1; }
       if printf '%s' '{}' | env HOME="$HOME" OPENVIKING_MEMORY_ENABLED=0 \
-        "$NODE_BIN" "$OV_HOME/agent-integrations/cursor/scripts/session-start.mjs" >/dev/null; then
+        "$NODE_BIN" "$OV_HOME/agent-integrations/cursor/scripts/hook.mjs" sessionStart cursor >/dev/null; then
         info "cursor: $(t 'installed Hook runtime passed its smoke test' '已安装的 Hook 运行时通过 smoke test')"
       else
         warn "cursor: $(t 'installed Hook runtime failed its smoke test' '已安装的 Hook 运行时 smoke test 失败')"
@@ -2767,21 +2430,20 @@ EOF
   if contains_harness trae; then
     local trae_mcp
     trae_mcp="$(trae_mcp_path trae)"
-    if grep -q 'scripts/session-start.mjs' "$HOME/.trae/hooks.json" 2>/dev/null \
-      && grep -q 'scripts/auto-recall.mjs' "$HOME/.trae/hooks.json" 2>/dev/null \
-      && grep -q 'scripts/auto-capture.mjs' "$HOME/.trae/hooks.json" 2>/dev/null \
+    if grep -q 'scripts/hook.mjs' "$HOME/.trae/hooks.json" 2>/dev/null \
       && grep -q 'scripts/uri-guard.mjs' "$HOME/.trae/hooks.json" 2>/dev/null \
       && grep -q 'OPENVIKING_INTEGRATION_ID' "$HOME/.trae/hooks.json" 2>/dev/null \
       && grep -q 'mcp-proxy.mjs' "$trae_mcp" 2>/dev/null \
-      && [ -f "$OV_HOME/agent-integrations/trae/scripts/trae-hook.mjs" ] \
+      && [ -f "$OV_HOME/agent-integrations/trae/scripts/hook.mjs" ] \
       && [ -f "$OV_HOME/agent-integrations/trae/scripts/uri-guard.mjs" ] \
-      && [ -f "$OV_HOME/agent-integrations/trae/integration.json" ]; then
-      "$NODE_BIN" --check "$OV_HOME/agent-integrations/trae/scripts/trae-hook.mjs" \
+      && [ -f "$OV_HOME/agent-integrations/trae/integration.json" ] \
+      && [ -f "$OV_HOME/agent-integrations/memory-plugin-shared/lib/agent-hook-runtime.mjs" ]; then
+      "$NODE_BIN" --check "$OV_HOME/agent-integrations/trae/scripts/hook.mjs" \
         || { ok=0; agent_fatal=1; }
       "$NODE_BIN" --check "$OV_HOME/agent-integrations/trae/scripts/uri-guard.mjs" \
         || { ok=0; agent_fatal=1; }
       if ! printf '%s' '{}' | env HOME="$HOME" OPENVIKING_MEMORY_ENABLED=0 \
-        "$NODE_BIN" "$OV_HOME/agent-integrations/trae/scripts/session-start.mjs" trae >/dev/null; then
+        "$NODE_BIN" "$OV_HOME/agent-integrations/trae/scripts/hook.mjs" session-start trae >/dev/null; then
         warn "trae: $(t 'installed Hook runtime failed its smoke test' '已安装的 Hook 运行时 smoke test 失败')"
         ok=0; agent_fatal=1
       fi
@@ -2794,21 +2456,20 @@ EOF
   if contains_harness trae-cn; then
     local trae_cn_mcp
     trae_cn_mcp="$(trae_mcp_path trae-cn)"
-    if grep -q 'scripts/session-start.mjs' "$HOME/.trae-cn/hooks.json" 2>/dev/null \
-      && grep -q 'scripts/auto-recall.mjs' "$HOME/.trae-cn/hooks.json" 2>/dev/null \
-      && grep -q 'scripts/auto-capture.mjs' "$HOME/.trae-cn/hooks.json" 2>/dev/null \
+    if grep -q 'scripts/hook.mjs' "$HOME/.trae-cn/hooks.json" 2>/dev/null \
       && grep -q 'scripts/uri-guard.mjs' "$HOME/.trae-cn/hooks.json" 2>/dev/null \
       && grep -q 'OPENVIKING_INTEGRATION_ID' "$HOME/.trae-cn/hooks.json" 2>/dev/null \
       && grep -q 'mcp-proxy.mjs' "$trae_cn_mcp" 2>/dev/null \
-      && [ -f "$OV_HOME/agent-integrations/trae-cn/scripts/trae-hook.mjs" ] \
+      && [ -f "$OV_HOME/agent-integrations/trae-cn/scripts/hook.mjs" ] \
       && [ -f "$OV_HOME/agent-integrations/trae-cn/scripts/uri-guard.mjs" ] \
-      && [ -f "$OV_HOME/agent-integrations/trae-cn/integration.json" ]; then
-      "$NODE_BIN" --check "$OV_HOME/agent-integrations/trae-cn/scripts/trae-hook.mjs" \
+      && [ -f "$OV_HOME/agent-integrations/trae-cn/integration.json" ] \
+      && [ -f "$OV_HOME/agent-integrations/memory-plugin-shared/lib/agent-hook-runtime.mjs" ]; then
+      "$NODE_BIN" --check "$OV_HOME/agent-integrations/trae-cn/scripts/hook.mjs" \
         || { ok=0; agent_fatal=1; }
       "$NODE_BIN" --check "$OV_HOME/agent-integrations/trae-cn/scripts/uri-guard.mjs" \
         || { ok=0; agent_fatal=1; }
       if ! printf '%s' '{}' | env HOME="$HOME" OPENVIKING_MEMORY_ENABLED=0 \
-        "$NODE_BIN" "$OV_HOME/agent-integrations/trae-cn/scripts/session-start.mjs" trae-cn >/dev/null; then
+        "$NODE_BIN" "$OV_HOME/agent-integrations/trae-cn/scripts/hook.mjs" session-start trae-cn >/dev/null; then
         warn "trae-cn: $(t 'installed Hook runtime failed its smoke test' '已安装的 Hook 运行时 smoke test 失败')"
         ok=0; agent_fatal=1
       fi
@@ -2818,23 +2479,52 @@ EOF
       ok=0; agent_fatal=1
     fi
   fi
+  if contains_harness trae-cli; then
+    local trae_home="${TRAE_HOME:-$HOME/.trae}"
+    local trae_cli_home="${TRAECLI_HOME:-$trae_home/cli}"
+    local trae_cli_hooks="$trae_cli_home/hooks.json"
+    local trae_cli_config="$trae_home/traecli.toml"
+    if grep -q 'scripts/session-start.mjs' "$trae_cli_hooks" 2>/dev/null \
+      && grep -q 'scripts/auto-recall.mjs' "$trae_cli_hooks" 2>/dev/null \
+      && grep -q 'scripts/auto-capture.mjs' "$trae_cli_hooks" 2>/dev/null \
+      && grep -q 'scripts/uri-guard.mjs' "$trae_cli_hooks" 2>/dev/null \
+      && grep -q 'OPENVIKING_INTEGRATION_ID' "$trae_cli_hooks" 2>/dev/null \
+      && grep -q '\[mcp_servers."openviking-memory"\]' "$trae_cli_config" 2>/dev/null \
+      && grep -q 'mcp-proxy.mjs' "$trae_cli_config" 2>/dev/null \
+      && [ -f "$OV_HOME/agent-integrations/trae-cli/scripts/trae-cli-hook.mjs" ] \
+      && [ -f "$OV_HOME/agent-integrations/trae-cli/scripts/uri-guard.mjs" ] \
+      && [ -f "$OV_HOME/agent-integrations/trae-cli/integration.json" ]; then
+      "$NODE_BIN" --check "$OV_HOME/agent-integrations/trae-cli/scripts/trae-cli-hook.mjs" \
+        || { ok=0; agent_fatal=1; }
+      "$NODE_BIN" --check "$OV_HOME/agent-integrations/trae-cli/scripts/uri-guard.mjs" \
+        || { ok=0; agent_fatal=1; }
+      if ! printf '%s' '{}' | env HOME="$HOME" OPENVIKING_MEMORY_ENABLED=0 \
+        "$NODE_BIN" "$OV_HOME/agent-integrations/trae-cli/scripts/session-start.mjs" >/dev/null; then
+        warn "trae-cli: $(t 'installed Hook runtime failed its smoke test' '已安装的 Hook 运行时 smoke test 失败')"
+        ok=0; agent_fatal=1
+      fi
+      info "trae-cli: $(t 'hooks and MCP are configured' 'hooks 与 MCP 已配置')"
+    else
+      warn "trae-cli: $(t 'OpenViking hook or MCP config is incomplete' 'OpenViking hook 或 MCP 配置不完整')"
+      ok=0; agent_fatal=1
+    fi
+  fi
   if contains_harness zcode; then
     local zcode_config="$HOME/.zcode/cli/config.json"
-    if grep -q 'scripts/session-start.mjs' "$zcode_config" 2>/dev/null \
-      && grep -q 'scripts/auto-recall.mjs' "$zcode_config" 2>/dev/null \
-      && grep -q 'scripts/auto-capture.mjs' "$zcode_config" 2>/dev/null \
+    if grep -q 'scripts/hook.mjs' "$zcode_config" 2>/dev/null \
       && grep -q 'scripts/uri-guard.mjs' "$zcode_config" 2>/dev/null \
       && grep -q 'OPENVIKING_INTEGRATION_ID' "$zcode_config" 2>/dev/null \
       && grep -q 'mcp-proxy.mjs' "$zcode_config" 2>/dev/null \
-      && [ -f "$OV_HOME/agent-integrations/zcode/scripts/zcode-hook.mjs" ] \
+      && [ -f "$OV_HOME/agent-integrations/zcode/scripts/hook.mjs" ] \
       && [ -f "$OV_HOME/agent-integrations/zcode/scripts/uri-guard.mjs" ] \
-      && [ -f "$OV_HOME/agent-integrations/zcode/integration.json" ]; then
-      "$NODE_BIN" --check "$OV_HOME/agent-integrations/zcode/scripts/zcode-hook.mjs" \
+      && [ -f "$OV_HOME/agent-integrations/zcode/integration.json" ] \
+      && [ -f "$OV_HOME/agent-integrations/memory-plugin-shared/lib/agent-hook-runtime.mjs" ]; then
+      "$NODE_BIN" --check "$OV_HOME/agent-integrations/zcode/scripts/hook.mjs" \
         || { ok=0; agent_fatal=1; }
       "$NODE_BIN" --check "$OV_HOME/agent-integrations/zcode/scripts/uri-guard.mjs" \
         || { ok=0; agent_fatal=1; }
       if ! printf '%s' '{}' | env HOME="$HOME" OPENVIKING_MEMORY_ENABLED=0 \
-        "$NODE_BIN" "$OV_HOME/agent-integrations/zcode/scripts/session-start.mjs" >/dev/null; then
+        "$NODE_BIN" "$OV_HOME/agent-integrations/zcode/scripts/hook.mjs" session-start zcode >/dev/null; then
         warn "zcode: $(t 'installed Hook runtime failed its smoke test' '已安装的 Hook 运行时 smoke test 失败')"
         ok=0; agent_fatal=1
       fi
@@ -2876,21 +2566,36 @@ EOF
   fi
   if contains_harness pi; then
     if [ -f "$HOME/.pi/agent/extensions/openviking/index.ts" ] || [ -f "$HOME/.pi/agent/extensions/openviking/index.js" ]; then
-      info "pi: $PLUGIN_NAME $(t 'extension files present' '扩展文件已存在')"
+      info "pi: $PLUGIN_NAME $(t 'extension files present (auto-discovered)' '扩展文件已存在（自动发现）')"
     else
       warn "pi: $PLUGIN_NAME $(t 'extension files not found' '未找到扩展文件')"
       ok=0
     fi
     if command -v pi >/dev/null 2>&1; then
+      # The extension lives under pi's auto-discovery root, so it must NOT appear
+      # as a configured "packages" entry — a stale entry there loads it twice.
       if pi list 2>/dev/null | grep -q 'extensions/openviking'; then
-        info "pi: $PLUGIN_NAME $(t 'registered in pi settings' '已注册到 pi settings')"
-      else
-        warn "pi: $PLUGIN_NAME $(t 'not registered in pi settings' '未注册到 pi settings')"
+        warn "pi: $PLUGIN_NAME $(t 'still registered as a package (duplicate load); run pi remove ~/.pi/agent/extensions/openviking' '仍作为 package 注册（会重复加载）；请运行 pi remove ~/.pi/agent/extensions/openviking')"
         ok=0
       fi
     fi
     if [ -f "$HOME/.pi/agent/extensions/openviking/shared/recall-core.mjs" ]; then
       node --check "$HOME/.pi/agent/extensions/openviking/shared/recall-core.mjs" || ok=0
+    fi
+  fi
+  if contains_harness dsh && command -v dsh >/dev/null 2>&1; then
+    local dsh_profile="${DSH_PROFILE:-$DSH_PROFILE_DEFAULT}"
+    if dsh plugin --profile "$dsh_profile" ls 2>/dev/null | grep -q "$DSH_PACKAGE"; then
+      info "dsh: $DSH_PACKAGE $(t 'installed in profile' '已安装到 profile') $dsh_profile"
+    else
+      warn "dsh: $DSH_PACKAGE $(t 'not found in profile' '未在 profile 中找到') $dsh_profile"
+      ok=0
+    fi
+    if dsh --profile "$dsh_profile" --dump-config 2>/dev/null | grep -q 'openviking-memory'; then
+      info "dsh: $(t 'plugin group composed into the profile' '插件组已合入 profile')"
+    else
+      warn "dsh: $(t 'plugin group not present in the composed profile' '合成后的 profile 中没有插件组')"
+      ok=0
     fi
   fi
   if [ -n "$MKT_DIR" ] && [ -f "$MKT_DIR/claude-code-memory-plugin/scripts/marketplace.test.mjs" ] && [ -d "$MKT_DIR/../.git" ]; then
@@ -2927,10 +2632,13 @@ resolve_self_checkout
 select_harnesses
 validate_selected_harnesses
 select_compatible_bins
+select_dsh_profile
 refresh_available_harnesses
-info "$(t 'Selected harnesses:' '已选择：') $(printf '%s' "$SELECTED_HARNESSES" | tr ',' ' ')"
+info "$(t 'Selected harnesses:' '已选择：') $(printf '%s' "${PUBLIC_SELECTED_HARNESSES:-$SELECTED_HARNESSES}" | tr ',' ' ')"
 if contains_harness claude; then info "$(t 'Claude-format commands:' 'Claude 格式命令：') $(list_words "$CLAUDE_BINS")"; fi
-if contains_harness codex; then info "$(t 'Codex-format commands:' 'Codex 格式命令：') $(list_words "$CODEX_BINS")"; fi
+if [ -n "$TRAECODE_CLI_BIN" ]; then info "TraeCode CLI 2.0: $TRAECODE_CLI_BIN"; fi
+if contains_harness codex && [ -z "$TRAECODE_CLI_BIN" ]; then info "$(t 'Codex-format commands:' 'Codex 格式命令：') $(list_words "$CODEX_BINS")"; fi
+if contains_harness dsh; then info "$(t 'DeepSeek Harness profile:' 'DeepSeek Harness profile：') ${DSH_PROFILE:-$DSH_PROFILE_DEFAULT}"; fi
 validate_selected_bins
 if [ "$UNINSTALL" -eq 1 ]; then
   uninstall_agent_integrations
@@ -2941,7 +2649,6 @@ select_dist
 configure_ovcli
 resolve_source_mode
 prepare_marketplace_dir
-cleanup_rc_wrappers
 
 if contains_harness claude; then
   while IFS= read -r CLAUDE_BIN; do
@@ -2965,6 +2672,7 @@ if contains_harness trae-cn; then install_trae_variant trae-cn; fi
 if contains_harness zcode; then install_zcode; fi
 if contains_harness opencode; then install_opencode; fi
 if contains_harness pi; then install_pi; fi
+if contains_harness dsh; then install_dsh; fi
 validate_install
 
 heading "$(t 'Done' '完成')"
@@ -2974,10 +2682,15 @@ case "$SOURCE_MODE" in
   *) if contains_harness claude || contains_harness codex; then info "Marketplace: ${MKT_DIR:-$CODEX_TOS_GIT_URL}"; fi ;;
 esac
 if contains_harness claude; then info "Claude-format: $(list_words "$CLAUDE_BINS") -> $PLUGIN_ID"; fi
-if contains_harness codex; then info "Codex-format:  $(list_words "$CODEX_BINS") -> $PLUGIN_ID"; fi
+if [ -n "$TRAECODE_CLI_BIN" ]; then
+  info "TraeCode CLI 2.0: $TRAECODE_CLI_BIN -> $PLUGIN_ID"
+elif contains_harness codex; then
+  info "Codex-format:  $(list_words "$CODEX_BINS") -> $PLUGIN_ID"
+fi
 if contains_harness cursor; then info "Cursor: Hooks + MCP + Rule + Skill"; fi
 if contains_harness trae; then info "TRAE: ~/.trae/hooks.json + MCP"; fi
 if contains_harness trae-cn; then info "TRAE CN: ~/.trae-cn/hooks.json + MCP"; fi
 if contains_harness zcode; then info "ZCode: ~/.zcode/cli/config.json (hooks + MCP)"; fi
 if contains_harness opencode; then info "OpenCode: @openviking/opencode-plugin"; fi
 if contains_harness pi; then info "pi: ~/.pi/agent/extensions/openviking"; fi
+if contains_harness dsh; then info "DeepSeek Harness: $DSH_PACKAGE ($(t 'profile' '配置档') ${DSH_PROFILE:-$DSH_PROFILE_DEFAULT})"; fi

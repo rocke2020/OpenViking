@@ -1,31 +1,34 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Semantic retrieval and relation management mixin for VikingFS."""
+"""Semantic retrieval mixin for VikingFS."""
 
 import asyncio
-import json
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
-from openviking.core.namespace import canonicalize_uri
+from openviking.core.context import ContextLevel
 from openviking.core.retrieval_targets import resolve_retrieval_targets
 from openviking.server.error_mapping import is_not_found_error, map_exception
 from openviking.server.identity import RequestContext
+from openviking.storage.abstract_overview import (
+    AbstractOverviewFormatError,
+    body_for_preview,
+    render_abstract_overview,
+)
+from openviking.storage.acl import AclAction
 from openviking.storage.viking_fs._base import (
-    RelationEntry,
+    _ensure_filter_present,
     _ensure_non_empty_search_query,
+    build_matched_context_from_record,
+    is_filter_only_query,
     logger,
 )
 from openviking.telemetry import get_current_telemetry
 from openviking.utils.image_search import build_multimodal_embedding_input
 from openviking_cli.exceptions import NotFoundError
 
-if TYPE_CHECKING:
-    from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
-    from openviking_cli.utils.config import GrepConfig, RerankConfig, RetrievalConfig
-
 
 class _SemanticMixin:
-    """Abstract/overview/relations/find/search/link (semantic retrieval layer)."""
+    """Abstract/overview/find/search semantic retrieval layer."""
 
     # ========== VikingFS Specific Capabilities ==========
 
@@ -43,15 +46,16 @@ class _SemanticMixin:
         file_path = f"{path}/.abstract.md"
         try:
             content_bytes = self._handle_agfs_read(await self._async_agfs.read(file_path))
+            return body_for_preview(self._decode_bytes(content_bytes))
+        except AbstractOverviewFormatError as exc:
+            logger.warning("Malformed directory abstract for %s: %s", uri, exc)
         except Exception as exc:
             if not is_not_found_error(exc):
                 mapped = map_exception(exc, resource=uri)
                 if mapped is not None:
                     raise mapped from exc
                 raise
-            return f"# {uri} [Directory abstract is not ready]"
-
-        return self._decode_bytes(content_bytes)
+        return f"# {uri} [Directory abstract is not ready]"
 
     async def _read_abstract_for_known_dir(
         self,
@@ -63,7 +67,7 @@ class _SemanticMixin:
         Bypasses stat() and isDir check. Caller (i.e. _batch_fetch_abstracts)
         must guarantee that the URI points to a directory.
         """
-        self._ensure_access(uri, ctx)
+        await self._ensure_access(uri, ctx)
         real_ctx = self._ctx_or_default(ctx)
         primary_path = self._uri_to_path(uri, ctx=ctx)
         for path in self._read_paths(uri, ctx=ctx):
@@ -89,7 +93,7 @@ class _SemanticMixin:
         If the caller points to a file, its parent directory is used instead so
         the endpoint remains usable for both file and directory URIs.
         """
-        self._ensure_access(uri, ctx)
+        await self._ensure_access(uri, ctx)
         real_ctx = self._ctx_or_default(ctx)
         primary_path = self._uri_to_path(uri, ctx=ctx)
         path = primary_path
@@ -136,7 +140,7 @@ class _SemanticMixin:
         If the caller points to a file, its parent directory is used instead so
         the endpoint remains usable for both file and directory URIs.
         """
-        self._ensure_access(uri, ctx)
+        await self._ensure_access(uri, ctx)
         real_ctx = self._ctx_or_default(ctx)
         primary_path = self._uri_to_path(uri, ctx=ctx)
         path = primary_path
@@ -174,34 +178,16 @@ class _SemanticMixin:
         file_path = f"{path}/.overview.md"
         try:
             content_bytes = self._handle_agfs_read(await self._async_agfs.read(file_path))
+            return body_for_preview(self._decode_bytes(content_bytes))
+        except AbstractOverviewFormatError as exc:
+            logger.warning("Malformed directory overview for %s: %s", uri, exc)
         except Exception as exc:
             if not is_not_found_error(exc):
                 mapped = map_exception(exc, resource=uri)
                 if mapped is not None:
                     raise mapped from exc
                 raise
-            # Fallback to default if .overview.md doesn't exist
-            return f"# {uri}\n\n[Directory overview is not ready]"
-
-        return self._decode_bytes(content_bytes)
-
-    async def relations(
-        self,
-        uri: str,
-        ctx: Optional[RequestContext] = None,
-    ) -> List[Dict[str, Any]]:
-        """Get relation list.
-
-        Returns: [{"uri": "...", "reason": "..."}, ...]
-        """
-        self._ensure_access(uri, ctx)
-        entries = await self.get_relation_table(uri, ctx=ctx)
-        result = []
-        for entry in entries:
-            for u in entry.uris:
-                if self._is_accessible(u, self._ctx_or_default(ctx)):
-                    result.append({"uri": u, "reason": entry.reason})
-        return result
+        return f"# {uri}\n\n[Directory overview is not ready]"
 
     async def find(
         self,
@@ -226,9 +212,25 @@ class _SemanticMixin:
         Returns:
             FindResult
         """
-        _ensure_non_empty_search_query(query, image_url)
+        # Validate before touching any state: callers rely on a bad request
+        # being rejected even when the instance has not been initialized yet.
+        #
+        # An empty query is allowed only when a metadata filter narrows the
+        # search: the result is then fully determined by that filter, so there
+        # is nothing to embed or rank. Callers that look records up by an exact
+        # tag (e.g. a legacy id carried on the record) would otherwise be forced
+        # to invent a meaningless query string whose similarity score is noise.
+        filter_only = is_filter_only_query(query, image_url)
+        if filter_only:
+            _ensure_filter_present(filter)
+        else:
+            _ensure_non_empty_search_query(query, image_url)
+
         telemetry = get_current_telemetry()
-        from openviking.retrieve.hierarchical_retriever import HierarchicalRetriever
+        from openviking.retrieve.hierarchical_retriever import (
+            HierarchicalRetriever,
+            RetrieverMode,
+        )
         from openviking_cli.retrieve import (
             ContextType,
             FindResult,
@@ -238,8 +240,17 @@ class _SemanticMixin:
         real_ctx = self._ctx_or_default(ctx)
         retrieval_targets = resolve_retrieval_targets(target_uri, real_ctx)
 
+        if filter_only:
+            return await self._find_by_filter(
+                filter=filter,
+                ctx=real_ctx,
+                target_directories=retrieval_targets.target_directories,
+                limit=limit,
+                level=level,
+            )
+
         for target_dir in retrieval_targets.target_directories:
-            self._ensure_access(target_dir, ctx)
+            await self._ensure_retrieval_scope(target_dir, ctx)
 
         storage = self._get_vector_store()
         if not storage:
@@ -276,6 +287,7 @@ class _SemanticMixin:
             typed_query,
             ctx=real_ctx,
             limit=limit,
+            mode=RetrieverMode.QUICK,
             score_threshold=score_threshold,
             scope_dsl=filter,
             level=level,
@@ -296,6 +308,66 @@ class _SemanticMixin:
             resources=resources,
             skills=skills,
         )
+        telemetry.set("vector.returned", find_result.total)
+        return find_result
+
+    async def _find_by_filter(
+        self,
+        filter: Optional[Dict],
+        ctx: Any,
+        target_directories: Any,
+        limit: int,
+        level: Optional[List[int]] = None,
+    ) -> Any:
+        """Resolve a query-less find purely from the metadata filter.
+
+        Scoping is delegated to filter_in_tenant, which builds the same scope
+        filter the vector path uses — tenant isolation and target-directory
+        limits therefore stay identical between the two. Hand-building the
+        filter here would be one refactor away from silently losing them.
+
+        Records come back in whatever order the store yields; there is no
+        similarity ranking, so ``score`` stays 0 rather than a fabricated value
+        callers might try to sort on.
+        """
+        from openviking.storage.vikingdb_manager import VikingDBManagerProxy
+        from openviking_cli.retrieve import ContextType, FindResult
+
+        telemetry = get_current_telemetry()
+        store = self._get_vector_store()
+        if not store:
+            raise RuntimeError("Vector store not initialized. Call OpenViking.initialize() first.")
+
+        for target_dir in target_directories:
+            await self._ensure_retrieval_scope(target_dir, ctx)
+
+        proxy = VikingDBManagerProxy(store, ctx)
+        records = await proxy.filter_in_tenant(
+            target_directories=list(target_directories or []),
+            extra_filter=filter,
+            level=level,
+            limit=limit,
+        )
+
+        memories, resources, skills = [], [], []
+        # Deduplicate by URI, mirroring what the vector path does: tags live on
+        # per-level records, so a directory carrying one matches on both its L0
+        # and L1 record and would otherwise be returned twice — inflating the
+        # total and eating two of the caller's limit slots for one result.
+        seen_uris: set = set()
+        for record in records:
+            matched = build_matched_context_from_record(record)
+            if matched is None or matched.uri in seen_uris:
+                continue
+            seen_uris.add(matched.uri)
+            if matched.context_type == ContextType.MEMORY:
+                memories.append(matched)
+            elif matched.context_type == ContextType.RESOURCE:
+                resources.append(matched)
+            elif matched.context_type == ContextType.SKILL:
+                skills.append(matched)
+
+        find_result = FindResult(memories=memories, resources=resources, skills=skills)
         telemetry.set("vector.returned", find_result.total)
         return find_result
 
@@ -345,7 +417,7 @@ class _SemanticMixin:
 
         query_plan: Optional[QueryPlan] = None
         for target_dir in retrieval_targets.target_directories:
-            self._ensure_access(target_dir, ctx)
+            await self._ensure_retrieval_scope(target_dir, ctx)
 
         # When target_uri exists, read its abstract as optional query-planning context.
         target_abstract = ""
@@ -357,9 +429,7 @@ class _SemanticMixin:
                 target_abstract = ""
 
         intent_enabled = (
-            bool(self.retrieval_config.enable_intent)
-            if self.retrieval_config is not None
-            else True
+            bool(self.retrieval_config.enable_intent) if self.retrieval_config is not None else True
         )
 
         # With session context: optional intent analysis
@@ -448,164 +518,6 @@ class _SemanticMixin:
         telemetry.set("vector.returned", find_result.total)
         return find_result
 
-    # ========== Relation Management ==========
-
-    async def link(
-        self,
-        from_uri: str,
-        uris: Union[str, List[str]],
-        reason: str = "",
-        ctx: Optional[RequestContext] = None,
-    ) -> None:
-        """Create relation (maintained in .relations.json)."""
-        if isinstance(uris, str):
-            uris = [uris]
-        self._ensure_mutable_access(from_uri, ctx)
-        for uri in uris:
-            self._ensure_access(uri, ctx)
-
-        from_path = self._uri_to_path(from_uri, ctx=ctx)
-
-        entries = await self._read_relation_table(from_path, ctx=ctx)
-        existing_ids = {e.id for e in entries}
-
-        link_id = next(f"link_{i}" for i in range(1, 10000) if f"link_{i}" not in existing_ids)
-
-        entries.append(RelationEntry(id=link_id, uris=uris, reason=reason))
-
-        await self._write_relation_table(from_path, entries, ctx=ctx)
-        logger.debug(f"[VikingFS] Created link: {from_uri} -> {uris}")
-
-    async def unlink(
-        self,
-        from_uri: str,
-        uri: str,
-        ctx: Optional[RequestContext] = None,
-    ) -> None:
-        """Delete relation."""
-        self._ensure_mutable_access(from_uri, ctx)
-        self._ensure_access(uri, ctx)
-        from_path = self._uri_to_path(from_uri, ctx=ctx)
-
-        try:
-            entries = await self._read_relation_table(from_path, ctx=ctx)
-
-            entry_to_modify = None
-            for entry in entries:
-                if uri in entry.uris:
-                    entry_to_modify = entry
-                    break
-
-            if not entry_to_modify:
-                logger.debug(f"[VikingFS] URI not found in relations: {uri}")
-                return
-
-            entry_to_modify.uris.remove(uri)
-
-            if not entry_to_modify.uris:
-                entries.remove(entry_to_modify)
-                logger.debug(f"[VikingFS] Removed empty entry: {entry_to_modify.id}")
-
-            await self._write_relation_table(from_path, entries, ctx=ctx)
-            logger.debug(f"[VikingFS] Removed link: {from_uri} -> {uri}")
-
-        except Exception as e:
-            logger.error(f"[VikingFS] Failed to unlink {from_uri} -> {uri}: {e}")
-            raise IOError(f"Failed to unlink: {e}")
-
-    async def get_relation_table(
-        self, uri: str, ctx: Optional[RequestContext] = None
-    ) -> List[RelationEntry]:
-        """Get relation table."""
-        self._ensure_access(uri, ctx)
-        path = self._uri_to_path(uri, ctx=ctx)
-        return await self._read_relation_table(path, ctx=ctx)
-
-    # ========== Relation Table Internal Methods ==========
-
-    async def _read_relation_table(
-        self, dir_path: str, ctx: Optional[RequestContext] = None
-    ) -> List[RelationEntry]:
-        """Read .relations.json."""
-        table_path = f"{dir_path}/.relations.json"
-        try:
-            content = self._handle_agfs_read(await self._async_agfs.read(table_path))
-            data = json.loads(content.decode("utf-8"))
-        except FileNotFoundError:
-            return []
-        except Exception:
-            # logger.warning(f"[VikingFS] Failed to read relation table {table_path}: {e}")
-            return []
-
-        entries = []
-        # Compatible with old format (nested) and new format (flat)
-        if isinstance(data, list):
-            # New format: flat list
-            for entry_data in data:
-                entries.append(RelationEntry.from_dict(entry_data))
-        elif isinstance(data, dict):
-            # Old format: nested {namespace: {user: [entries]}}
-            for _namespace, user_dict in data.items():
-                for _user, entry_list in user_dict.items():
-                    for entry_data in entry_list:
-                        entries.append(RelationEntry.from_dict(entry_data))
-        return entries
-
-    async def _write_relation_table(
-        self, dir_path: str, entries: List[RelationEntry], ctx: Optional[RequestContext] = None
-    ) -> None:
-        """Write .relations.json."""
-        # Use flat list format
-        data = [entry.to_dict() for entry in entries]
-
-        content = json.dumps(data, ensure_ascii=False, indent=2)
-        table_path = f"{dir_path}/.relations.json"
-        if isinstance(content, str):
-            content = content.encode("utf-8")
-
-        await self._async_agfs.write(table_path, content)
-
-    async def get_relations(self, uri: str, ctx: Optional[RequestContext] = None) -> List[str]:
-        """Get all related URIs (backward compatible)."""
-        entries = await self.get_relation_table(uri, ctx=ctx)
-        real_ctx = self._ctx_or_default(ctx)
-        all_uris = []
-        for entry in entries:
-            for related in entry.uris:
-                if self._is_accessible(related, real_ctx):
-                    all_uris.append(related)
-        return all_uris
-
-    async def get_relations_with_content(
-        self,
-        uri: str,
-        include_l0: bool = True,
-        include_l1: bool = False,
-        ctx: Optional[RequestContext] = None,
-    ) -> List[Dict[str, Any]]:
-        """Get related URIs and their content (backward compatible)."""
-        relation_uris = await self.get_relations(uri, ctx=ctx)
-        if not relation_uris:
-            return []
-
-        results = []
-        abstracts = {}
-        overviews = {}
-        if include_l0:
-            abstracts = await self.read_batch(relation_uris, level="l0", ctx=ctx)
-        if include_l1:
-            overviews = await self.read_batch(relation_uris, level="l1", ctx=ctx)
-
-        for rel_uri in relation_uris:
-            info = {"uri": rel_uri}
-            if include_l0:
-                info["abstract"] = abstracts.get(rel_uri, "")
-            if include_l1:
-                info["overview"] = overviews.get(rel_uri, "")
-            results.append(info)
-
-        return results
-
     async def write_context(
         self,
         uri: str,
@@ -615,31 +527,65 @@ class _SemanticMixin:
         content_filename: str = "content.md",
         is_leaf: bool = False,
         ctx: Optional[RequestContext] = None,
+        *,
+        lease_ref: Any = None,
     ) -> None:
         """Write context to AGFS (L0/L1/L2)."""
 
-        self._ensure_mutable_access(uri, ctx)
+        await self._ensure_access(uri, ctx, action=AclAction.WRITE)
         path = self._uri_to_path(uri, ctx=ctx)
 
         try:
-            await self._ensure_parent_dirs(path, ctx=ctx)
+            await self._ensure_parent_dirs(path, ctx=ctx, lease_ref=lease_ref)
             try:
-                await self._async_agfs.mkdir(path)
+                # _pathlock_fs_ctx is supplied by VikingFS's _AccessMixin.
+                fs_ctx = self._pathlock_fs_ctx(ctx, lease_ref)  # type: ignore[attr-defined]
+                await self._async_agfs.mkdir(path, fs_ctx=fs_ctx)
             except Exception as e:
                 if "exist" not in str(e).lower():
                     raise
 
             if content:
                 content_uri = f"{uri}/{content_filename}"
-                await self.write_file(content_uri, content, ctx=ctx)
+                await self.write_file(content_uri, content, ctx=ctx, lease_ref=lease_ref)
 
             if abstract:
                 abstract_uri = f"{uri}/.abstract.md"
-                await self.write_file(abstract_uri, abstract, ctx=ctx)
+                await self.write_file(
+                    abstract_uri,
+                    render_abstract_overview(
+                        ContextLevel.ABSTRACT,
+                        uri,
+                        abstract,
+                        {
+                            "generated_by": {
+                                "component": "VikingFS.write_context",
+                                "trigger": "context_write",
+                            }
+                        },
+                    ),
+                    ctx=ctx,
+                    lease_ref=lease_ref,
+                )
 
             if overview:
                 overview_uri = f"{uri}/.overview.md"
-                await self.write_file(overview_uri, overview, ctx=ctx)
+                await self.write_file(
+                    overview_uri,
+                    render_abstract_overview(
+                        ContextLevel.OVERVIEW,
+                        uri,
+                        overview,
+                        {
+                            "generated_by": {
+                                "component": "VikingFS.write_context",
+                                "trigger": "context_write",
+                            }
+                        },
+                    ),
+                    ctx=ctx,
+                    lease_ref=lease_ref,
+                )
 
         except Exception as e:
             logger.error(f"[VikingFS] Failed to write {uri}: {e}")

@@ -25,12 +25,14 @@ async def _seed(
     role="user",
     interval=60.0,
     path="https://example.com/foo",
+    source_type=None,
 ):
     return await wm.create_task(
         path=path,
         account_id=account,
         user_id=user,
         original_role=role,
+        source_type=source_type,
         to_uri=to_uri,
         watch_interval=interval,
     )
@@ -45,7 +47,7 @@ async def test_list_empty(client: httpx.AsyncClient):
 
 
 async def test_full_lifecycle(client: httpx.AsyncClient, watch_manager, monkeypatch):
-    task = await _seed(watch_manager)
+    task = await _seed(watch_manager, source_type="url")
 
     # List
     resp = await client.get("/api/v1/watches")
@@ -53,6 +55,7 @@ async def test_full_lifecycle(client: httpx.AsyncClient, watch_manager, monkeypa
     assert body["status"] == "ok"
     assert body["result"]["total"] == 1
     assert body["result"]["tasks"][0]["task_id"] == task.task_id
+    assert body["result"]["tasks"][0]["source_type"] == "url"
     assert body["result"]["tasks"][0]["to_uri"] == task.to_uri
 
     # Get by ID
@@ -114,6 +117,24 @@ async def test_full_lifecycle(client: httpx.AsyncClient, watch_manager, monkeypa
     # Subsequent GET → 404
     resp = await client.get(f"/api/v1/watches/{task.task_id}")
     assert resp.status_code == 404
+
+
+async def test_list_exposes_last_execution_result(client: httpx.AsyncClient, watch_manager):
+    task = await _seed(watch_manager, to_uri="viking://resources/test/observable")
+    await watch_manager.record_execution(
+        task.task_id,
+        status="failed",
+        execution_task_id="connector-task-1",
+        error="pull failed",
+    )
+
+    resp = await client.get("/api/v1/watches")
+
+    assert resp.status_code == 200
+    result = resp.json()["result"]["tasks"][0]
+    assert result["last_task_id"] == "connector-task-1"
+    assert result["last_status"] == "failed"
+    assert result["last_error"] == "pull failed"
 
 
 async def test_get_by_uri_returns_single_object(client: httpx.AsyncClient, watch_manager):
@@ -244,3 +265,42 @@ async def test_patch_partial_preserves_unset_fields(client: httpx.AsyncClient, w
     body = resp.json()
     assert body["result"]["watch_interval"] == original_interval
     assert body["result"]["is_active"] is False
+
+
+async def test_home_alias_to_uri_resolves_to_canonically_keyed_task(
+    app, client: httpx.AsyncClient, watch_manager
+):
+    """`?to_uri=viking://~/...` addresses the task stored under the canonical key.
+
+    Watch tasks are keyed on the canonical URI, and the router canonicalizes
+    ``to_uri`` at the request boundary, so the alias resolves to the same task
+    and the response keeps echoing the stored canonical key. The dev auth plugin
+    resolves test requests to root, which never expands the alias, so this test
+    overrides the request context with a user-role identity.
+    """
+    from openviking.server.auth import get_request_context
+    from openviking.server.identity import RequestContext, Role
+    from openviking_cli.session.user_id import UserIdentifier
+
+    canonical = "viking://user/default/resources/home-alias"
+    task = await _seed(watch_manager, to_uri=canonical)
+    app.dependency_overrides[get_request_context] = lambda: RequestContext(
+        user=UserIdentifier(account_id="default", user_id="default"),
+        role=Role.USER,
+    )
+    try:
+        resp = await client.get(
+            "/api/v1/watches", params={"to_uri": "viking://~/resources/home-alias"}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["result"]["task_id"] == task.task_id
+        assert resp.json()["result"]["to_uri"] == canonical
+
+        resp = await client.delete(
+            "/api/v1/watches", params={"to_uri": "viking://~/resources/home-alias"}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["result"]["deleted"] is True
+        assert resp.json()["result"]["to_uri"] == canonical
+    finally:
+        app.dependency_overrides.pop(get_request_context, None)

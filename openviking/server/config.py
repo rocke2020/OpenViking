@@ -3,7 +3,7 @@
 """Server configuration for OpenViking HTTP Server."""
 
 import sys
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
@@ -39,13 +39,38 @@ def _normalize_config_uri(value: Optional[str], field_name: str) -> Optional[str
     return uri
 
 
+def _rewrite_legacy_current_user_uri(uri: str, field_name: str) -> str:
+    """Rewrite legacy uid-less current-user spellings to the ``~`` home alias.
+
+    ``viking://user/resources[/...]`` and ``viking://user/skills`` are no longer
+    expanded at request boundaries, but stored configurations (ov.conf
+    ``user_config_defaults.add_targets``, persisted ``user_config.json``, old
+    PATCH bodies) may still carry them. Their intent was unambiguous, so
+    normalize them here instead of breaking existing deployments.
+    """
+    from openviking.core.namespace import uri_parts
+
+    try:
+        parts = uri_parts(uri.rstrip("/"))
+    except ValueError:
+        return uri
+    if parts[:2] not in (["user", "resources"], ["user", "skills"]):
+        return uri
+    rewritten = f"viking://~/{'/'.join(parts[1:])}"
+    logger.info(
+        "Rewrote legacy current-user %s %r to %r; use the viking://~ home alias instead.",
+        field_name,
+        uri,
+        rewritten,
+    )
+    return rewritten
+
+
 class AddTargetsConfig(BaseModel):
     """Add targets for resource and skill writes."""
 
     resource_uri: Optional[str] = None
     skill_uri: Optional[str] = None
-
-    model_config = {"extra": "forbid"}
 
     @field_validator("resource_uri")
     @classmethod
@@ -55,19 +80,26 @@ class AddTargetsConfig(BaseModel):
             return None
         from openviking.core.namespace import classify_uri, uri_parts
         from openviking.core.uri_validation import validate_viking_uri
-        from openviking_cli.utils.uri import VikingURI
 
+        uri = _rewrite_legacy_current_user_uri(uri, "resource_uri")
         validate_viking_uri(uri, field_name="resource_uri")
-        normalized = VikingURI.normalize(uri).rstrip("/")
+        normalized = uri.rstrip("/")
         parts = uri_parts(normalized)
         classification = classify_uri(normalized)
-        if parts[:1] == ["resources"] or (
-            parts[:1] == ["user"]
-            and classification.context_type == "resource"
-            and classification.content_index is not None
+        if (
+            parts[:1] == ["resources"]
+            or parts[:2] == ["~", "resources"]
+            or (
+                parts[:1] == ["user"]
+                and classification.context_type == "resource"
+                and classification.content_index is not None
+            )
         ):
             return normalized
-        raise ValueError("resource_uri must be a resource directory URI")
+        raise ValueError(
+            "resource_uri must be a resource directory URI: viking://resources/..., "
+            "viking://~/resources[/...], or viking://user/{user_id}/resources[/...]"
+        )
 
     @field_validator("skill_uri")
     @classmethod
@@ -75,12 +107,21 @@ class AddTargetsConfig(BaseModel):
         uri = _normalize_config_uri(value, "skill_uri")
         if uri is None:
             return None
-        from openviking_cli.utils.uri import VikingURI
+        from openviking.core.namespace import uri_parts
+        from openviking.core.uri_validation import validate_viking_uri
 
-        normalized = VikingURI.normalize(uri).rstrip("/")
-        if normalized in {"viking://user/skills", "viking://agent/skills"}:
+        uri = _rewrite_legacy_current_user_uri(uri, "skill_uri")
+        validate_viking_uri(uri, field_name="skill_uri")
+        normalized = uri.rstrip("/")
+        parts = uri_parts(normalized)
+        if parts in (["~", "skills"], ["agent", "skills"]) or (
+            len(parts) == 3 and parts[0] == "user" and parts[2] == "skills"
+        ):
             return normalized
-        raise ValueError("skill_uri must be viking://user/skills or viking://agent/skills")
+        raise ValueError(
+            "skill_uri must be viking://~/skills, viking://user/{user_id}/skills, "
+            "or viking://agent/skills"
+        )
 
 
 class AgentEvolutionConfig(BaseModel):
@@ -88,27 +129,31 @@ class AgentEvolutionConfig(BaseModel):
 
     enabled: bool = False
 
-    model_config = {"extra": "forbid"}
-
 
 class DeprecatedUserAgentEvolutionConfig(BaseModel):
     """Parse-only compatibility for legacy per-user configuration files."""
 
     enabled: Optional[bool] = None
 
-    model_config = {"extra": "forbid"}
-
 
 class UserConfig(BaseModel):
     """User configuration values that can be defaulted or initialized."""
 
     add_targets: AddTargetsConfig = Field(default_factory=AddTargetsConfig)
+    memory_policy: Optional[Dict[str, Any]] = None
     agent_evolution: DeprecatedUserAgentEvolutionConfig = Field(
         default_factory=DeprecatedUserAgentEvolutionConfig,
         exclude=True,
     )
 
-    model_config = {"extra": "forbid"}
+    @field_validator("memory_policy", mode="before")
+    @classmethod
+    def validate_memory_policy(cls, value: Any) -> Optional[Dict[str, Any]]:
+        if value is None:
+            return None
+        from openviking.session.memory_policy import MemoryPolicy
+
+        return MemoryPolicy.from_dict(value).to_dict()
 
 
 class MetricsAccountDimensionConfig(BaseModel):
@@ -119,15 +164,11 @@ class MetricsAccountDimensionConfig(BaseModel):
     max_active_accounts: int = 100
     metric_allowlist: List[str] = Field(default_factory=list)
 
-    model_config = {"extra": "forbid"}
-
 
 class PrometheusExporterConfig(BaseModel):
     """Prometheus exporter configuration."""
 
     enabled: bool = True
-
-    model_config = {"extra": "forbid"}
 
 
 class OTelExporterConfig(BaseModel):
@@ -137,8 +178,6 @@ class OTelExporterConfig(BaseModel):
         """TLS configuration for OTLP exporters."""
 
         insecure: bool = False
-
-        model_config = {"extra": "forbid"}
 
     enabled: bool = False
     protocol: str = "grpc"  # "grpc", "http", or "local" for traces
@@ -151,16 +190,12 @@ class OTelExporterConfig(BaseModel):
     local_rotation_mb: int = Field(default=40, gt=0)
     local_backup_count: int = Field(default=2, ge=0)
 
-    model_config = {"extra": "forbid"}
-
 
 class MetricsExportersConfig(BaseModel):
     """Metrics exporters configuration."""
 
     prometheus: PrometheusExporterConfig = Field(default_factory=PrometheusExporterConfig)
     otel: OTelExporterConfig = Field(default_factory=OTelExporterConfig)
-
-    model_config = {"extra": "forbid"}
 
 
 class MetricsConfig(BaseModel):
@@ -172,8 +207,6 @@ class MetricsConfig(BaseModel):
         default_factory=MetricsAccountDimensionConfig
     )
     exporters: MetricsExportersConfig = Field(default_factory=MetricsExportersConfig)
-
-    model_config = {"extra": "forbid"}
 
 
 class UsageAuditConfig(BaseModel):
@@ -192,8 +225,6 @@ class UsageAuditConfig(BaseModel):
     timezone: str = "local"
     inventory_ttl_seconds: float = Field(10.0, ge=0)
 
-    model_config = {"extra": "forbid"}
-
 
 class UsageReporterSinkConfig(BaseModel):
     """Usage reporter sink configuration."""
@@ -202,8 +233,6 @@ class UsageReporterSinkConfig(BaseModel):
     class_path: Optional[str] = None
     config: Dict[str, object] = Field(default_factory=dict)
 
-    model_config = {"extra": "forbid"}
-
 
 class UsageReporterConfig(BaseModel):
     """Usage event reporter configuration."""
@@ -211,8 +240,6 @@ class UsageReporterConfig(BaseModel):
     enabled: bool = False
     extractors: List[Literal["memory_usage"]] = Field(default_factory=lambda: ["memory_usage"])
     sinks: List[UsageReporterSinkConfig] = Field(default_factory=list)
-
-    model_config = {"extra": "forbid"}
 
 
 class TraceDumpBodyConfig(BaseModel):
@@ -226,8 +253,6 @@ class TraceDumpBodyConfig(BaseModel):
     enabled: bool = False
     max_bytes: int = 4096
 
-    model_config = {"extra": "forbid"}
-
 
 class ObservabilityConfig(BaseModel):
     """Server-side observability configuration."""
@@ -238,17 +263,18 @@ class ObservabilityConfig(BaseModel):
     logs: OTelExporterConfig = Field(default_factory=OTelExporterConfig)
     dump_body: TraceDumpBodyConfig = Field(default_factory=TraceDumpBodyConfig)
 
-    model_config = {"extra": "forbid"}
-
 
 class TempUploadConfig(BaseModel):
     """Temporary upload configuration."""
 
     default_mode: Literal["local", "shared"] = "local"
     shared_max_size_bytes: int = 512 * 1024 * 1024
-    shared_prefix: str = "viking://upload"
-
-    model_config = {"extra": "forbid"}
+    ttl_seconds: int = Field(12 * 60 * 60, ge=0)
+    # When True, shared-upload cleanup also removes directories whose names are
+    # not valid upload ids (missing/garbled `<ms-ts>-<uuid>` format). Off by
+    # default so a malformed entry never triggers an unexpected delete; enable
+    # to reclaim junk directories that would otherwise be skipped forever.
+    cleanup_invalid_dirs: bool = False
 
 
 class ToolOutputExternalizationConfig(BaseModel):
@@ -263,13 +289,19 @@ class ToolOutputExternalizationConfig(BaseModel):
     aggregate_selection_strategy: Literal["largest_first"] = "largest_first"
     failure_mode: Literal["reject", "preserve_raw", "preview_only"] = "preserve_raw"
 
-    model_config = {"extra": "forbid"}
-
 
 class ServerConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 1933
     workers: int = 1
+    executor_threads: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Maximum number of threads in each server process's default asyncio "
+            "executor. Zero keeps Python's default sizing policy."
+        ),
+    )
     # Seconds an idle HTTP keep-alive connection is kept open before the server
     # closes it. Defaults to 5 to match uvicorn's built-in default and preserve
     # the existing service behavior. Raise it above the idle-connection lifetime
@@ -295,6 +327,9 @@ class ServerConfig(BaseModel):
     api_key_watch_enabled: bool = False
     # Poll interval; each check only stats registry files and reads fully on change.
     api_key_watch_interval_seconds: float = 30.0
+    # Trusted-mode identity registration is batched in memory; 0 disables it.
+    trusted_identity_flush_interval_seconds: float = Field(300.0, ge=0)
+    trusted_identity_pending_max_size: int = Field(10_000, gt=0)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
     usage_reporter: UsageReporterConfig = Field(default_factory=UsageReporterConfig)
     # Public-facing base URL emitted in MCP-issued upload instructions. See
@@ -310,8 +345,6 @@ class ServerConfig(BaseModel):
     tool_output_externalization: ToolOutputExternalizationConfig = Field(
         default_factory=ToolOutputExternalizationConfig
     )
-
-    model_config = {"extra": "forbid"}
 
     def get_effective_auth_mode(self) -> str:
         """Get effective auth mode, auto-detecting if not explicitly set.
@@ -401,7 +434,7 @@ def load_server_config(config_path: Optional[str] = None) -> ServerConfig:
     if server_data is None:
         server_data = {}
     if not isinstance(server_data, dict):
-        raise ValueError("Invalid server config: 'server' section must be an object")
+        raise ValueError(f"Invalid server config in {path}: 'server' section must be an object")
 
     # Convert auth_mode string — built-in enums are converted to their string
     # value; custom modes are kept as-is for plugin extensibility.

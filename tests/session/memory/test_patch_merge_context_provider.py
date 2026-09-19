@@ -14,6 +14,7 @@ from openviking.session.memory.patch_merge_context_provider import (
     PatchMergeContextProvider,
     PatchMergePatch,
 )
+from openviking.session.skill.session_skill_context_provider import load_skill_extract_registry
 
 
 def _memory_file(
@@ -131,6 +132,37 @@ async def test_patch_merge_context_provider_prefetch_searches_and_reads_extra_ca
     assert "viking://user/u/memories/experiences/candidate_4.md" in read_uris
     assert "viking://user/u/memories/experiences/candidate_5.md" not in read_uris
     assert messages[-1]["content"].startswith("# Memory File Patches")
+
+
+@pytest.mark.asyncio
+async def test_patch_merge_context_provider_skips_extra_candidates_for_existing_files():
+    uri = "viking://user/u/memories/experiences/booking.md"
+    provider = PatchMergeContextProvider(
+        memory_type="experiences",
+        required_file_uris=[uri],
+        patches=[
+            PatchMergePatch(
+                before_file=_memory_file(name="booking", uri=uri, content="old line"),
+                after_file=_memory_file(name="booking", uri=uri, content="new line"),
+            )
+        ],
+    )
+    provider.search_files = AsyncMock(
+        return_value=["viking://user/u/memories/experiences/other.md"]
+    )
+    provider.read_file = AsyncMock(
+        return_value={
+            "memory_type": "experiences",
+            "experience_name": "booking",
+            "content": "1\told line",
+        }
+    )
+
+    messages = await provider.prefetch()
+
+    provider.search_files.assert_not_awaited()
+    provider.read_file.assert_awaited_once_with(uri)
+    assert len(messages) == 2
 
 
 @pytest.mark.asyncio
@@ -325,6 +357,21 @@ def test_patch_merge_context_provider_get_memory_schema_raises_for_missing_type(
         provider.get_memory_schemas(ctx=None)
 
 
+def test_patch_merge_context_provider_uses_registry_override_for_session_skills():
+    provider = PatchMergeContextProvider(
+        memory_type="session_skills",
+        memory_registry=load_skill_extract_registry(),
+        required_file_uris=[],
+        patches=[],
+    )
+
+    schemas = provider.get_memory_schemas(ctx=None)
+
+    assert len(schemas) == 1
+    assert schemas[0].memory_type == "session_skills"
+    assert schemas[0].enabled is True
+
+
 def test_patch_merge_context_provider_instruction_mentions_path_field_normalization():
     provider = PatchMergeContextProvider(
         memory_type="entities",
@@ -335,12 +382,18 @@ def test_patch_merge_context_provider_instruction_mentions_path_field_normalizat
     instruction = provider.instruction()
 
     assert "independent extraction patch proposals" in instruction
-    assert "merge duplicate/overlapping\nmemories into one canonical file patch" in instruction
+    assert "same identity under the active memory schema" in instruction
+    assert "same object or occurrence" in instruction
+    assert "overlapping topic only identifies candidates" in instruction
+    assert "never sufficient evidence" in instruction
+    assert "every substantive atomic fact" in instruction
+    assert "If identity is uncertain" in instruction
     assert "directory/filename fields" in instruction
     assert "schema identifiers" in instruction
     assert "book not books" in instruction
     assert "Chinese" in instruction
     assert "书籍 not 书/图书" in instruction
+    assert "verified duplicate existing file" in instruction
     assert "put it in delete_ids" in instruction
 
 

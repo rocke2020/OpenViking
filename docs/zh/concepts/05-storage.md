@@ -7,7 +7,7 @@ OpenViking 采用双层存储架构，分离内容存储和索引存储。
 ```
 ┌─────────────────────────────────────────┐
 │            VikingFS (URI 抽象层)         │
-│    URI 映射 · 层级访问 · 关联管理        │
+│            URI 映射 · 层级访问           │
 └────────────────┬────────────────────────┘
         ┌────────┴────────┐
         │                 │
@@ -21,7 +21,7 @@ OpenViking 采用双层存储架构，分离内容存储和索引存储。
 
 | 存储层 | 职责 | 存储内容 |
 |--------|------|----------|
-| **AGFS** | 内容存储 | L0/L1/L2 完整内容、多媒体文件、关联关系 |
+| **AGFS** | 内容存储 | L0/L1/L2 完整内容、多媒体文件 |
 | **向量库** | 索引存储 | URI、向量、元数据（不存文件内容） |
 
 ### 设计优势
@@ -40,8 +40,8 @@ VikingFS 是统一的 URI 抽象层，屏蔽底层存储细节。
 
 ```
 viking://resources/docs/auth  →  /local/{account_id}/resources/docs/auth
-viking://user/memories        →  /local/{account_id}/user/{user_id}/memories
-viking://user/skills          →  /local/{account_id}/user/{user_id}/skills
+viking://~/memories        →  /local/{account_id}/user/{user_id}/memories
+viking://~/skills          →  /local/{account_id}/user/{user_id}/skills
 ```
 
 ### 核心 API
@@ -55,24 +55,7 @@ viking://user/skills          →  /local/{account_id}/user/{user_id}/skills
 | `mv(old, new)` | 移动/重命名（同步更新向量 URI） |
 | `abstract(uri)` | 读取 L0 摘要 |
 | `overview(uri)` | 读取 L1 概览 |
-| `relations(uri)` | 获取关联列表 |
 | `find(query, uri)` | 语义搜索 |
-
-### 关联管理
-
-VikingFS 通过 `.relations.json` 管理资源间的关联：
-
-```python
-# 创建关联
-viking_fs.link(
-    from_uri="viking://resources/docs/auth",
-    uris=["viking://resources/docs/security"],
-    reason="相关安全文档"
-)
-
-# 获取关联
-relations = viking_fs.relations("viking://resources/docs/auth")
-```
 
 ## AGFS 底层存储
 
@@ -105,13 +88,23 @@ AGFS 提供 POSIX 风格的文件操作，支持多种后端。
 viking://resources/docs/auth/
 ├── .abstract.md          # L0 摘要
 ├── .overview.md          # L1 概览
-├── .relations.json       # 关联
 └── *.md                  # L2 详细内容
 ```
 
 ## 向量库索引
 
 向量库存储语义索引，支持向量搜索和标量过滤。
+
+### 本地记录格式兼容
+
+本地后端将非向量字段打包成 JSON。新写入的当前记录和 Delta 日志使用带 32 位字节长度的
+`text` 保存这份 JSON，解除原先整个 JSON 合计 65,535 字节的限制，不截断内容。
+
+新记录带有格式版本。已有的无版本记录继续可读，更新时写入新格式；本次格式升级不需要
+全库重写、重建索引或重新计算 embedding。Delta 恢复也支持新旧格式混存。
+
+兼容方向为新版读取旧数据：旧版程序无法读取新格式。需要降级时，应恢复首次写入新格式
+之前的备份，不能只替换回旧版程序。
 
 ### Context 集合 Schema
 

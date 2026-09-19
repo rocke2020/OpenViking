@@ -4,9 +4,11 @@
 
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
+from urllib.parse import urlparse
 
 from openviking.parse.accessors.base import LocalResource, SourceType
 from openviking.parse.accessors.mime_types import IANA_MEDIA_TYPE_TO_EXTENSION
+from openviking.parse.backend import ParserBackend, normalize_parser_backend
 from openviking.parse.base import ParseResult
 from openviking.parse.mode import ParseMode, normalize_parse_mode
 from openviking.parse.parsers.constants import (
@@ -17,12 +19,13 @@ from openviking.parse.parsers.constants import (
     TYPESCRIPT_MPEG_TS_EXTENSION,
 )
 from openviking.parse.parsers.media.utils import is_mpeg_ts, read_mpeg_ts_probe
+from openviking.parse.parsers.upload_utils import is_empty_file
 from openviking.parse.registry import parse
 from openviking.server.local_input_guard import (
     is_remote_resource_source,
     looks_like_local_path,
 )
-from openviking_cli.exceptions import PermissionDeniedError
+from openviking_cli.exceptions import InvalidArgumentError, PermissionDeniedError
 from openviking_cli.utils.logger import get_logger
 
 # All known valid extensions - only these should be stripped when getting stem
@@ -123,8 +126,41 @@ class UnifiedResourceProcessor:
     def should_use_understanding_directly(self, source: str, **kwargs) -> bool:
         return self._get_parser_router().should_use_understanding_directly(source, **kwargs)
 
+    def durable_route_requires_preparation(
+        self,
+        source: str,
+        *,
+        parse_mode: ParseMode | str = ParseMode.DEFAULT,
+        **kwargs,
+    ) -> bool:
+        """Return whether durable parser selection must inspect fetched content."""
+        if normalize_parse_mode(parse_mode) is ParseMode.NO_SPLIT:
+            return False
+        parser_backend = normalize_parser_backend(kwargs.get("parser_backend"))
+        if parser_backend is ParserBackend.INTERNAL:
+            return False
+
+        from openviking.parse.accessors.feishu_accessor import FeishuAccessor
+        from openviking.parse.accessors.web_feed_accessor import WebFeedAccessor
+
+        accessor = self._get_accessor_registry().get_accessor(source, **kwargs)
+        if isinstance(accessor, (FeishuAccessor, WebFeedAccessor)):
+            return False
+
+        router = self._get_parser_router()
+        if not router.understanding_api_enabled():
+            return False
+        if parser_backend is ParserBackend.UNDERSTANDING:
+            return True
+        if not Path(urlparse(source).path).suffix:
+            return True
+        return router.should_use_understanding_api(source)
+
     async def submit_understanding(self, source: str | Path | LocalResource, **kwargs) -> str:
         return await self._get_parser_router().submit(source, **kwargs)
+
+    async def upload_understanding_file(self, source: str | Path | LocalResource) -> str:
+        return await self._get_parser_router().upload_file(source)
 
     @staticmethod
     def _set_resolved_identity(resource: LocalResource, source_name: Optional[str]) -> None:
@@ -165,9 +201,72 @@ class UnifiedResourceProcessor:
                 "direct host filesystem paths are not allowed."
             )
 
+        from openviking.parse.accessors.feishu_accessor import FeishuAccessor
+        from openviking.parse.feishu_import import recursive_wiki
+
+        if FeishuAccessor._is_feishu_url(str(source)) and (
+            FeishuAccessor._parse_feishu_url(str(source))[0] == "folder"
+            or (
+                FeishuAccessor._parse_feishu_url(str(source))[0] == "wiki"
+                and recursive_wiki(kwargs)
+            )
+        ):
+            backend = normalize_parser_backend(kwargs.get("parser_backend"))
+            mode = normalize_parse_mode(kwargs.get("parse_mode", ParseMode.DEFAULT))
+            kwargs["_feishu_use_understanding"] = bool(
+                mode is ParseMode.DEFAULT
+                and backend is not ParserBackend.INTERNAL
+                and (
+                    backend is ParserBackend.UNDERSTANDING
+                    or self._get_parser_router().should_use_understanding_api(source)
+                )
+            )
         resource = await self._get_accessor_registry().access(source, **kwargs)
-        self._set_resolved_identity(resource, kwargs.get("source_name"))
+        try:
+            self._set_resolved_identity(resource, kwargs.get("source_name"))
+            self._reject_empty_resource(resource, kwargs.get("source_name"))
+        except Exception:
+            # Ownership transfers to the caller only after prepare succeeds.
+            # Until then, release temporary accessor results on every error.
+            resource.cleanup()
+            raise
         return resource
+
+    @staticmethod
+    def _reject_empty_resource(resource: LocalResource, source_name: Optional[str]) -> None:
+        """Refuse a source with no content, wherever it was fetched from.
+
+        Every ingestion path reaches this method: prepare_durable_source
+        freezes a source here before the request touches the tree, and
+        process() calls it for anything that was not frozen earlier. An empty
+        file is refused once, at the point the bytes are first in hand, rather
+        than being parsed and indexed as an empty resource.
+
+        Directories are skipped: their size is not meaningful, and
+        directory_scan already drops empty or whitespace-only members. content/write is a
+        different path and still allows an empty file, because creating one
+        there is an explicit user action.
+        """
+        try:
+            if not resource.path.is_file() or not is_empty_file(resource.path):
+                return
+        except OSError:
+            # An unreadable source is not this check's business; let the normal
+            # ingestion path report it.
+            return
+
+        meta = resource.meta
+        name = (
+            source_name
+            or meta.get("resolved_name")
+            or meta.get("original_filename")
+            or resource.path.name
+        )
+        raise InvalidArgumentError(
+            f"'{name}' is empty or contains only whitespace, so there is nothing to extract or index. "
+            "Add a resource with content, or use content/write if an empty file is "
+            "what you want."
+        )
 
     async def process(
         self,
@@ -208,6 +307,8 @@ class UnifiedResourceProcessor:
             and self._has_prepared_understanding_response(kwargs)
         ):
             parse_kwargs = dict(kwargs)
+            parse_kwargs.pop("tos_signature", None)
+            parse_kwargs.pop("tos_access", None)
             parse_kwargs["instruction"] = instruction
             parse_kwargs["vlm_processor"] = self._get_vlm_processor()
             parse_kwargs["storage"] = self.storage
@@ -216,7 +317,7 @@ class UnifiedResourceProcessor:
                 "original_url": source,
             }
             parse_kwargs["original_source"] = source
-            parse_kwargs["parser_backend"] = "understanding"
+            parse_kwargs["parser_backend"] = ParserBackend.UNDERSTANDING
             parse_kwargs.pop("feishu_access_token", None)
 
             explicit_name = kwargs.get("resource_name") or kwargs.get("source_name")
@@ -230,6 +331,8 @@ class UnifiedResourceProcessor:
             and self.should_use_understanding_directly(source, **kwargs)
         ):
             parse_kwargs = dict(kwargs)
+            parse_kwargs.pop("tos_signature", None)
+            parse_kwargs.pop("tos_access", None)
             parse_kwargs["instruction"] = instruction
             parse_kwargs["vlm_processor"] = self._get_vlm_processor()
             parse_kwargs["storage"] = self.storage
@@ -249,6 +352,7 @@ class UnifiedResourceProcessor:
         local_resource = prepared_resource or await self.prepare(
             source,
             allow_local_path_resolution=allow_local_path_resolution,
+            **({"parse_mode": mode} if mode is ParseMode.NO_SPLIT else {}),
             **kwargs,
         )
 
@@ -259,6 +363,8 @@ class UnifiedResourceProcessor:
             # Source credentials are consumed by the accessor. Never forward
             # them into parser kwargs, parse results, or later queue payloads.
             parse_kwargs.pop("auth_config", None)
+            parse_kwargs.pop("tos_signature", None)
+            parse_kwargs.pop("tos_access", None)
             parse_kwargs["instruction"] = instruction
             parse_kwargs["_source_meta"] = local_resource.meta
             parse_kwargs["resolved_extension"] = kwargs.get(
@@ -301,6 +407,7 @@ class UnifiedResourceProcessor:
                 from openviking.parse.parsers.directory import DirectoryParser
 
                 parser = DirectoryParser()
+                parse_kwargs["_feishu_import_plan"] = local_resource.feishu_plan
 
                 result = await parser.parse(str(local_resource.path), **parse_kwargs)
                 # Preserve temporary directory for TreeBuilder
@@ -312,6 +419,24 @@ class UnifiedResourceProcessor:
 
             # For files, use ParserRouter to decide which parser to use
             parser_router = self._get_parser_router()
+            if (
+                mode is ParseMode.NO_SPLIT
+                and local_resource.source_type == SourceType.FEISHU
+                and local_resource.meta.get("feishu_content_kind") == "file"
+            ):
+                parse_kwargs["parser_backend"] = ParserBackend.INTERNAL
+            parse_kwargs.pop("feishu_access_token", None)
+            parse_kwargs.pop("lark_file", None)
+            checkpoint = parse_kwargs.pop("_feishu_checkpoint", None)
+            if checkpoint is not None and local_resource.meta.get("feishu_content_kind") == "file":
+                saved, save = checkpoint
+                if "file" in saved:
+                    parse_kwargs["understanding_response_id"] = saved["file"]
+
+                async def record(response_id):
+                    await save("file", response_id)
+
+                parse_kwargs["_response_checkpoint"] = record
             return await parser_router.parse(local_resource, **parse_kwargs)
         finally:
             # Clean up temporary resources unless they need to be preserved
@@ -323,7 +448,12 @@ class UnifiedResourceProcessor:
 
     @staticmethod
     def _has_prepared_understanding_response(kwargs: dict) -> bool:
-        from openviking.parse.understanding_api import PREPARED_RESPONSE_ID_ARG
+        from openviking.parse.understanding_api import (
+            PREPARED_FILE_ID_ARG,
+            PREPARED_RESPONSE_ID_ARG,
+        )
 
-        value = kwargs.get(PREPARED_RESPONSE_ID_ARG)
-        return isinstance(value, str) and bool(value.strip())
+        return any(
+            isinstance(kwargs.get(key), str) and bool(kwargs[key].strip())
+            for key in (PREPARED_RESPONSE_ID_ARG, PREPARED_FILE_ID_ARG)
+        )

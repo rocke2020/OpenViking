@@ -185,6 +185,47 @@ class TestLanguageFlow:
 class TestOverviewGenerationFlow:
     """目录概述生成流程测试。"""
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "description,override,expected_language",
+        [
+            ("", "", "en"),
+            ("这是用于查询任务状态和统计运行时间的客户端代码。", "", "zh-CN"),
+            (
+                "Este documento descreve as preferências do usuário e o projeto para completar.",
+                "",
+                "pt",
+            ),
+            ("", "zh-CN", "zh-CN"),
+        ],
+    )
+    async def test_import_paths_do_not_set_overview_language(
+        self, description, override, expected_language
+    ):
+        from openviking.storage.queuefs.semantic_processor import SemanticProcessor
+
+        imports = [f'"github.com/example/module{index}"' for index in range(6)]
+        skeleton = "package client\nimport (\n" + "\n".join(imports) + "\n)\nfunc NewClient()"
+        config = MagicMock()
+        config.output_language_override = override
+        config.semantic.max_overview_prompt_chars = 60_000
+        config.semantic.overview_batch_size = 50
+        config.vlm.get_completion_async = AsyncMock(return_value="# client\nClient overview.")
+
+        with patch(
+            "openviking.storage.queuefs.semantic_processor.get_openviking_config",
+            return_value=config,
+        ):
+            await SemanticProcessor()._generate_overview(
+                "viking://resources/example/client",
+                [{"name": "client.go", "summary": description + "\n" + skeleton}],
+                [],
+            )
+
+        prompt = config.vlm.get_completion_async.call_args.args[0]
+        assert f"Output Language: {expected_language}" in prompt
+        assert all(path in prompt for path in imports)
+
     @pytest.mark.parametrize(
         "lang,file_summaries",
         [
@@ -209,7 +250,8 @@ class TestOverviewGenerationFlow:
         )
         assert f"Output Language: {lang}" in prompt
         assert "Output in Markdown format" in prompt
-        assert "Brief Description" in prompt
+        expected_brief_heading = "简要描述" if lang == "zh-CN" else "Brief Description"
+        assert expected_brief_heading in prompt
         assert "abstract_max_chars" not in prompt
 
     def test_overview_generation_prompt_preserves_repository_hierarchy(self):
@@ -237,12 +279,14 @@ class TestOverviewGenerationFlow:
             in prompt
         )
         assert (
-            "- Describe only what the provided summaries state; do not invent or generalize entities, facts, or relationships not present in them."
+            "- Describe only what the provided summaries state; do not invent entities, facts, or relationships not present in them."
             in prompt
         )
         assert "Before output, remove any named entity absent from the provided summaries" in prompt
         assert "never fill gaps with outside knowledge" in prompt
         assert "Who it's suitable for, if stated in the provided summaries" in prompt
+        assert "keep this paragraph useful as a standalone retrieval abstract" in prompt
+        assert "**Directory Coverage** (H2)" in prompt
 
     def test_chinese_overview_uses_localized_headings(self):
         prompt = render_prompt(
@@ -257,8 +301,11 @@ class TestOverviewGenerationFlow:
 
         assert "**快速导航** (H2)" in prompt
         assert "**详细说明** (H2)" in prompt
+        assert "**目录覆盖** (H2)" in prompt
+        assert "**Directory Coverage** (H2)" not in prompt
         assert "**Quick Navigation** (H2)" not in prompt
         assert "**Detailed Description** (H2)" not in prompt
+
 
 class LanguageAwareMockVLM:
     """语言感知的 MockVLM，根据 prompt 中的 Output Language 返回对应语言的响应。"""

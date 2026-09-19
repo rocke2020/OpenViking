@@ -137,7 +137,7 @@ func TestFindSendsHeadersQueryAndBody(t *testing.T) {
 		requireBodyKeysAbsent(t, body, "agent_id", "agent_uri")
 		writeOK(t, w, map[string]any{
 			"resources": []map[string]any{
-				{"uri": "viking://resources/docs/api.md", "context_type": "resource", "score": 0.9},
+				{"uri": "viking://resources/docs/api.md", "context_type": "resource", "score": 0.9, "tags": []string{"topic=docs", "kind=api"}},
 			},
 		})
 	}))
@@ -159,6 +159,9 @@ func TestFindSendsHeadersQueryAndBody(t *testing.T) {
 	if len(result.Resources) != 1 || result.Resources[0].URI != "viking://resources/docs/api.md" {
 		t.Fatalf("unexpected result: %#v", result)
 	}
+	if got := result.Resources[0].Tags; len(got) != 2 || got[0] != "topic=docs" || got[1] != "kind=api" {
+		t.Fatalf("result tags = %#v", got)
+	}
 }
 
 func TestFindOmitsSearchFiltersWhenUnset(t *testing.T) {
@@ -177,30 +180,131 @@ func TestFindOmitsSearchFiltersWhenUnset(t *testing.T) {
 	}
 }
 
-func TestListSendsOrderingOptions(t *testing.T) {
+func TestFindSendsAndDecodesReadContentWhenEnabled(t *testing.T) {
 	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v1/fs/ls" {
-			t.Fatalf("path = %s", r.URL.Path)
+		body := readJSONBody(t, r)
+		if body["read_content"] != true {
+			t.Fatalf("read_content = %#v", body["read_content"])
 		}
-		if got := r.URL.Query().Get("node_limit"); got != "200" {
-			t.Fatalf("node_limit = %q", got)
+		writeOK(t, w, map[string]any{
+			"resources": []map[string]any{{
+				"uri":     "viking://resources/auth.md",
+				"content": "full visible content",
+			}},
+		})
+	}))
+	defer closeServer()
+
+	enabled := true
+	result, err := client.Find(context.Background(), "auth", &FindOptions{ReadContent: &enabled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Resources) != 1 || result.Resources[0].Content != "full visible content" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestFindUsesDefaultLimitAndPreservesEmptyValues(t *testing.T) {
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := readJSONBody(t, r)
+		if got, ok := body["limit"]; !ok || got != float64(10) {
+			t.Fatalf("limit = %#v, present = %v", got, ok)
 		}
-		if got := r.URL.Query().Get("sort_by"); got != "mtime" {
-			t.Fatalf("sort_by = %q", got)
+		if tags, ok := body["tags"].([]any); !ok || len(tags) != 0 {
+			t.Fatalf("tags = %#v", body["tags"])
 		}
-		if got := r.URL.Query().Get("sort_order"); got != "desc" {
-			t.Fatalf("sort_order = %q", got)
+		if levels, ok := body["level"].([]any); !ok || len(levels) != 0 {
+			t.Fatalf("level = %#v", body["level"])
+		}
+		writeOK(t, w, map[string]any{"resources": []any{}})
+	}))
+	defer closeServer()
+
+	if _, err := client.Find(context.Background(), "auth", &FindOptions{
+		Tags:  []string{},
+		Level: []int{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestListAndTreeSendQueryOptions(t *testing.T) {
+	treeCalls := 0
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/fs/ls":
+			if got := r.URL.Query().Get("node_limit"); got != "200" {
+				t.Fatalf("node_limit = %q", got)
+			}
+			if got := r.URL.Query().Get("offset"); got != "4" {
+				t.Fatalf("offset = %q", got)
+			}
+			if got := r.URL.Query().Get("limit"); got != "5" {
+				t.Fatalf("limit = %q", got)
+			}
+			if got := r.URL.Query().Get("sort_by"); got != "mtime" {
+				t.Fatalf("sort_by = %q", got)
+			}
+			if got := r.URL.Query().Get("sort_order"); got != "desc" {
+				t.Fatalf("sort_order = %q", got)
+			}
+			if got := r.URL.Query()["tags"]; !reflect.DeepEqual(got, []string{"env=prod", "team=search"}) {
+				t.Fatalf("tags = %#v", got)
+			}
+		case "/api/v1/fs/tree":
+			if treeCalls == 0 {
+				if got := r.URL.Query().Get("level_limit"); got != "0" {
+					t.Fatalf("level_limit = %q, want 0", got)
+				}
+				if got := r.URL.Query().Get("offset"); got != "6" {
+					t.Fatalf("offset = %q", got)
+				}
+				if got := r.URL.Query().Get("limit"); got != "7" {
+					t.Fatalf("limit = %q", got)
+				}
+				if got := r.URL.Query()["tags"]; !reflect.DeepEqual(got, []string{"env=prod"}) {
+					t.Fatalf("tags = %#v", got)
+				}
+			} else {
+				if got := r.URL.Query().Get("level_limit"); got != "3" {
+					t.Fatalf("level_limit = %q, want 3", got)
+				}
+				if _, ok := r.URL.Query()["offset"]; ok {
+					t.Fatal("default tree request should omit offset")
+				}
+				if _, ok := r.URL.Query()["limit"]; ok {
+					t.Fatal("default tree request should omit limit")
+				}
+			}
+			treeCalls++
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
 		writeOK(t, w, []any{})
 	}))
 	defer closeServer()
 
-	_, err := client.List(context.Background(), "viking://session", &ListOptions{
+	if _, err := client.List(context.Background(), "viking://session", &ListOptions{
 		NodeLimit: 200,
+		Offset:    4,
+		Limit:     5,
 		SortBy:    "mtime",
 		SortOrder: "desc",
-	})
-	if err != nil {
+		Tags:      []string{"env=prod", "team=search"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Tree(context.Background(), "viking://resources/docs", &TreeOptions{
+		NodeLimit:  200,
+		LevelLimit: Int(0),
+		Offset:     6,
+		Limit:      7,
+		Tags:       []string{"env=prod"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Tree(context.Background(), "viking://resources/docs", nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -255,16 +359,64 @@ func TestReindexSendsDryRun(t *testing.T) {
 		if got := body["dry_run"]; got != true {
 			t.Fatalf("dry_run = %#v", got)
 		}
+		if got := body["recursive"]; got != false {
+			t.Fatalf("recursive = %#v", got)
+		}
 		writeOK(t, w, map[string]any{"status": "completed"})
 	}))
 	defer closeServer()
 
 	if _, err := client.Reindex(context.Background(), "resources/demo", &ReindexOptions{
-		Mode:   "prune_orphans",
-		Wait:   false,
-		DryRun: true,
+		Mode:      "prune_orphans",
+		Wait:      false,
+		DryRun:    true,
+		Recursive: Bool(false),
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReindexSendsExplicitEmptyTags(t *testing.T) {
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := readJSONBody(t, r)
+		tags, ok := body["tags"].([]any)
+		if !ok || len(tags) != 0 {
+			t.Fatalf("tags = %#v", body["tags"])
+		}
+		if got := body["tag_mode"]; got != "replace" {
+			t.Fatalf("tag_mode = %#v", got)
+		}
+		writeOK(t, w, map[string]any{"status": "completed"})
+	}))
+	defer closeServer()
+
+	if _, err := client.Reindex(context.Background(), "resources/demo", &ReindexOptions{
+		Tags:    []string{},
+		TagMode: "replace",
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReindexSendsExtraAndRejectsOverrides(t *testing.T) {
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := readJSONBody(t, r)
+		if got := body["future_flag"]; got != false {
+			t.Fatalf("future_flag = %#v", got)
+		}
+		writeOK(t, w, map[string]any{"status": "completed"})
+	}))
+	defer closeServer()
+
+	if _, err := client.Reindex(context.Background(), "resources/demo", &ReindexOptions{
+		Extra: map[string]any{"future_flag": false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Reindex(context.Background(), "resources/demo", &ReindexOptions{
+		Extra: map[string]any{"tags": []string{"team=search"}},
+	}); err == nil {
+		t.Fatal("expected formal tags field in extra to fail")
 	}
 }
 
@@ -454,6 +606,378 @@ func TestSearchOmitsSearchFiltersWhenUnset(t *testing.T) {
 	}
 }
 
+func TestSearchContextSendsContextOptionsAndRejectsModeOverride(t *testing.T) {
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method+" "+r.URL.Path != "POST /api/v1/search/search" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		body := readJSONBody(t, r)
+		if body["mode"] != "context" || body["query"] != "continue refactor" {
+			t.Fatalf("body = %#v", body)
+		}
+		if body["session_id"] != "session-1" || body["purpose"] != "coding" {
+			t.Fatalf("context fields = %#v", body)
+		}
+		if body["max_tokens"] != float64(3000) || body["dedup_turns"] != float64(5) {
+			t.Fatalf("budget fields = %#v", body)
+		}
+		writeOK(t, w, map[string]any{
+			"rendered": "<memory />",
+			"entries":  []any{},
+			"stats":    map[string]any{"returned": 0},
+		})
+	}))
+	defer closeServer()
+
+	result, err := client.SearchContext(context.Background(), "continue refactor", &SearchContextOptions{
+		SessionID:  "session-1",
+		Purpose:    "coding",
+		MaxTokens:  Int(3000),
+		DedupTurns: Int(5),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Rendered != "<memory />" {
+		t.Fatalf("result = %#v", result)
+	}
+
+	if _, err := client.SearchContext(context.Background(), "query", &SearchContextOptions{
+		Extra: map[string]any{"mode": "list"},
+	}); err == nil || !strings.Contains(err.Error(), "mode") {
+		t.Fatalf("expected mode conflict, got %v", err)
+	}
+}
+
+func TestWriteSendsProcessingModeAndExtra(t *testing.T) {
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := readJSONBody(t, r)
+		if body["processing_mode"] != "vectors_only" || body["future_flag"] != float64(0) || body["wait"] != true || !reflect.DeepEqual(body["tags"], []any{}) || body["tag_mode"] != "replace" {
+			t.Fatalf("body = %#v", body)
+		}
+		writeOK(t, w, map[string]any{"uri": "viking://resources/a.md"})
+	}))
+	defer closeServer()
+
+	if _, err := client.Write(context.Background(), "resources/a.md", "", &WriteOptions{
+		ProcessingMode: "vectors_only",
+		Tags:           []string{},
+		TagMode:        "replace",
+		Wait:           true,
+		Extra:          map[string]any{"future_flag": 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFilesystemTagProjectionOptionsAreSent(t *testing.T) {
+	requests := 0
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		switch requests {
+		case 1:
+			if r.URL.Query().Get("include_tags") != "true" {
+				t.Fatalf("list query = %s", r.URL.RawQuery)
+			}
+		case 2:
+			if r.URL.Query().Get("include_tags") != "true" {
+				t.Fatalf("tree query = %s", r.URL.RawQuery)
+			}
+		case 3:
+			body := readJSONBody(t, r)
+			if body["include_tags"] != true {
+				t.Fatalf("grep body = %#v", body)
+			}
+		case 4:
+			if _, ok := r.URL.Query()["include_tags"]; ok {
+				t.Fatalf("default list query unexpectedly includes tags projection: %s", r.URL.RawQuery)
+			}
+		case 5:
+			body := readJSONBody(t, r)
+			if !reflect.DeepEqual(body["tags"], []any{"team=search", "env=prod"}) || body["include_tags"] != true {
+				t.Fatalf("glob body = %#v", body)
+			}
+		}
+		if requests == 3 || requests == 5 {
+			writeOK(t, w, map[string]any{})
+			return
+		}
+		writeOK(t, w, []any{})
+	}))
+	defer closeServer()
+
+	if _, err := client.List(context.Background(), "resources", &ListOptions{IncludeTags: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Tree(context.Background(), "resources", &TreeOptions{IncludeTags: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Grep(context.Background(), "resources", "needle", &GrepOptions{IncludeTags: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.List(context.Background(), "resources", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Glob(context.Background(), "**/*.md", "resources", &GlobOptions{
+		Tags:        []string{"team=search", "env=prod"},
+		IncludeTags: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBatchWriteAndDownloadBytes(t *testing.T) {
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "POST /api/v1/content/batch-write":
+			body := readJSONBody(t, r)
+			if body["root_uri"] != "viking://resources/project" || body["future_flag"] != float64(0) {
+				t.Fatalf("body = %#v", body)
+			}
+			operations, ok := body["operations"].([]any)
+			if !ok || len(operations) != 1 {
+				t.Fatalf("operations = %#v", body["operations"])
+			}
+			operation, ok := operations[0].(map[string]any)
+			if !ok || !reflect.DeepEqual(operation, map[string]any{
+				"uri":     "viking://resources/project/a.txt",
+				"content": "hello",
+				"mode":    "upsert",
+			}) {
+				t.Fatalf("operation = %#v", operations[0])
+			}
+			writeOK(t, w, map[string]any{"updated": 1})
+		case "GET /api/v1/content/download":
+			if r.URL.Query().Get("uri") != "viking://resources/project/a.txt" {
+				t.Fatalf("query = %s", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte{1, 2, 3})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer closeServer()
+
+	if _, err := client.BatchWrite(context.Background(), "resources/project", []BatchWriteOperation{
+		{
+			URI:     "resources/project/a.txt",
+			Content: String("hello"),
+			Mode:    "upsert",
+		},
+	}, &BatchWriteOptions{Extra: map[string]any{"future_flag": 0}}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := client.DownloadBytes(context.Background(), "resources/project/a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != string([]byte{1, 2, 3}) {
+		t.Fatalf("data = %v", data)
+	}
+}
+
+func TestAddResourceExtra(t *testing.T) {
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := readJSONBody(t, r)
+		if body["future_flag"] != false {
+			t.Fatalf("body = %#v", body)
+		}
+		writeOK(t, w, map[string]any{"root_uri": "viking://resources/a"})
+	}))
+	defer closeServer()
+
+	if _, err := client.AddResource(context.Background(), "https://example.com/a.md", &AddResourceOptions{
+		CreateParent: Bool(false),
+		Extra:        map[string]any{"future_flag": false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAddResourceForwardsRemoteSources(t *testing.T) {
+	remoteSources := []string{
+		"http://example.com/a.md",
+		"https://example.com/a.md",
+		"git@example.com:team/docs.git",
+		"ssh://git@example.com/team/docs.git",
+		"git://example.com/team/docs.git",
+	}
+
+	for _, source := range remoteSources {
+		t.Run(source, func(t *testing.T) {
+			client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body := readJSONBody(t, r)
+				if body["path"] != source {
+					t.Fatalf("path = %#v, want %q", body["path"], source)
+				}
+				writeOK(t, w, map[string]any{"root_uri": "viking://resources/a"})
+			}))
+			defer closeServer()
+
+			if _, err := client.AddResource(context.Background(), source, nil); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestAddResourceSendsAddTypeAndProcessingMode(t *testing.T) {
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := readJSONBody(t, r)
+		if body["add_type"] != "git" || body["processing_mode"] != "vectors_only" {
+			t.Fatalf("body = %#v", body)
+		}
+		writeOK(t, w, map[string]any{"root_uri": "viking://resources/a"})
+	}))
+	defer closeServer()
+
+	if _, err := client.AddResource(context.Background(), "https://example.com/a.md", &AddResourceOptions{
+		AddType:        "git",
+		ProcessingMode: "vectors_only",
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSessionSendsLatestMessageAndRetentionFields(t *testing.T) {
+	var bodies []map[string]any
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodies = append(bodies, readJSONBody(t, r))
+		writeOK(t, w, map[string]any{"status": "ok"})
+	}))
+	defer closeServer()
+
+	if _, err := client.AddMessage(context.Background(), "session-1", "assistant", AddMessageOptions{
+		Content:          String("done"),
+		TurnID:           "turn-1",
+		MessageKind:      "assistant_step",
+		SourceMessageIDs: []string{"user-1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.CommitSession(context.Background(), "session-1", &CommitSessionOptions{
+		RetentionMode:              "turn_budget",
+		KeepRecentTurnCount:        Int(3),
+		RetainedMessageTokenBudget: Int(12000),
+		MinRawTailSteps:            Int(1),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if bodies[0]["turn_id"] != "turn-1" || bodies[0]["message_kind"] != "assistant_step" {
+		t.Fatalf("message = %#v", bodies[0])
+	}
+	if bodies[1]["retention_mode"] != "turn_budget" ||
+		bodies[1]["keep_recent_turn_count"] != float64(3) {
+		t.Fatalf("commit = %#v", bodies[1])
+	}
+}
+
+func TestCreateSessionSendsExtra(t *testing.T) {
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := readJSONBody(t, r)
+		if body["future_flag"] != false {
+			t.Fatalf("body = %#v", body)
+		}
+		writeOK(t, w, map[string]any{"session_id": "session-1"})
+	}))
+	defer closeServer()
+
+	if _, err := client.CreateSession(context.Background(), &CreateSessionOptions{
+		Extra: map[string]any{"future_flag": false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAgentEvolutionQueries(t *testing.T) {
+	var paths []string
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.RequestURI())
+		writeOK(t, w, map[string]any{"experience_uri": "viking://user/memories/experiences/a.md"})
+	}))
+	defer closeServer()
+
+	if _, err := client.ListExperienceTrajectories(
+		context.Background(),
+		"user/memories/experiences/a.md",
+		&ExperienceTrajectoryOptions{
+			Limit:     Int(25),
+			Offset:    Int(50),
+			StartDate: "2026-08-01",
+			EndDate:   "2026-08-10",
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.GetExperienceOutcomes(
+		context.Background(),
+		"user/memories/experiences/a.md",
+		&ExperienceOutcomeOptions{
+			StartDate: "2026-08-01",
+			EndDate:   "2026-08-10",
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(paths[0], "limit=25") || !strings.Contains(paths[0], "offset=50") {
+		t.Fatalf("trajectory path = %s", paths[0])
+	}
+	if !strings.Contains(paths[0], "start_date=2026-08-01") ||
+		!strings.Contains(paths[0], "end_date=2026-08-10") {
+		t.Fatalf("trajectory dates = %s", paths[0])
+	}
+	if !strings.Contains(paths[1], "experiences%2Fa.md") {
+		t.Fatalf("outcomes path = %s", paths[1])
+	}
+	if !strings.Contains(paths[1], "start_date=2026-08-01") ||
+		!strings.Contains(paths[1], "end_date=2026-08-10") {
+		t.Fatalf("outcome dates = %s", paths[1])
+	}
+}
+
+func TestOpenVikingAssetsResolveAndPreflight(t *testing.T) {
+	var bodies []map[string]any
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodies = append(bodies, readJSONBody(t, r))
+		writeOK(t, w, map[string]any{"ok": true})
+	}))
+	defer closeServer()
+
+	if _, err := client.ResolveOpenVikingAssets(
+		context.Background(),
+		"protocol: openviking-assets/1",
+		&ResolveAssetsOptions{
+			ManifestLabel: "custom.yaml",
+			Extra:         map[string]any{"future_flag": false},
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.PreflightOpenVikingAsset(
+		context.Background(),
+		"private-repo",
+		"https://github.com/example/private.git",
+		&PreflightAssetOptions{
+			Branch: "main",
+			Commit: "0123456789abcdef",
+			AuthConfig: &AssetGitAuth{
+				Username: "oauth2",
+				Token:    "secret",
+			},
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if bodies[0]["manifest_label"] != "custom.yaml" || bodies[0]["future_flag"] != false {
+		t.Fatalf("resolve body = %#v", bodies[0])
+	}
+	if bodies[1]["commit"] != "0123456789abcdef" {
+		t.Fatalf("preflight body = %#v", bodies[1])
+	}
+}
+
 func TestSearchSendsImageURI(t *testing.T) {
 	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/search/search" {
@@ -471,46 +995,6 @@ func TestSearchSendsImageURI(t *testing.T) {
 		TargetURI: "viking://resources/images",
 		Image:     "viking://resources/images/cat.png",
 	}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestRelationRequests(t *testing.T) {
-	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method + " " + r.URL.Path {
-		case "GET /api/v1/relations":
-			if got := r.URL.Query().Get("uri"); got != "viking://resources/from" {
-				t.Fatalf("uri = %q", got)
-			}
-			writeOK(t, w, []map[string]any{{"uri": "viking://resources/to"}})
-		case "POST /api/v1/relations/link":
-			body := readJSONBody(t, r)
-			targets, ok := body["to_uris"].([]any)
-			if body["from_uri"] != "viking://resources/from" || body["reason"] != "related" ||
-				!ok || len(targets) != 1 || targets[0] != "viking://resources/to" {
-				t.Fatalf("link body = %#v", body)
-			}
-			writeOK(t, w, map[string]any{"linked": true})
-		case "DELETE /api/v1/relations/link":
-			body := readJSONBody(t, r)
-			if body["from_uri"] != "viking://resources/from" || body["to_uri"] != "viking://resources/to" {
-				t.Fatalf("unlink body = %#v", body)
-			}
-			writeOK(t, w, map[string]any{"unlinked": true})
-		default:
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	defer closeServer()
-
-	relations, err := client.Relations(context.Background(), "resources/from")
-	if err != nil || len(relations) != 1 {
-		t.Fatalf("relations = %#v, err = %v", relations, err)
-	}
-	if err := client.Link(context.Background(), "resources/from", []string{"resources/to"}, "related"); err != nil {
-		t.Fatal(err)
-	}
-	if err := client.Unlink(context.Background(), "resources/from", "resources/to"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1182,26 +1666,58 @@ func TestSessionExistsHandlesNotFound(t *testing.T) {
 	}
 }
 
-func TestListTasksRequest(t *testing.T) {
+func TestCompileAndListTasksRequests(t *testing.T) {
 	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			t.Fatalf("method = %s", r.Method)
-		}
-		if r.URL.Path != "/api/v1/tasks" {
+		switch r.URL.Path {
+		case "/api/v1/compile":
+			if r.Method != http.MethodPost {
+				t.Fatalf("method = %s", r.Method)
+			}
+			body := readJSONBody(t, r)
+			if !reflect.DeepEqual(body["from"], []any{"viking://resources/source"}) ||
+				body["to"] != "viking://resources/output" ||
+				body["skill"] != "viking://agent/skills/wiki" ||
+				body["instruction"] != "Keep supporting evidence." ||
+				!reflect.DeepEqual(body["args"], map[string]any{"model_name": "endpoint-1"}) {
+				t.Fatalf("body = %#v", body)
+			}
+			writeOK(t, w, map[string]any{"task_id": "cmp_1"})
+		case "/api/v1/tasks":
+			if r.Method != http.MethodGet {
+				t.Fatalf("method = %s", r.Method)
+			}
+			query := r.URL.Query()
+			if query.Get("task_type") != "session_commit" ||
+				query.Get("status") != "running" ||
+				query.Get("resource_id") != "session-1" ||
+				query.Get("limit") != "20" {
+				t.Fatalf("query = %s", r.URL.RawQuery)
+			}
+			writeOK(t, w, []map[string]any{
+				{"task_id": "task-1", "status": "running"},
+			})
+		default:
 			t.Fatalf("path = %s", r.URL.Path)
 		}
-		query := r.URL.Query()
-		if query.Get("task_type") != "session_commit" ||
-			query.Get("status") != "running" ||
-			query.Get("resource_id") != "session-1" ||
-			query.Get("limit") != "20" {
-			t.Fatalf("query = %s", r.URL.RawQuery)
-		}
-		writeOK(t, w, []map[string]any{
-			{"task_id": "task-1", "status": "running"},
-		})
 	}))
 	defer closeServer()
+
+	compiled, err := client.Compile(
+		context.Background(),
+		[]string{"viking://resources/source"},
+		"viking://resources/output",
+		"viking://agent/skills/wiki",
+		&CompileOptions{
+			Instruction: "Keep supporting evidence.",
+			Args:        map[string]any{"model_name": "endpoint-1"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compiled["task_id"] != "cmp_1" {
+		t.Fatalf("compiled = %#v", compiled)
+	}
 
 	tasks, err := client.ListTasks(context.Background(), &ListTasksOptions{
 		TaskType:   "session_commit",
@@ -1308,6 +1824,28 @@ func TestSetTagsDefaultsModeAndOmitsTelemetry(t *testing.T) {
 	}
 }
 
+func TestSetTagsForwardsExtraAndRejectsOfficialFields(t *testing.T) {
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := readJSONBody(t, r)
+		if got := body["future_flag"]; got != false {
+			t.Fatalf("future_flag = %#v", got)
+		}
+		writeOK(t, w, map[string]any{"updated": 1})
+	}))
+	defer closeServer()
+
+	if _, err := client.SetTags(context.Background(), "resources/docs", []string{"team=infra"}, &SetTagsOptions{
+		Extra: map[string]any{"future_flag": false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.SetTags(context.Background(), "resources/docs", []string{"team=infra"}, &SetTagsOptions{
+		Extra: map[string]any{"uri": "viking://other"},
+	}); err == nil {
+		t.Fatal("expected extra to reject uri override")
+	}
+}
+
 func TestGrepForwardsLevelLimit(t *testing.T) {
 	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method+" "+r.URL.Path != "POST /api/v1/search/grep" {
@@ -1317,12 +1855,15 @@ func TestGrepForwardsLevelLimit(t *testing.T) {
 		if got, ok := body["level_limit"]; !ok || got != float64(3) {
 			t.Fatalf("level_limit = %#v (ok=%v)", body["level_limit"], ok)
 		}
+		if !reflect.DeepEqual(body["tags"], []any{"env=prod"}) {
+			t.Fatalf("tags = %#v", body["tags"])
+		}
 		writeOK(t, w, map[string]any{"matches": []any{}})
 	}))
 	defer closeServer()
 
 	level := 3
-	if _, err := client.Grep(context.Background(), "viking://user", "pat", &GrepOptions{LevelLimit: &level}); err != nil {
+	if _, err := client.Grep(context.Background(), "viking://user", "pat", &GrepOptions{LevelLimit: &level, Tags: []string{"env=prod"}}); err != nil {
 		t.Fatal(err)
 	}
 }

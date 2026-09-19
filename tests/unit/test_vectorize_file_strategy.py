@@ -165,26 +165,38 @@ async def test_vectorize_disambiguates_typescript_and_mpeg_ts(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_vectorize_file_uses_summary_first(monkeypatch):
+@pytest.mark.parametrize("text_source", ["summary_first", "summary_only"])
+@pytest.mark.parametrize("summary", ["short summary", ""])
+async def test_vectorize_file_uses_summary_first(monkeypatch, text_source, summary):
+    from openviking_cli.utils.config.embedding_config import EmbeddingConfig
+
+    cfg = EmbeddingConfig(
+        dense={
+            "provider": "openai",
+            "model": "text-embedding-3-small",
+            "api_base": "http://localhost:8080/v1",
+            "dimension": 1536,
+        },
+        text_source=text_source,
+        max_input_tokens=1000,
+    )
     queue = DummyQueue()
     monkeypatch.setattr(embedding_utils, "get_queue_manager", lambda: DummyQueueManager(queue))
-    monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: DummyFS("X" * 5000))
+    monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: DummyFS("raw content"))
     monkeypatch.setattr(
         embedding_utils,
         "get_openviking_config",
-        lambda: types.SimpleNamespace(
-            embedding=types.SimpleNamespace(text_source="summary_first", max_input_tokens=1000)
-        ),
+        lambda: types.SimpleNamespace(embedding=cfg),
     )
     await embedding_utils.vectorize_file(
         file_path="viking://user/default/resources/test.md",
-        summary_dict={"name": "test.md", "summary": "short summary"},
+        summary_dict={"name": "test.md", "summary": summary},
         parent_uri="viking://user/default/resources",
         ctx=DummyReq(),
     )
 
     assert len(queue.items) == 1
-    assert queue.items[0].message == "short summary"
+    assert queue.items[0].message == (summary or "raw content")
     assert "content" not in queue.items[0].context_data
 
 
@@ -561,25 +573,46 @@ async def test_vectorize_directory_meta_appends_search_tags_by_level(monkeypatch
 async def test_vectorize_directory_meta_l1_abstract_is_overview(monkeypatch):
     """L1 records must carry the overview in the abstract scalar so Rerank
     sees L1 text instead of the L0 abstract."""
+    from openviking.core.context import ContextLevel
+    from openviking.storage.abstract_overview import render_abstract_overview
+
     queue = DummyQueue()
     monkeypatch.setattr(embedding_utils, "get_queue_manager", lambda: DummyQueueManager(queue))
     monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: DummyFS("ignored"))
 
+    uri = "viking://user/default/resources/demo"
     overview = "# Overview\n\n" + ("section detail. " * 50)
+    metadata = {
+        "source": {"kind": "http", "uri": "https://example.com/private.pdf"},
+        "generated_by": {"component": "SemanticProcessor", "trigger": "ingest"},
+        "freshness": {
+            "total_entries": 4,
+            "sampled_entries": 2,
+            "unsampled_entries": 2,
+            "pending_child_changes": 0,
+        },
+    }
     await embedding_utils.vectorize_directory_meta(
-        uri="viking://user/default/resources/demo",
-        abstract="demo abstract",
-        overview=overview,
+        uri=uri,
+        abstract=render_abstract_overview(
+            ContextLevel.ABSTRACT, uri, "Visible abstract.", metadata
+        ),
+        overview=render_abstract_overview(ContextLevel.OVERVIEW, uri, overview, metadata),
         ctx=DummyReq(),
     )
 
     assert len(queue.items) == 2
     l0, l1 = queue.items
     assert l0.context_data["level"] == 0
-    assert l0.context_data["abstract"] == "demo abstract"
+    assert l0.context_data["abstract"] == "Visible abstract."
     assert l1.context_data["level"] == 1
-    assert l1.context_data["abstract"] == overview
-    assert l1.message == overview
+    assert l1.context_data["abstract"] == overview.rstrip()
+    assert l1.message == (f"---\ndirectory: {uri}/\n---\n\n{overview.rstrip()}")
+    for item in (l0, l1):
+        assert f"directory: {uri}/" in item.message
+        assert "source:" not in item.message
+        assert "generated_by:" not in item.message
+        assert "freshness:" not in item.message
 
 
 @pytest.mark.asyncio
@@ -1042,3 +1075,35 @@ async def test_vectorize_directory_meta_truncates_oversized_abstract(monkeypatch
         abstract = item.context_data["abstract"]
         assert len(abstract.encode("utf-8")) <= embedding_utils._ABSTRACT_MAX_BYTES
         assert abstract.encode("utf-8").decode("utf-8") == abstract
+
+
+@pytest.mark.asyncio
+async def test_skill_directory_body_frontmatter_is_not_parsed_twice(monkeypatch):
+    from openviking.storage.abstract_overview import (
+        AbstractOverviewFormatError,
+        render_abstract_overview,
+    )
+
+    queue = DummyQueue()
+    monkeypatch.setattr(embedding_utils, "get_queue_manager", lambda: DummyQueueManager(queue))
+    monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: DummyFS("ignored"))
+    uri = "viking://agent/skills/demo"
+    body = "---\nname: demo\ndescription: Tool instructions\n---\n\n# Parameters\nKeep this body."
+    await embedding_utils.vectorize_directory_meta(
+        uri, "name: demo", body, context_type="skill", ctx=DummyReq(), content_is_body=True
+    )
+    overview_msg = next(item for item in queue.items if item.context_data["level"] == 1)
+    assert overview_msg.context_data["abstract"] == body
+    assert body in overview_msg.message
+
+    # Existing callers still validate serialized sidecars, and strip only the
+    # outer system metadata from a valid document containing frontmatter.
+    with pytest.raises(AbstractOverviewFormatError, match="must contain directory"):
+        await embedding_utils.vectorize_directory_meta(uri, "abstract", body, ctx=DummyReq())
+    queue.items.clear()
+    await embedding_utils.vectorize_directory_meta(
+        uri, "abstract", render_abstract_overview(1, uri, body), ctx=DummyReq()
+    )
+    overview_msg = next(item for item in queue.items if item.context_data["level"] == 1)
+    assert overview_msg.context_data["abstract"] == body
+    assert body in overview_msg.message

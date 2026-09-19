@@ -6,8 +6,10 @@ import asyncio
 import re
 import threading
 from contextlib import nullcontext
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
+from urllib.parse import quote, unquote, urlsplit
 
+from openviking.core.namespace import classify_uri
 from openviking.observability.context import (
     bind_root_observability_context,
     reset_root_observability_context,
@@ -32,15 +34,31 @@ from openviking.parse.parsers.media.utils import (
 )
 from openviking.prompts import render_prompt
 from openviking.server.identity import RequestContext, Role
+from openviking.service.task_tracker_concurrency import run_to_completion
+from openviking.service.task_work_index import detach_task_context
+from openviking.storage.abstract_overview import (
+    AbstractOverviewWriteResult,
+    body_for_preview,
+    deterministic_sample,
+    freshness_metadata,
+    plan_abstract_overview_refresh,
+    write_abstract_overview,
+)
+from openviking.storage.acl import CreatorAclGrant
 from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
+from openviking.storage.queuefs.process_result import ProcessResult
 from openviking.storage.queuefs.semantic_dag import DagStats, SemanticDagExecutor
 from openviking.storage.queuefs.semantic_lock import SemanticLockScope
 from openviking.storage.queuefs.semantic_msg import SemanticMsg, build_semantic_coalesce_key
+from openviking.storage.queuefs.semantic_ops.freshness_policy import FreshnessAction
 from openviking.storage.queuefs.semantic_queue import is_semantic_msg_stale
-from openviking.storage.queuefs.semantic_sidecar import write_semantic_sidecars
+from openviking.storage.queuefs.semantic_work import SemanticMessageWork, SkillSemanticMessageWork
 from openviking.storage.viking_fs import LS_ALL_NODES, SyncDiff, get_viking_fs
-from openviking.telemetry import bind_telemetry, bind_telemetry_stage, resolve_telemetry
+from openviking.telemetry import (
+    bind_telemetry,
+    bind_telemetry_stage,
+)
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.telemetry.span_models import create_root_span_attributes
 from openviking.utils.circuit_breaker import (
@@ -83,7 +101,12 @@ class SemanticProcessor(DequeueHandlerBase):
     _request_stats_order: List[str] = []
     _max_cached_stats = 256
 
-    def __init__(self, max_concurrent_llm: int = 32):
+    def __init__(
+        self,
+        max_concurrent_llm: int = 32,
+        *,
+        embedding_worker_stopped: Optional[Callable[[], bool]] = None,
+    ):
         """
         Initialize SemanticProcessor.
 
@@ -93,6 +116,7 @@ class SemanticProcessor(DequeueHandlerBase):
         self.max_concurrent_llm = max_concurrent_llm
         self._default_ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
         self._circuit_breaker = CircuitBreaker()
+        self._embedding_worker_stopped = embedding_worker_stopped
 
     @classmethod
     def _cache_dag_stats(cls, telemetry_id: str, uri: str, stats: DagStats) -> None:
@@ -153,10 +177,11 @@ class SemanticProcessor(DequeueHandlerBase):
 
     @staticmethod
     def _ctx_from_semantic_msg(msg: SemanticMsg) -> RequestContext:
-        role = Role(msg.role or Role.ROOT)
         return RequestContext(
             user=UserIdentifier(msg.account_id, msg.user_id),
-            role=role,
+            role=Role(msg.role),
+            group_ids=tuple(msg.group_ids),
+            bypass_acl=True,
         )
 
     def _detect_file_type(self, file_name: str) -> str:
@@ -190,7 +215,12 @@ class SemanticProcessor(DequeueHandlerBase):
         # Default to other
         return FILE_TYPE_OTHER
 
-    async def _reenqueue_semantic_msg(self, msg: SemanticMsg) -> None:
+    async def _reenqueue_semantic_msg(
+        self,
+        msg: SemanticMsg,
+        *,
+        enqueue: Optional[Callable[[Any, SemanticMsg], Awaitable[None]]] = None,
+    ) -> None:
         """Re-enqueue a semantic message for later processing.
 
         Throttles with a sleep when the circuit breaker is open to prevent
@@ -208,49 +238,117 @@ class SemanticProcessor(DequeueHandlerBase):
         queue_manager = get_queue_manager()
         if queue_manager is not None:
             semantic_queue = queue_manager.get_queue(queue_manager.SEMANTIC)
-            await semantic_queue.enqueue(msg)
+            if enqueue is None:
+                await semantic_queue.enqueue(msg)
+            else:
+                await enqueue(semantic_queue, msg)
             logger.info(f"Re-enqueued semantic message: {msg.uri}")
         else:
             logger.warning(f"No queue manager available, cannot re-enqueue: {msg.uri}")
 
+    async def _enqueue_skill_retry(self, queue, msg: SemanticMsg, scope: SemanticLockScope) -> None:
+        """Transfer the live package lease to a retry before releasing this worker.
+
+        Reusing the consumed handoff would require acquiring an unrelated lock,
+        which conflicts with an update request still waiting under its outer lease.
+        """
+        agfs = get_viking_fs()._async_agfs
+        handoff = await agfs.pathlock_to_handoff(scope.lock)
+        handed_off = False
+        try:
+            await agfs.pathlock_handoff(scope.lock)
+            handed_off = True
+            scope._owned = False
+            msg.lock_handoff = handoff
+            await queue.enqueue(msg)
+        except BaseException:
+            if handed_off:
+                scope.lock = await agfs.pathlock_adopt(handoff)
+                scope._owned = True
+            raise
+
     async def _requeue_semantic_msg_after_error(
         self,
         msg: SemanticMsg,
-        data: Optional[Dict[str, Any]],
         error: Exception,
-    ) -> None:
+        *,
+        work: SemanticMessageWork,
+    ) -> ProcessResult:
         try:
-            await self._reenqueue_semantic_msg(msg)
+            await work.reenqueue_after_error()
             self._merge_request_stats(msg.telemetry_id, requeue_count=1)
             get_request_wait_tracker().record_semantic_requeue(msg.telemetry_id)
-            self.report_requeue()
         except Exception as requeue_err:
             logger.error(f"Failed to re-enqueue semantic message: {requeue_err}")
             self._merge_request_stats(msg.telemetry_id, error_count=1)
             get_request_wait_tracker().mark_semantic_failed(msg.telemetry_id, msg.id, str(error))
-            self.report_error(str(error), data)
-            return
-        self.report_success()
+            return ProcessResult.failed(str(error))
+        return ProcessResult.requeued()
 
-    async def _enqueue_parent_refresh(self, msg: SemanticMsg, uri: str) -> None:
+    async def _enqueue_parent_refresh(
+        self, msg: SemanticMsg, uri: str, *, l0_body_changed: bool
+    ) -> None:
+        if msg.generation_trigger == "content_copy":
+            return
         if msg.context_type not in {"resource", "skill"}:
+            return
+        if not msg.propagate_to_parent:
             return
         parent = VikingURI(uri).parent
         if parent is None:
             return
         parent_uri = parent.uri.rstrip("/")
+        if msg.context_type == "skill":
+            classification = classify_uri(parent_uri)
+            if (
+                not classification.is_skill
+                or classification.is_skill_namespace
+                or classification.is_skill_root
+            ):
+                return
         if (
             not parent_uri
-            or parent_uri in {"viking://", "viking:"}
+            or parent_uri in {"viking://", "viking:", "viking://user", "viking://agent"}
             or parent_uri == uri.rstrip("/")
         ):
+            return
+        parent_ctx = self._ctx_from_semantic_msg(msg)
+        semantic_config = get_openviking_config().semantic
+        try:
+            decision = await plan_abstract_overview_refresh(
+                viking_fs=get_viking_fs(),
+                dir_uri=parent_uri,
+                changed_entries=1,
+                ctx=parent_ctx,
+                l0_body_changed=l0_body_changed,
+                # This helper handles automatic upward propagation only. Manual
+                # refresh/ingest bypasses the threshold for its requested root,
+                # not for every ancestor reached afterwards.
+                force_refresh=False,
+                overview_sample_limit=getattr(semantic_config, "overview_sample_limit", 32),
+                refresh_ratio=getattr(semantic_config, "freshness_refresh_ratio", 0.10),
+                lock_timeout_secs=1.0,
+            )
+        except LockAcquisitionError:
+            logger.info(
+                "Skipping best-effort parent freshness update because sidecars are busy: %s",
+                parent_uri,
+            )
+            return
+
+        if decision.action is not FreshnessAction.REFRESH_NOW:
+            logger.debug(
+                "Parent semantic refresh %s for %s (pending=%d, total=%d)",
+                decision.action.value,
+                parent_uri,
+                decision.pending_after,
+                decision.total_entries,
+            )
             return
 
         from openviking.storage.queuefs import get_queue_manager
 
         queue_manager = get_queue_manager()
-        if queue_manager is None:
-            return
         semantic_queue = queue_manager.get_queue(queue_manager.SEMANTIC, allow_create=True)
         parent_msg = SemanticMsg(
             uri=parent_uri,
@@ -258,10 +356,12 @@ class SemanticProcessor(DequeueHandlerBase):
             recursive=False,
             account_id=msg.account_id,
             user_id=msg.user_id,
+            group_ids=msg.group_ids,
             peer_id=msg.peer_id,
             role=msg.role,
             skip_vectorization=msg.skip_vectorization,
             changes={"modified": [uri]},
+            generation_trigger="parent_refresh",
             coalesce_key=build_semantic_coalesce_key(
                 context_type=msg.context_type,
                 uri=parent_uri,
@@ -270,44 +370,72 @@ class SemanticProcessor(DequeueHandlerBase):
                 peer_id=msg.peer_id,
             ),
         )
-        await semantic_queue.enqueue(parent_msg)
+        with detach_task_context():
+            await semantic_queue.enqueue(parent_msg)
         logger.info("Enqueued parent semantic refresh: %s", parent_uri)
+
+    def _message_work(
+        self, msg: SemanticMsg, lock: Optional[Dict[str, Any]] = None
+    ) -> SemanticMessageWork:
+        work_type = SkillSemanticMessageWork if msg.context_type == "skill" else SemanticMessageWork
+        return work_type(self, msg, lock)
 
     async def on_dequeue(
         self,
         data: Optional[Dict[str, Any]],
         lock: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> ProcessResult:
         """Process dequeued SemanticMsg, recursively process all subdirectories."""
         msg: Optional[SemanticMsg] = None
         collector = None
+        work: Optional[SemanticMessageWork] = None
         try:
             import json
 
             if not data:
-                return None
+                return ProcessResult.success()
 
             if "data" in data and isinstance(data["data"], str):
                 data = json.loads(data["data"])
 
             assert data is not None
             msg = SemanticMsg.from_dict(data)
+            work = self._message_work(msg, lock)
+            work.start()
             if VikingURI(msg.uri).parent is None:
                 logger.warning("Skipping semantic generation for root URI: %s", msg.uri)
                 if msg.telemetry_id and msg.id:
                     get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
-                self.report_success()
-                return None
+                return ProcessResult.success()
             if is_semantic_msg_stale(msg):
-                logger.info(
-                    "Skipping stale semantic message: uri=%s version=%s",
-                    msg.uri,
-                    msg.coalesce_version,
-                )
-                if msg.telemetry_id and msg.id:
-                    get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
-                self.report_success()
-                return None
+                live_file_changes = {
+                    kind: list(msg.changes.get(kind, []))
+                    for kind in ("added", "modified")
+                    if msg.changes and msg.changes.get(kind)
+                }
+                if msg.generation_trigger == "content_write" and live_file_changes:
+                    # Coalescing replaces directory aggregation, not per-file
+                    # maintenance. Let the newest message aggregate while this
+                    # one still summarizes/vectorizes its changed files.
+                    logger.info(
+                        "Downgrading stale semantic message to file-only work: uri=%s version=%s",
+                        msg.uri,
+                        msg.coalesce_version,
+                    )
+                    msg.aggregate_directory = False
+                    msg.changes = live_file_changes
+                    msg.coalesce_key = ""
+                    msg.coalesce_version = 0
+                else:
+                    logger.info(
+                        "Skipping stale semantic message: uri=%s version=%s",
+                        msg.uri,
+                        msg.coalesce_version,
+                    )
+                    await work.skip()
+                    if msg.telemetry_id and msg.id:
+                        get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
+                    return ProcessResult.success()
             # Circuit breaker: if API is known-broken, re-enqueue and wait
             try:
                 self._circuit_breaker.check()
@@ -315,13 +443,11 @@ class SemanticProcessor(DequeueHandlerBase):
                 logger.warning(
                     f"Circuit breaker is open, re-enqueueing semantic message: {msg.uri}"
                 )
-                await self._reenqueue_semantic_msg(msg)
+                await work.reenqueue()
                 self._merge_request_stats(msg.telemetry_id, requeue_count=1)
                 get_request_wait_tracker().record_semantic_requeue(msg.telemetry_id)
-                self.report_requeue()
-                self.report_success()
-                return None
-            collector = resolve_telemetry(msg.telemetry_id)
+                return ProcessResult.requeued()
+            collector = work.resolve_telemetry()
             telemetry_ctx = bind_telemetry(collector) if collector is not None else nullcontext()
             with telemetry_ctx:
                 root_attrs = create_root_span_attributes(
@@ -341,15 +467,27 @@ class SemanticProcessor(DequeueHandlerBase):
 
                     logger.info(f"Processing semantic generation for: {msg})")
 
-                    semantic_lock = await SemanticLockScope.resolve(
-                        msg.lock_handoff,
-                        caller_lock=lock,
-                        fallback_path_factory=lambda: get_viking_fs()._uri_to_path(
-                            msg.uri, ctx=current_ctx
-                        ),
-                    )
+                    # Resolving a deleted root can recreate it for lock metadata.
+                    # Settle queued ownership before acknowledging skipped work.
+                    if not await get_viking_fs().exists(msg.uri, ctx=current_ctx):
+                        logger.info("Skipping semantic message for missing root: uri=%s", msg.uri)
+                        await work.skip()
+                        if msg.telemetry_id and msg.id:
+                            get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
+                        return ProcessResult.success()
+
+                    if not await work.acquire_lock(current_ctx):
+                        get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
+                        return ProcessResult.success()
+                    semantic_lock = work.scope
+                    assert semantic_lock is not None
+                    dag_stats = None
+                    processing_succeeded = False
                     try:
-                        if msg.context_type == "memory":
+                        # Regular memory writes keep their specialized update path.
+                        # Callers must explicitly opt into directory aggregation; the
+                        # trigger remains descriptive metadata, not an algorithm switch.
+                        if msg.context_type == "memory" and not msg.use_hierarchical_aggregation:
                             await self._process_memory_directory(
                                 msg,
                                 ctx=current_ctx,
@@ -370,11 +508,13 @@ class SemanticProcessor(DequeueHandlerBase):
                                         "Syncing semantic source into target before processing: "
                                         f"{msg.uri} -> {msg.target_uri}"
                                     )
-                                    diff = await self._sync_topdown_recursive(
-                                        msg.uri,
-                                        msg.target_uri,
-                                        ctx=current_ctx,
-                                        lock=semantic_lock.lock,
+                                    diff = await work.run_write(
+                                        lambda: self._sync_topdown_recursive(
+                                            msg.uri,
+                                            msg.target_uri,
+                                            ctx=current_ctx,
+                                            lock=semantic_lock.lock,
+                                        )
                                     )
                                     logger.info(
                                         "[SyncDiff] Diff computed: "
@@ -407,6 +547,7 @@ class SemanticProcessor(DequeueHandlerBase):
                                 ctx=current_ctx,
                                 incremental_update=is_incremental,
                                 target_uri=target_uri,
+                                target_preexisting=msg.target_preexisting,
                                 recursive=msg.recursive,
                                 lock=semantic_lock.lock,
                                 is_code_repo=msg.is_code_repo,
@@ -415,26 +556,49 @@ class SemanticProcessor(DequeueHandlerBase):
                                 ingest_options=msg.ingest_options,
                                 coalesce_key=msg.coalesce_key,
                                 coalesce_version=msg.coalesce_version,
+                                source=msg.source,
+                                generation_trigger=msg.generation_trigger,
+                                aggregate_directory=msg.aggregate_directory,
+                                copy_source_uri=msg.copy_source_uri,
                             )
                             await executor.run(run_uri)
+                            dag_stats = executor.get_stats()
                             self._cache_dag_stats(
                                 msg.telemetry_id,
                                 run_uri,
-                                executor.get_stats(),
+                                dag_stats,
                             )
-                            if not executor.stale:
-                                await self._enqueue_parent_refresh(msg, target_uri or msg.uri)
+                            if not executor.stale and msg.aggregate_directory:
+                                write_result = getattr(
+                                    executor,
+                                    "root_write_result",
+                                    AbstractOverviewWriteResult(
+                                        wrote=True, abstract_body_changed=True
+                                    ),
+                                )
+                                await self._enqueue_parent_refresh(
+                                    msg,
+                                    target_uri or msg.uri,
+                                    l0_body_changed=write_result.abstract_body_changed,
+                                )
+                        processing_succeeded = True
                     finally:
-                        await semantic_lock.close()
+                        await work.finish_processing(processing_succeeded)
+                    failure = work.failure_result(dag_stats)
+                    if failure is not None:
+                        return failure
                     get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
                     self._merge_request_stats(msg.telemetry_id, processed=1)
                     logger.info(f"Completed semantic generation for: {msg.uri}")
-                    self.report_success()
                     self._circuit_breaker.record_success()
-                    return None
+                    return ProcessResult.success()
                 finally:
                     reset_root_observability_context(root_context_token)
 
+        except asyncio.CancelledError:
+            if work is not None:
+                await work.cancel()
+            raise
         except Exception as e:
             if isinstance(e, LockAcquisitionError):
                 logger.warning(
@@ -443,11 +607,13 @@ class SemanticProcessor(DequeueHandlerBase):
                     e,
                     exc_info=True,
                 )
-                if msg is not None:
-                    await self._requeue_semantic_msg_after_error(msg, data, e)
-                else:
-                    self.report_error(str(e), data)
-                return None
+                if msg is not None and work is not None:
+                    return await self._requeue_semantic_msg_after_error(
+                        msg,
+                        e,
+                        work=work,
+                    )
+                return ProcessResult.failed(str(e))
 
             error_class = classify_api_error(e)
             if error_class == ERROR_CLASS_INPUT_TOO_LARGE:
@@ -460,7 +626,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     get_request_wait_tracker().mark_semantic_failed(
                         msg.telemetry_id, msg.id, str(e)
                     )
-                self.report_error(str(e), data)
+                return ProcessResult.failed(str(e))
             elif error_class == ERROR_CLASS_PERMANENT:
                 logger.critical(
                     f"Permanent API error processing semantic message, dropping: {e}",
@@ -472,7 +638,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     get_request_wait_tracker().mark_semantic_failed(
                         msg.telemetry_id, msg.id, str(e)
                     )
-                self.report_error(str(e), data)
+                return ProcessResult.failed(str(e))
             else:
                 # Transient or unknown — re-enqueue for retry
                 logger.warning(
@@ -480,13 +646,19 @@ class SemanticProcessor(DequeueHandlerBase):
                     exc_info=True,
                 )
                 self._circuit_breaker.record_failure(e)
-                if msg is not None:
-                    await self._requeue_semantic_msg_after_error(msg, data, e)
-                else:
-                    self.report_error(str(e), data)
-            return None
+                if msg is not None and work is not None:
+                    return await self._requeue_semantic_msg_after_error(
+                        msg,
+                        e,
+                        work=work,
+                    )
+                return ProcessResult.failed(str(e))
 
-    async def on_cancelled(self, data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        finally:
+            if work is not None:
+                await work.close()
+
+    async def on_cancelled(self, data: Optional[Dict[str, Any]]) -> ProcessResult:
         """Release a queued semantic lock before cancelled work is ACKed."""
         try:
             import json
@@ -496,11 +668,12 @@ class SemanticProcessor(DequeueHandlerBase):
                 payload = json.loads(payload)
             msg = SemanticMsg.from_dict(payload)
         except (TypeError, ValueError) as exc:
-            self.report_error(str(exc), data)
-            return None
+            return ProcessResult.failed(str(exc))
 
-        if msg.telemetry_id and msg.id:
-            get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
+        await self._message_work(msg).cancel_queued()
+        return ProcessResult.cancelled()
+
+    async def _release_cancelled_semantic_lock(self, msg: SemanticMsg) -> None:
         if msg.lock_handoff is not None:
             try:
                 viking_fs = get_viking_fs()
@@ -508,8 +681,37 @@ class SemanticProcessor(DequeueHandlerBase):
                 await viking_fs._async_agfs.pathlock_release(lock)
             except Exception as exc:
                 logger.warning("Failed to release cancelled semantic lock: %s", exc)
-        self.report_success()
-        return None
+
+    async def _resolve_skill_semantic_lock(
+        self,
+        msg: SemanticMsg,
+        ctx: RequestContext,
+        caller_lock: Optional[Dict[str, Any]],
+    ) -> SemanticLockScope:
+        scope = None
+
+        async def acquire():
+            nonlocal scope
+            viking_fs = get_viking_fs()
+            scope = await SemanticLockScope.resolve(
+                msg.lock_handoff,
+                caller_lock=caller_lock,
+                fallback_path_factory=lambda: viking_fs._uri_to_path(msg.uri, ctx=ctx),
+            )
+            if scope.lock is None and await viking_fs.exists(msg.uri, ctx=ctx):
+                lease = await viking_fs._async_agfs.pathlock_acquire_tree(
+                    viking_fs._uri_to_path(msg.uri, ctx=ctx)
+                )
+                scope = SemanticLockScope(lease, _owned=True)
+            return scope
+
+        try:
+            return await run_to_completion(acquire)
+        except asyncio.CancelledError:
+            # Acquiring/adopting a lease can itself outlive a cancelled await.
+            if scope is not None:
+                await run_to_completion(scope.close)
+            raise
 
     def get_dag_stats(self) -> Optional["DagStats"]:
         return SemanticDagExecutor.get_active_stats()
@@ -549,6 +751,7 @@ class SemanticProcessor(DequeueHandlerBase):
             if not entry.get("isDir", False):
                 item_uri = VikingURI(dir_uri).join(name).uri
                 file_paths.append(item_uri)
+        file_paths.sort()
 
         if not file_paths:
             logger.info(f"No memory files found in {dir_uri}")
@@ -559,7 +762,7 @@ class SemanticProcessor(DequeueHandlerBase):
             try:
                 old_overview = await viking_fs.read_file(f"{dir_uri}/.overview.md", ctx=ctx)
                 if old_overview:
-                    existing_summaries = self._parse_overview_md(old_overview)
+                    existing_summaries = self._parse_overview_md(body_for_preview(old_overview))
                     logger.info(
                         f"Parsed {len(existing_summaries)} existing summaries from overview.md"
                     )
@@ -651,8 +854,18 @@ class SemanticProcessor(DequeueHandlerBase):
                 await asyncio.gather(*[_gen(i, fp) for i, fp in batch])
 
         completed_summaries = [s for s in file_summaries if s is not None]
+        sample_limit = getattr(
+            get_openviking_config().semantic,
+            "overview_sample_limit",
+            32,
+        )
+        sampled_summaries = deterministic_sample(completed_summaries, sample_limit)
         generated_content = await self._generate_overview(
-            dir_uri, completed_summaries, [], llm_sem=llm_sem
+            dir_uri,
+            sampled_summaries,
+            [],
+            llm_sem=llm_sem,
+            total_files=len(file_paths),
         )
         overview, abstract = self._normalize_overview_generation(generated_content)
 
@@ -665,15 +878,25 @@ class SemanticProcessor(DequeueHandlerBase):
                 abstract=abstract,
                 ctx=ctx,
                 lock=lock,
+                total_entries=len(file_paths),
+                sampled_entries=len(sampled_summaries),
             )
+        except LockAcquisitionError:
+            raise
         except Exception as e:
             raise RuntimeError(f"Failed to write abstract/overview for {dir_uri}: {e}") from e
-        if not wrote_semantics:
+        if not wrote_semantics.wrote:
             return
         logger.info(f"Generated abstract.md and overview.md for {dir_uri}")
 
         if msg.skip_vectorization:
             logger.info(f"Skipping vectorization for {dir_uri} (requested via SemanticMsg)")
+            return
+        if not (wrote_semantics.overview_body_changed or wrote_semantics.abstract_body_changed):
+            logger.info(
+                "Skipping directory vectorization for %s (visible semantics unchanged)",
+                dir_uri,
+            )
             return
         await self._vectorize_directory(
             uri=dir_uri,
@@ -694,14 +917,24 @@ class SemanticProcessor(DequeueHandlerBase):
         abstract: str,
         ctx: Optional[RequestContext],
         lock: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        return await write_semantic_sidecars(
+        total_entries: int = 0,
+        sampled_entries: int = 0,
+    ) -> AbstractOverviewWriteResult:
+        return await write_abstract_overview(
             viking_fs=viking_fs,
             dir_uri=dir_uri,
             overview=overview,
             abstract=abstract,
             ctx=ctx,
             is_stale=lambda: is_semantic_msg_stale(msg),
+            metadata={
+                **({"source": msg.source} if msg.source else {}),
+                "generated_by": {
+                    "component": "SemanticProcessor",
+                    "trigger": msg.generation_trigger,
+                },
+                "freshness": freshness_metadata(total_entries, sampled_entries),
+            },
             lock=lock,
             log_prefix="[MemorySemantic]",
         )
@@ -809,7 +1042,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     else f"{target_prefix}/{mapping_name}"
                 )
                 try:
-                    await viking_fs.stat(target_mapping, ctx=ctx)
+                    await viking_fs.stat(target_mapping, ctx=ctx, skip_count=True)
                     continue  # already carried over
                 except Exception:
                     pass
@@ -950,14 +1183,36 @@ class SemanticProcessor(DequeueHandlerBase):
         else:
             return await self._generate_text_summary(file_path, file_name, llm_sem, ctx=ctx)
 
-    def _replace_index_references(
-        self, generated_content: str, file_index_map: Dict[int, str]
+    def _child_summary_line(
+        self,
+        dir_uri: str,
+        idx: int,
+        item: Dict[str, str],
+        link_map: Dict[str, str],
     ) -> str:
-        def replace_index(match):
-            idx = int(match.group(1))
-            return file_index_map.get(idx, match.group(0))
+        """Render a subdirectory summary line with a collision-free link placeholder."""
+        placeholder = f"viking://input_sample_c{idx}"
+        link_map[placeholder] = self._markdown_link_target(dir_uri, item["name"])
+        return f"- {item['name']}/ (link: {placeholder}): {item['abstract']}"
 
-        return re.sub(r"\[(\d+)\]", replace_index, generated_content)
+    @staticmethod
+    def _markdown_link_target(dir_uri: str, entry_name: str) -> str:
+        """Build a Markdown-safe target without changing the stored Viking URI."""
+        entry_uri = VikingURI(dir_uri).join(entry_name).uri
+        return quote(entry_uri, safe=":/")
+
+    def _replace_link_references(self, generated_content: str, link_map: Dict[str, str]) -> str:
+        """Resolve link placeholders (viking://input_sample_fN / cN) to real URIs.
+
+        The model is fed compact, collision-free placeholders and asked to emit
+        Markdown links against them; here we map each placeholder back to the
+        entry's real URI. Unknown placeholders are left untouched.
+        """
+
+        def replace_link(match):
+            return link_map.get(match.group(0), match.group(0))
+
+        return re.sub(r"viking://input_sample_[fc]\d+", replace_link, generated_content)
 
     def _truncate_generated_text(self, text: str, max_chars: int) -> str:
         if max_chars <= 0 or len(text) <= max_chars:
@@ -991,6 +1246,7 @@ class SemanticProcessor(DequeueHandlerBase):
 
     def _extract_abstract_from_overview(self, overview_content: str) -> str:
         """Extract an abstract from the Markdown overview brief description."""
+        overview_content = body_for_preview(overview_content)
         lines = overview_content.split("\n")
 
         # Skip header lines (starting with #)
@@ -998,6 +1254,8 @@ class SemanticProcessor(DequeueHandlerBase):
         in_header = True
 
         for line in lines:
+            if line.strip() == "---":
+                continue
             if in_header and line.startswith("#"):
                 continue
             elif in_header and line.strip():
@@ -1014,8 +1272,8 @@ class SemanticProcessor(DequeueHandlerBase):
 
     def _normalize_overview_generation(self, generated_content: str) -> Tuple[str, str]:
         """Convert raw Markdown overview output into final L1 overview and L0 abstract."""
-        overview = generated_content
-        abstract = self._extract_abstract_from_overview(generated_content)
+        overview = body_for_preview(generated_content)
+        abstract = self._extract_abstract_from_overview(overview)
         return self._enforce_size_limits(overview, abstract)
 
     def _enforce_size_limits(self, overview: str, abstract: str) -> Tuple[str, str]:
@@ -1040,6 +1298,7 @@ class SemanticProcessor(DequeueHandlerBase):
 
         summaries: Dict[str, str] = {}
 
+        overview_content = body_for_preview(overview_content)
         if not overview_content or not overview_content.strip():
             return summaries
 
@@ -1053,7 +1312,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 if current_file and current_summary_lines:
                     summaries[current_file] = " ".join(current_summary_lines).strip()
 
-                file_name = header_match.group(1).strip()
+                file_name = self._overview_heading_cache_key(header_match.group(1).strip())
                 parts = file_name.split()
                 if len(parts) >= 2 and parts[0] == parts[1]:
                     file_name = parts[0]
@@ -1080,12 +1339,29 @@ class SemanticProcessor(DequeueHandlerBase):
 
         return summaries
 
+    @staticmethod
+    def _overview_heading_cache_key(heading: str) -> str:
+        """Return the entry name represented by a plain or linked H3 heading."""
+        if heading.startswith("[") and heading.endswith(")"):
+            destination_start = heading.rfind("](")
+            if destination_start > 0:
+                target = heading[destination_start + 2 : -1].strip()
+                if target.startswith("<") and target.endswith(">"):
+                    target = target[1:-1].strip()
+                if target.startswith("viking://"):
+                    path = unquote(urlsplit(target).path).rstrip("/")
+                    if path:
+                        return path.rsplit("/", 1)[-1]
+        return heading
+
     async def _generate_overview(
         self,
         dir_uri: str,
         file_summaries: List[Dict[str, str]],
         children_abstracts: List[Dict[str, str]],
         llm_sem: Optional[asyncio.Semaphore] = None,
+        total_files: Optional[int] = None,
+        total_children: Optional[int] = None,
     ) -> str:
         """Generate raw directory overview model output.
 
@@ -1096,8 +1372,13 @@ class SemanticProcessor(DequeueHandlerBase):
 
         Args:
             dir_uri: Directory URI
-            file_summaries: File summary list
-            children_abstracts: Subdirectory summary list
+            file_summaries: File summary list (only entries participating in
+                this aggregation, i.e. already sampled when applicable)
+            children_abstracts: Subdirectory summary list (sampled when applicable)
+            total_files: Total direct files in the directory (may exceed
+                ``len(file_summaries)`` when the directory was sampled)
+            total_children: Total direct subdirectories (may exceed
+                ``len(children_abstracts)`` when sampled)
 
         Returns:
             Markdown overview content generated by the model.
@@ -1113,17 +1394,48 @@ class SemanticProcessor(DequeueHandlerBase):
 
         from openviking.session.memory.utils.language import resolve_output_language
 
-        # Build file index mapping and summary string
-        file_index_map = {}
+        # Build coverage statement so the model knows the directory scale
+        # and whether the provided summaries represent all entries or a sample.
+        total_files = len(file_summaries) if total_files is None else total_files
+        total_children = len(children_abstracts) if total_children is None else total_children
+        total_direct = total_files + total_children
+        provided = len(file_summaries) + len(children_abstracts)
+        if total_direct <= provided:
+            directory_coverage = (
+                f"Total direct entries: {total_direct}. "
+                "All direct entries are represented in the summaries below."
+            )
+        else:
+            directory_coverage = (
+                f"Total direct entries: {total_direct} "
+                f"({total_files} files, {total_children} subdirectories).\n"
+                f"Summaries provided for this aggregation: {provided}.\n"
+                f"Direct entries not individually shown: {total_direct - provided}.\n"
+                "Coverage: sampled. The summaries below are representative "
+                "entries; generalize cautiously and do not treat them as exhaustive."
+            )
+
+        # Build link placeholder mapping and summary string.
+        # The model is fed collision-free placeholders (viking://input_sample_fN)
+        # and asked to emit Markdown links; placeholders are resolved to real
+        # URIs in post-processing. This avoids the fragility of bare [N] indices
+        # and of asking the model to reproduce long/CJK URIs verbatim.
+        link_map: Dict[str, str] = {}
         file_summaries_lines = []
         for idx, item in enumerate(file_summaries, 1):
-            file_index_map[idx] = item["name"]
-            file_summaries_lines.append(f"[{idx}] {item['name']}: {item['summary']}")
+            placeholder = f"viking://input_sample_f{idx}"
+            link_map[placeholder] = self._markdown_link_target(dir_uri, item["name"])
+            file_summaries_lines.append(
+                f"- {item['name']} (link: {placeholder}): {item['summary']}"
+            )
         file_summaries_str = "\n".join(file_summaries_lines) if file_summaries_lines else "None"
 
         # Build subdirectory summary string
         children_abstracts_str = (
-            "\n".join(f"- {item['name']}/: {item['abstract']}" for item in children_abstracts)
+            "\n".join(
+                self._child_summary_line(dir_uri, idx, item, link_map)
+                for idx, item in enumerate(children_abstracts, 1)
+            )
             if children_abstracts
             else "None"
         )
@@ -1155,9 +1467,10 @@ class SemanticProcessor(DequeueHandlerBase):
                 dir_uri,
                 file_summaries,
                 children_abstracts,
-                file_index_map,
+                link_map,
                 llm_sem=llm_sem,
                 output_language=output_language,
+                directory_coverage=directory_coverage,
             )
         elif over_budget:
             # Few files but long summaries → truncate summaries to fit budget
@@ -1172,22 +1485,26 @@ class SemanticProcessor(DequeueHandlerBase):
             truncated_lines = []
             for idx, item in enumerate(file_summaries, 1):
                 summary = item["summary"][:per_file]
-                truncated_lines.append(f"[{idx}] {item['name']}: {summary}")
+                truncated_lines.append(
+                    f"- {item['name']} (link: viking://input_sample_f{idx}): {summary}"
+                )
             file_summaries_str = "\n".join(truncated_lines)
             overview = await self._single_generate_overview(
                 dir_uri,
                 file_summaries_str,
                 children_abstracts_str,
-                file_index_map,
+                link_map,
                 output_language=output_language,
+                directory_coverage=directory_coverage,
             )
         else:
             overview = await self._single_generate_overview(
                 dir_uri,
                 file_summaries_str,
                 children_abstracts_str,
-                file_index_map,
+                link_map,
                 output_language=output_language,
+                directory_coverage=directory_coverage,
             )
 
         return overview
@@ -1197,8 +1514,9 @@ class SemanticProcessor(DequeueHandlerBase):
         dir_uri: str,
         file_summaries_str: str,
         children_abstracts_str: str,
-        file_index_map: Dict[int, str],
+        link_map: Dict[str, str],
         output_language: str = "en",
+        directory_coverage: str = "",
     ) -> str:
         """Generate overview from a single prompt (small directories)."""
         config = get_openviking_config()
@@ -1212,13 +1530,14 @@ class SemanticProcessor(DequeueHandlerBase):
                     "file_summaries": file_summaries_str,
                     "children_abstracts": children_abstracts_str,
                     "output_language": output_language,
+                    "directory_coverage": directory_coverage,
                 },
             )
 
             with bind_telemetry_stage("resource_summarize"):
                 overview = await vlm.get_completion_async(prompt)
 
-            overview = self._replace_index_references(overview, file_index_map)
+            overview = self._replace_link_references(overview, link_map)
 
             return overview.strip()
 
@@ -1234,9 +1553,10 @@ class SemanticProcessor(DequeueHandlerBase):
         dir_uri: str,
         file_summaries: List[Dict[str, str]],
         children_abstracts: List[Dict[str, str]],
-        file_index_map: Dict[int, str],
+        link_map: Dict[str, str],
         llm_sem: Optional[asyncio.Semaphore] = None,
         output_language: str = "en",
+        directory_coverage: str = "",
     ) -> str:
         """Generate overview by batching file and subdirectory summaries.
 
@@ -1250,28 +1570,33 @@ class SemanticProcessor(DequeueHandlerBase):
         dir_name = dir_uri.split("/")[-1]
 
         work_items = [("file", index, item) for index, item in enumerate(file_summaries, 1)] + [
-            ("child", None, item) for item in children_abstracts
+            ("child", index, item) for index, item in enumerate(children_abstracts, 1)
         ]
         batches = [work_items[i : i + batch_size] for i in range(0, len(work_items), batch_size)]
         logger.info(f"Generating overview for {dir_uri} in {len(batches)} batches")
 
-        # Generate partial overviews concurrently using global file indices.
+        # Generate partial overviews concurrently using global link placeholders.
         if llm_sem is None:
             llm_sem = asyncio.Semaphore(self.max_concurrent_llm)
         partial_overviews = [None] * len(batches)
-        batch_prompts: List[Tuple[int, str, Dict[int, str]]] = []
+        batch_prompts: List[Tuple[int, str, Dict[str, str]]] = []
 
         for batch_idx, batch in enumerate(batches):
             batch_lines = []
             child_lines = []
-            batch_index_map = {}
+            batch_link_map: Dict[str, str] = {}
             for entry_kind, global_idx, item in batch:
+                assert global_idx is not None
                 if entry_kind == "file":
-                    assert global_idx is not None
-                    batch_index_map[global_idx] = item["name"]
-                    batch_lines.append(f"[{global_idx}] {item['name']}: {item['summary']}")
+                    placeholder = f"viking://input_sample_f{global_idx}"
+                    batch_link_map[placeholder] = link_map.get(
+                        placeholder, self._markdown_link_target(dir_uri, item["name"])
+                    )
+                    batch_lines.append(f"- {item['name']} (link: {placeholder}): {item['summary']}")
                 else:
-                    child_lines.append(f"- {item['name']}/: {item['abstract']}")
+                    child_lines.append(
+                        self._child_summary_line(dir_uri, global_idx, item, batch_link_map)
+                    )
 
             prompt = render_prompt(
                 "semantic.overview_generation",
@@ -1280,16 +1605,17 @@ class SemanticProcessor(DequeueHandlerBase):
                     "file_summaries": "\n".join(batch_lines) or "None",
                     "children_abstracts": "\n".join(child_lines) or "None",
                     "output_language": output_language,
+                    "directory_coverage": directory_coverage,
                 },
             )
-            batch_prompts.append((batch_idx, prompt, batch_index_map))
+            batch_prompts.append((batch_idx, prompt, batch_link_map))
 
-        async def _run_batch(batch_idx: int, prompt: str, batch_index_map: Dict[int, str]) -> None:
+        async def _run_batch(batch_idx: int, prompt: str, batch_link_map: Dict[str, str]) -> None:
             try:
                 async with llm_sem:
                     with bind_telemetry_stage("resource_summarize"):
                         partial = await vlm.get_completion_async(prompt)
-                partial = self._replace_index_references(partial, batch_index_map)
+                partial = self._replace_link_references(partial, batch_link_map)
                 partial_overviews[batch_idx] = partial.strip()
             except Exception as e:
                 logger.warning(
@@ -1308,6 +1634,9 @@ class SemanticProcessor(DequeueHandlerBase):
             return partial_overviews[0]
 
         # Merge partials only; each child abstract is already represented once.
+        # Partials already contain real URIs, but the shared generation prompt can
+        # make the merge model emit placeholders again. Resolve the merged output
+        # with the complete map before persisting it.
         combined = "\n\n---\n\n".join(partial_overviews)
         try:
             prompt = render_prompt(
@@ -1317,11 +1646,12 @@ class SemanticProcessor(DequeueHandlerBase):
                     "file_summaries": combined,
                     "children_abstracts": "None",
                     "output_language": output_language,
+                    "directory_coverage": directory_coverage,
                 },
             )
             with bind_telemetry_stage("resource_summarize"):
                 overview = await vlm.get_completion_async(prompt)
-            overview = self._replace_index_references(overview, file_index_map)
+            overview = self._replace_link_references(overview, link_map)
             return overview.strip()
         except Exception as e:
             logger.error(
@@ -1329,6 +1659,52 @@ class SemanticProcessor(DequeueHandlerBase):
                 exc_info=True,
             )
             return partial_overviews[0]
+
+    async def _skill_root_semantics(
+        self,
+        uri: str,
+        *,
+        ctx: RequestContext,
+        regenerate: bool = False,
+        lock: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, str]:
+        """Keep the package root tied only to its SKILL.md definition."""
+        viking_fs = get_viking_fs()
+        if (
+            not regenerate
+            and await viking_fs.exists(f"{uri}/.abstract.md", ctx=ctx)
+            and await viking_fs.exists(f"{uri}/.overview.md", ctx=ctx)
+        ):
+            abstract = body_for_preview(await viking_fs.read_file(f"{uri}/.abstract.md", ctx=ctx))
+            overview = body_for_preview(await viking_fs.read_file(f"{uri}/.overview.md", ctx=ctx))
+            if abstract and overview:
+                return overview, abstract
+
+        from openviking.core.skill_loader import SkillLoader
+        from openviking.utils.skill_processor import SkillProcessor
+
+        content = await viking_fs.read_file(f"{uri}/SKILL.md", ctx=ctx)
+        if isinstance(content, bytes):
+            content = content.decode("utf-8")
+        definition = SkillLoader.parse(content)
+        processor = SkillProcessor(vikingdb=None)
+        abstract = processor._build_skill_abstract(definition)
+        overview = await processor._generate_overview(definition, get_openviking_config())
+        await run_to_completion(
+            lambda: write_abstract_overview(
+                viking_fs=viking_fs,
+                dir_uri=uri,
+                abstract=abstract,
+                overview=overview,
+                ctx=ctx,
+                lock=lock,
+                is_stale=lambda: False,
+                metadata={
+                    "generated_by": {"component": "SkillProcessor", "trigger": "skill_refresh"}
+                },
+            )
+        )
+        return overview, abstract
 
     async def _vectorize_directory(
         self,
@@ -1338,12 +1714,25 @@ class SemanticProcessor(DequeueHandlerBase):
         overview: str,
         ctx: Optional[RequestContext] = None,
         ingest_options: IngestOptions | None = None,
+        creator_acl_grant: CreatorAclGrant | None = None,
+        skill_source_path: str = "",
     ) -> None:
         """Create directory Context and enqueue to EmbeddingQueue."""
 
         from openviking.utils.embedding_utils import vectorize_directory_meta
 
         active_ctx = ctx or self._default_ctx
+        skill_meta = None
+        if context_type == "skill" and classify_uri(uri).is_skill_root:
+            import yaml
+
+            parsed = yaml.safe_load(body_for_preview(abstract))
+            if isinstance(parsed, dict):
+                skill_meta = {
+                    key: parsed.get(key, [] if key in {"tags", "allowed_tools"} else "")
+                    for key in ("name", "description", "tags", "allowed_tools")
+                }
+                skill_meta["source_path"] = skill_source_path
         await vectorize_directory_meta(
             uri=uri,
             abstract=abstract,
@@ -1351,7 +1740,25 @@ class SemanticProcessor(DequeueHandlerBase):
             context_type=context_type,
             ctx=active_ctx,
             ingest_options=ingest_options,
+            creator_acl_grant=creator_acl_grant,
+            content_is_body=context_type == "skill",
+            **({"meta": skill_meta} if skill_meta is not None else {}),
         )
+
+    async def _load_transfer_file_summaries(
+        self,
+        file_paths: List[str],
+        ctx: Optional[RequestContext] = None,
+    ) -> Dict[str, str]:
+        """Load copied/moved file summaries from their existing target L2 vectors."""
+        if not file_paths:
+            return {}
+        viking_fs = get_viking_fs()
+        vector_store = viking_fs._get_vector_store()
+        if vector_store is None:
+            return {}
+        active_ctx = ctx or self._default_ctx
+        return await vector_store.get_l2_abstracts_by_uris(file_paths, ctx=active_ctx)
 
     async def _vectorize_single_file(
         self,
@@ -1363,12 +1770,13 @@ class SemanticProcessor(DequeueHandlerBase):
         use_summary: bool = False,
         preserve_existing_created_at: bool = False,
         ingest_options: IngestOptions | None = None,
-    ) -> None:
+        creator_acl_grant: CreatorAclGrant | None = None,
+    ) -> bool:
         """Vectorize a single file using its content or summary."""
         from openviking.utils.embedding_utils import vectorize_file
 
         active_ctx = ctx or self._default_ctx
-        await vectorize_file(
+        return await vectorize_file(
             file_path=file_path,
             summary_dict=summary_dict,
             parent_uri=parent_uri,
@@ -1377,4 +1785,5 @@ class SemanticProcessor(DequeueHandlerBase):
             use_summary=use_summary,
             preserve_existing_created_at=preserve_existing_created_at,
             ingest_options=ingest_options,
+            creator_acl_grant=creator_acl_grant,
         )

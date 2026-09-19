@@ -1,33 +1,38 @@
-## Install the TRAE Integration
+## Step 1: Install
 
-Requires macOS/Linux and Node.js 18+. Run the command for your client; Hooks and MCP are configured together:
+1. Run the command that matches your TRAE version:
 
-```bash
-# TRAE
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) --harness trae --dist tos
+   **Trae International**
 
-# TRAE CN
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) --harness trae-cn --dist tos
+   ```bash
+   bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) --harness trae --dist tos
+   ```
 
-# Both
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) --harness trae,trae-cn --dist tos
-```
+   **Trae China**
 
-When asked where to connect, select **Volcengine OpenViking Cloud** and enter your API key. Choose **Self-hosted / local** only for a locally running OpenViking server.
+   ```bash
+   bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) --harness trae-cn --dist tos
+   ```
 
-## Verify
+2. The installer will ask for language (English / Chinese) and OpenViking credentials. In the OpenViking credential step, choose **VolcEngine OpenViking Cloud Service [api.vikingdb.cn-beijing.volces.com]** and enter the API KEY:
 
-1. Restart TRAE after installation.
-2. Confirm that `openviking` is connected in TRAE settings.
-3. Start a new session and ask about a previous project or preference.
-4. Share a temporary preference and ask for it in the next session to verify capture and commit.
+   ```text
+   {{OPENVIKING_API_KEY}}
+   ```
 
-See the complete [TRAE integration guide](https://docs.openviking.ai/en/agent-integrations/13-trae).
+## Step 2: Verify
 
-## Troubleshooting
+Open **Settings → MCP → Configured MCP Servers** and confirm that the `openviking` entry is visible.
 
-| Problem | Suggested fix |
+## Troubleshoot
+
+| Problem | Fix |
 |---|---|
-| Automatic recall does not run after installation | Quit TRAE completely, restart it, and create a new Agent session. |
-| A new session cannot recall the previous turn | Check `~/.openviking/logs/trae-hooks.log` or `trae-cn-hooks.log` and confirm that Stop committed successfully. |
-| Connection/authentication fails | Check `~/.openviking/ovcli.conf` and restart TRAE. |
+| No auto recall | Quit TRAE completely, restart, new Agent session |
+| Connection / auth fails | Check `~/.openviking/ovcli.conf` and restart TRAE |
+| Need logs | `~/.openviking/logs/trae-hooks.log` or `trae-cn-hooks.log` |
+
+## Reference
+
+- Docs on Manual Settings: [TRAE](https://docs.openviking.net/en/agent-integrations/13-trae)
+- Code: [examples/agent-hook-plugin](https://github.com/volcengine/OpenViking/tree/main/examples/agent-hook-plugin)

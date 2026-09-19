@@ -18,6 +18,7 @@ from openviking.storage.vectordb.collection.volcengine_clients import (
     ClientForConsoleApi,
     ClientForDataApi,
 )
+from openviking.utils.search_filters import VALID_TIME_FIELDS
 from openviking_cli.utils.logger import default_logger as logger
 
 
@@ -255,17 +256,42 @@ class VolcengineCollection(ICollection):
                 sanitized_list.append(y)
         return sanitized_list
 
-    def _data_post(self, path: str, data: Dict[str, Any]):
+    @classmethod
+    def _normalize_date_time_filter(cls, obj: Any) -> Any:
+        """Rewrite ``range`` nodes on date_time fields to VikingDB ``time_range``.
+
+        OpenViking compiles ``TimeRange`` down to the internal ``range`` DSL, but the
+        commercial data-plane expects ``time_range`` for date_time fields and ``range``
+        only for numeric fields. Numeric ``range`` nodes are left untouched.
+        """
+        if isinstance(obj, list):
+            return [cls._normalize_date_time_filter(item) for item in obj]
+        if not isinstance(obj, dict):
+            return obj
+
+        normalized = {key: cls._normalize_date_time_filter(value) for key, value in obj.items()}
+        if normalized.get("op") == "range" and normalized.get("field") in VALID_TIME_FIELDS:
+            normalized["op"] = "time_range"
+        return normalized
+
+    def _data_post(self, path: str, data: Dict[str, Any], *, raise_for_status: bool = False):
         # Centralized sanitization at the request exit, covering all data API inputs
         safe_data = self._sanitize_payload(data)
+        if isinstance(safe_data, dict) and "filter" in safe_data:
+            safe_data["filter"] = self._normalize_date_time_filter(safe_data["filter"])
         response = self.data_client.do_req("POST", path, req_body=safe_data)
         if response.status_code != 200:
-            logger.error(f"Request to {path} failed: {response.text}")
+            error = self._build_response_error(response, path)
+            logger.error(str(error))
+            if raise_for_status:
+                raise error
             return {}
         try:
             result = response.json()
             return result.get("result", {})
         except json.JSONDecodeError:
+            if raise_for_status:
+                raise ConnectionError(f"Request to {path} failed: invalid JSON response")
             return {}
 
     def _data_get(self, path: str, params: Dict[str, Any]):
@@ -342,7 +368,7 @@ class VolcengineCollection(ICollection):
     def update_index(
         self,
         index_name: str,
-        scalar_index: Optional[Dict[str, Any]] = None,
+        scalar_index: Optional[List[str]] = None,
         description: Optional[str] = None,
     ):
         data = {
@@ -540,6 +566,7 @@ class VolcengineCollection(ICollection):
         offset: int = 0,
         filters: Optional[Dict[str, Any]] = None,
         output_fields: Optional[List[str]] = None,
+        advance: Optional[Dict[str, Any]] = None,
     ) -> SearchResult:
         path = "/api/vikingdb/data/search/random"
         data = {
@@ -552,7 +579,9 @@ class VolcengineCollection(ICollection):
             "offset": offset,
             "ignore_unknown_fields": True,
         }
-        resp_data = self._data_post(path, data)
+        if advance is not None:
+            data["advance"] = advance
+        resp_data = self._data_post(path, data, raise_for_status=True)
         return self._parse_search_result(resp_data)
 
     def search_by_keywords(

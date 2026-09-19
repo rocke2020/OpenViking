@@ -6,11 +6,14 @@
 import asyncio
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
+from openviking.core.context import ContextLevel
 from openviking.retrieve.hierarchical_retriever import HierarchicalRetriever, RetrieverMode
 from openviking.server.identity import RequestContext, Role
+from openviking.storage.abstract_overview import render_abstract_overview
 from openviking.utils.token_estimation import estimate_text_tokens
 from openviking_cli.retrieve.types import ContextType, TypedQuery
 from openviking_cli.session.user_id import UserIdentifier
@@ -49,8 +52,12 @@ class DummyEmbedder:
 class DummyStorage:
     def __init__(self) -> None:
         self.collection_name = "context"
+        self.acl_manager = None
         self.search_calls = []
         self.child_search_calls = []
+
+    def _acl_enabled(self, ctx: RequestContext) -> bool:
+        return self.acl_manager is not None and self.acl_manager.is_enabled(ctx.account_id)
 
     async def collection_exists_bound(self) -> bool:
         return True
@@ -363,8 +370,18 @@ async def test_retrieve_falls_back_to_vector_scores_when_rerank_returns_none(mon
         lambda config: fake_client,
     )
 
+    storage = QuickSearchStorage([
+        _result("viking://resources/a/deep-a.md", 0.2, abstract="deep A"),
+        _result("viking://resources/b/deep-b.md", 0.8, abstract="deep B"),
+    ])
+    storage.acl_manager = SimpleNamespace(is_enabled=lambda _account_id: True)
+
+    async def no_hierarchical_children(*_args, **_kwargs):
+        return []
+
+    storage.search_children_in_tenant = no_hierarchical_children
     retriever = HierarchicalRetriever(
-        storage=DummyStorage(),
+        storage=storage,
         embedder=DummyEmbedder(),
         rerank_config=_config(),
     )
@@ -372,9 +389,10 @@ async def test_retrieve_falls_back_to_vector_scores_when_rerank_returns_none(mon
     result = await retriever.retrieve(_query(), ctx=_ctx(), limit=2, mode=RetrieverMode.THINKING)
 
     assert [ctx.uri for ctx in result.matched_contexts] == [
-        "viking://resources/file-b",
-        "viking://resources/file-a",
+        "viking://resources/b/deep-b.md",
+        "viking://resources/a/deep-a.md",
     ]
+    assert [call["level"] for call in storage.search_calls] == [[0, 1], [2]]
     assert fake_client.calls
 
 
@@ -624,22 +642,6 @@ async def test_retrieval_hotness_alpha_blends_when_configured(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_convert_to_matched_contexts_returns_empty_relations():
-    retriever = HierarchicalRetriever(
-        storage=DummyStorage(),
-        embedder=None,
-        rerank_config=None,
-    )
-
-    result = await retriever._convert_to_matched_contexts(
-        [_result("viking://resources/file-a", 1.0, abstract="child A")],
-        ctx=_ctx(),
-    )
-
-    assert result[0].relations == []
-
-
-@pytest.mark.asyncio
 async def test_convert_to_matched_contexts_propagates_search_tags():
     retriever = HierarchicalRetriever(
         storage=DummyStorage(),
@@ -653,7 +655,7 @@ async def test_convert_to_matched_contexts_propagates_search_tags():
                 "viking://resources/file-a",
                 1.0,
                 abstract="child A",
-                search_tags=["team=infra", "project=viking"],
+                search_tags=["default", "team=infra", "bad=", "project=viking"],
             )
         ],
         ctx=_ctx(),
@@ -663,16 +665,52 @@ async def test_convert_to_matched_contexts_propagates_search_tags():
 
 
 @pytest.mark.asyncio
-async def test_convert_to_matched_contexts_defaults_empty_search_tags():
+async def test_convert_to_matched_contexts_defaults_tags_and_body_previews():
     retriever = HierarchicalRetriever(
         storage=DummyStorage(),
         embedder=None,
         rerank_config=None,
     )
+    uri = "viking://resources/demo"
+    metadata = {
+        "source": {"kind": "http", "uri": "https://example.com/private.pdf"},
+        "generated_by": {"component": "SemanticProcessor", "trigger": "ingest"},
+    }
+    markdown = "---\ntitle: User document\n---\n\nVisible body."
 
     result = await retriever._convert_to_matched_contexts(
-        [_result("viking://resources/file-a", 1.0, abstract="child A")],
+        [
+            _result(
+                uri,
+                1.0,
+                level=int(ContextLevel.ABSTRACT),
+                abstract=render_abstract_overview(
+                    ContextLevel.ABSTRACT, uri, "Visible abstract.", metadata
+                ),
+            ),
+            _result(
+                uri,
+                0.9,
+                level=int(ContextLevel.OVERVIEW),
+                abstract=render_abstract_overview(
+                    ContextLevel.OVERVIEW, uri, "# Visible overview", metadata
+                ),
+            ),
+            _result("viking://resources/demo.md", 0.8, level=2, abstract=markdown),
+            _result(
+                "viking://resources/malformed",
+                0.7,
+                level=int(ContextLevel.ABSTRACT),
+                abstract="---\n",
+            ),
+        ],
         ctx=_ctx(),
     )
 
-    assert result[0].search_tags == []
+    assert [item.search_tags for item in result] == [[], [], [], []]
+    assert [item.abstract for item in result] == [
+        "Visible abstract.",
+        "# Visible overview",
+        markdown,
+        "",
+    ]

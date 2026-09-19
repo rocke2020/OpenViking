@@ -11,7 +11,7 @@
 //! | Any segment equals `.path.ovlock` OR starts with `.path.ovlock` | Runtime lock |
 //! | File extension is `.faiss` or `.index`, OR path contains an `embedding_cache/` segment | Vector index — derived data |
 //!
-//! L0/L1 derived files (`.abstract.md`, `.overview.md`, `.relations.json`)
+//! L0/L1 derived files (`.abstract.md`, `.overview.md`)
 //! are intentionally KEPT — design §4.2 says they belong in snapshots.
 
 use crate::core::internal_names::{is_hidden_runtime_lock_name, PATH_LOCK_FILE};
@@ -106,7 +106,9 @@ pub async fn collect_under(
     };
     let account_prefix = format!("/local/{}/", account);
 
-    let entries = vfs.tree_directory(&root, true, None, None).await?;
+    let entries = vfs
+        .tree_directory(&root, true, None, None, None, None, None)
+        .await?;
 
     let mut survivors = Vec::new();
     for entry in entries {
@@ -193,7 +195,14 @@ mod tests {
         ) -> Result<u64> {
             unimplemented!()
         }
-        async fn read_dir(&self, _path: &str) -> Result<Vec<FileInfo>> {
+        async fn read_dir(
+            &self,
+            _path: &str,
+            _offset: Option<usize>,
+            _limit: Option<usize>,
+            _sort_by: Option<crate::core::ListSortBy>,
+            _sort_order: Option<crate::core::SortOrder>,
+        ) -> Result<Vec<FileInfo>> {
             unimplemented!()
         }
         async fn stat(&self, _path: &str) -> Result<FileInfo> {
@@ -214,6 +223,9 @@ mod tests {
             _show_hidden: bool,
             _node_limit: Option<usize>,
             _level_limit: Option<usize>,
+            _offset: Option<usize>,
+            _sort_by: Option<crate::core::ListSortBy>,
+            _sort_order: Option<crate::core::SortOrder>,
         ) -> Result<Vec<TreeEntry>> {
             let raw = self.entries_by_root.get(path).cloned().unwrap_or_default();
 
@@ -290,7 +302,6 @@ mod tests {
                 ("/local/acct/resources/x.md", false),
                 ("/local/acct/resources/x.md.abstract.md", false),
                 ("/local/acct/resources/x.md.overview.md", false),
-                ("/local/acct/resources/x.md.relations.json", false),
             ],
         );
         let fs: Arc<dyn FileSystem> = Arc::new(mock);
@@ -302,7 +313,6 @@ mod tests {
             "resources/x.md".to_string(),
             "resources/x.md.abstract.md".to_string(),
             "resources/x.md.overview.md".to_string(),
-            "resources/x.md.relations.json".to_string(),
         ];
         expected.sort();
 
@@ -405,7 +415,6 @@ mod tests {
         assert!(!prune_path("agent/skills/b.py"));
         assert!(!prune_path("resources/x.md.abstract.md"));
         assert!(!prune_path("resources/x.md.overview.md"));
-        assert!(!prune_path("resources/x.md.relations.json"));
         // "_systemfoo" is NOT "_system", must survive.
         assert!(!prune_path("_systemfoo/x"));
         // Per "any segment starting with .path.ovlock", ".path.ovlocking"

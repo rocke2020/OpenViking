@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-from typing import Any, Dict
+from typing import Any, Dict, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -18,8 +18,6 @@ class SessionAutoCommitConfig(BaseModel):
     scan_batch_size: int = Field(default=16, gt=0)
     scan_batch_pause_seconds: float = Field(default=0.0, ge=0)
 
-    model_config = {"extra": "forbid"}
-
 
 class MemoryConfig(BaseModel):
     """Memory configuration for OpenViking."""
@@ -31,22 +29,6 @@ class MemoryConfig(BaseModel):
     custom_templates_dir: str = Field(
         default="",
         description="Custom memory templates directory. If set, templates from this directory will be loaded in addition to built-in templates",
-    )
-    v2_lock_retry_interval_seconds: float = Field(
-        default=0.2,
-        ge=0.0,
-        description=(
-            "Retry interval (seconds) when SessionCompressorV2 fails to acquire memory subtree "
-            "locks. Set to 0 for immediate retries."
-        ),
-    )
-    v2_lock_max_retries: int = Field(
-        default=0,
-        ge=0,
-        description=(
-            "Maximum retries for SessionCompressorV2 memory lock acquisition. "
-            "0 means unlimited retries."
-        ),
     )
     experimental_memory_switch: bool = Field(
         default=False,
@@ -72,6 +54,14 @@ class MemoryConfig(BaseModel):
             "When multiple directories are searched, results are merged and top-N are read."
         ),
     )
+    maintenance_review_tokens: int = Field(
+        default=1000,
+        gt=0,
+        description=(
+            "Estimated token count above which a full memory read includes an LLM maintenance "
+            "notice asking it to choose between coherent splitting and single-file compaction."
+        ),
+    )
     extraction_enabled: bool = Field(
         default=True,
         description=(
@@ -79,6 +69,14 @@ class MemoryConfig(BaseModel):
             "to produce long-term memories. When disabled, sessions are archived "
             "but no memory extraction is performed. Useful for read-only or "
             "stateless deployments."
+        ),
+    )
+    extraction_output_format: Literal["json", "python"] = Field(
+        default="python",
+        description=(
+            "Final model-output protocol used by every memory extraction loop. "
+            "'python' uses the restricted internal memory SDK DSL (default); "
+            "'json' preserves the legacy structured JSON protocol."
         ),
     )
     session_skill_extraction_enabled: bool = Field(
@@ -101,8 +99,6 @@ class MemoryConfig(BaseModel):
         default_factory=SessionAutoCommitConfig,
         description="Server-wide controls for automatic session commits.",
     )
-
-    model_config = {"extra": "forbid"}
 
     @model_validator(mode="before")
     @classmethod

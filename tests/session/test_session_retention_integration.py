@@ -751,6 +751,70 @@ async def test_wm_creation_returns_two_products_in_one_model_call(
     assert "secret-source-id" not in calls[0]["prompt"]
 
 
+async def test_wm_creation_passes_configured_output_language_to_prompt(client, monkeypatch):
+    session = client(session_id="wm_output_language_prompt_test")
+    prompts: list[dict] = []
+
+    class FakeVLM:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        async def get_completion_async(self, **kwargs):
+            prompts.append(kwargs)
+            return "# Working Memory"
+
+    vlm = FakeVLM()
+    monkeypatch.setattr(
+        "openviking.session.session.get_openviking_config",
+        lambda: SimpleNamespace(vlm=vlm, output_language_override="zh-CN"),
+    )
+
+    result = await session._generate_archive_summary_async(
+        [_text_message("zh-user", "user", "请总结当前部署状态")]
+    )
+
+    assert result == "# Working Memory"
+    assert len(prompts) == 1
+    assert "zh-CN" in prompts[0]["prompt"]
+
+
+async def test_wm_creation_detects_language_from_multiline_user_message(client, monkeypatch):
+    session = client(session_id="wm_multiline_output_language_detection_test")
+    prompts: list[dict] = []
+
+    class FakeVLM:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        async def get_completion_async(self, **kwargs):
+            prompts.append(kwargs)
+            return "# Working Memory"
+
+    vlm = FakeVLM()
+    monkeypatch.setattr(
+        "openviking.session.session.get_openviking_config",
+        lambda: SimpleNamespace(vlm=vlm),
+    )
+
+    result = await session._generate_archive_summary_async(
+        [
+            _text_message(
+                "multiline-user",
+                "user",
+                "Task details:\n"
+                "当前生产环境已经完成部署。\n"
+                "请用中文总结当前状态和后续风险。",
+            )
+        ]
+    )
+
+    assert result == "# Working Memory"
+    assert len(prompts) == 1
+    assert "zh-CN" in prompts[0]["prompt"]
+
+
 async def test_wm_update_returns_two_products_in_one_model_call(
     client,
     monkeypatch,
@@ -1542,7 +1606,7 @@ async def test_concurrent_stale_workers_append_without_losing_messages(
     ]
 
 
-async def test_phase2_meta_merge_serializes_with_concurrent_append(
+async def test_session_state_lock_serializes_root_meta_without_blocking_archive_write(
     client,
     monkeypatch,
 ):
@@ -1574,6 +1638,12 @@ async def test_phase2_meta_merge_serializes_with_concurrent_append(
     )
     await phase2_inside_save.wait()
 
+    memory_diff_uri = f"{initial._session_uri}/history/archive_001/memory_diff.json"
+    await asyncio.wait_for(
+        phase2._viking_fs.write_file(memory_diff_uri, "{}", ctx=phase2.ctx),
+        timeout=1.0,
+    )
+
     append_task = asyncio.create_task(
         appending.add_message_async("assistant", [TextPart("second")])
     )
@@ -1585,6 +1655,7 @@ async def test_phase2_meta_merge_serializes_with_concurrent_append(
 
     fresh = client(session_id=initial.session_id)
     await fresh.load()
+    assert await fresh._viking_fs.read_file(memory_diff_uri, ctx=fresh.ctx) == "{}"
     assert [message.content for message in fresh.messages] == ["first", "second"]
     assert fresh.meta.message_count == 2
     assert fresh.meta.total_message_count == 2

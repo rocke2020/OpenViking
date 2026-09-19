@@ -30,9 +30,37 @@ under `viking://user/{user_id}/sessions`.
 `temp`, `queue`, and `upload` are internal implementation
 scopes and cannot be addressed directly through public API URI parameters.
 
+### Home Alias `~`
+
+`~` is a server-side alias for the caller's own user root. `viking://~` expands to
+`viking://user/{user_id}`, and `viking://~/memories/note.md` to
+`viking://user/{user_id}/memories/note.md`, where `{user_id}` comes from the request's
+authenticated identity — the same string therefore points at a different directory for
+each caller.
+
+- Universal: accepted by every control plane (REST API, `ov` CLI, SDKs, MCP), anywhere a
+  public-scope URI is accepted.
+- First segment only: `viking://resources/~/x` and `viking://user/alice/~/x` keep `~` as
+  a literal path segment.
+- Accepted, not advertised: `~` is not part of the public scope list, so the
+  `Invalid scope ... Must be one of:` error message never mentions it.
+- Responses always echo the expanded canonical URI, never `viking://~`, and persisted
+  data (vector records, watch keys) stays canonical as well.
+- Requires an authenticated request identity. Expansion uses that identity's effective
+  `user_id` for every request role, including root. Places that demand an already-canonical
+  URI (internal storage paths and background tasks without a request context) reject the
+  alias instead of guessing a user.
+- Replaces the removed uid-less shorthand: `viking://user/<segment>/...` for `memories`,
+  `resources`, `skills`, `peers`, `privacy`, and `sessions` is rejected at USER/ADMIN
+  request boundaries with an error that names the `viking://~/...` replacement.
+
 ## Initial Directory Structure
 
 Moving away from traditional flat database thinking, all context is organized as a filesystem. Agents no longer just find data through vector search, but can locate and browse data through deterministic paths and standard filesystem commands. Each context or directory is assigned a unique URI identifier string in the format viking://{scope}/{path}, allowing the system to precisely locate and access resources stored in different locations.
+
+## File IDs
+
+In addition to its URI, every file is automatically assigned a stable `id` that serves as the primary key of its vector record in VikingDB. The id is deterministically computed as `md5(f"{account_id}:{uri}")` for level 2 (regular file) records, and is returned by `stat()` and other metadata APIs. This allows callers to cross-reference vector index entries without a separate lookup. The id is scoped to the account and changes if the file is moved to a different URI (vector records are re-keyed during URI migration). Directories do not expose a single `id` because a directory may span multiple semantic levels (L0 abstract, L1 overview, L2), each with its own record.
 
 ```
 viking://
@@ -78,25 +106,29 @@ viking://resources/my-project/docs/api.md     # Specific file
 ### User Data
 
 ```
-viking://user/                                # User root
-viking://user/memories/                       # All user memories
-viking://user/memories/preferences/           # User preferences
-viking://user/memories/preferences/coding     # Specific preference
-viking://user/memories/entities/              # Entity memories
-viking://user/memories/events/                # Event memories
-viking://user/resources/                      # Current user's resources
-viking://user/resources/docs/                 # Current user's resource directory
+viking://user/                                # Container of all user spaces (a user key lists only its own)
+viking://~/                                   # Your own user root (expands to viking://user/{user_id}/)
+viking://~/memories/                          # All your memories
+viking://~/memories/preferences/              # Your preferences
+viking://~/memories/preferences/coding        # Specific preference
+viking://~/memories/entities/                 # Entity memories
+viking://~/memories/events/                   # Event memories
+viking://~/resources/                         # Your private resources
+viking://~/resources/docs/                    # Your private resource directory
+viking://user/{user_id}/memories/             # Explicit user path (your own id; other ids need admin/root)
 ```
+
+`viking://resources/...` is the shared scope for the current account and supports per-directory or per-file [ACLs](./15-acl.md). `viking://user/{user}/resources/...` is private; move a resource into the shared scope to share it.
 
 ### User Skills and Peer Content
 
 ```
-viking://user/skills/                         # Current user's skills
-viking://user/skills/search-web               # Specific skill
-viking://user/memories/                       # Current user's memories
-viking://user/memories/cases/                 # Task cases used for training and evaluation
-viking://user/memories/trajectories/          # Reusable task-execution trajectories
-viking://user/memories/experiences/           # Experience distilled from execution outcomes
+viking://~/skills/                            # Your skills
+viking://~/skills/search-web                  # Specific skill
+viking://~/memories/                          # Your memories
+viking://~/memories/cases/                    # Task cases used for training and evaluation
+viking://~/memories/trajectories/             # Reusable task-execution trajectories
+viking://~/memories/experiences/              # Experience distilled from execution outcomes
 viking://user/{user_id}/peers/{peer_id}/memories/
 viking://user/{user_id}/peers/{peer_id}/resources/
 ```
@@ -111,13 +143,21 @@ viking://agent/tools/mcp/                           # MCP tool configuration (pl
 viking://agent/payments/ap2/                        # Payment configuration (planned)
 ```
 
-`viking://agent/...` is a global shared scope, accessible to all users under the account,
-without agent_id isolation. Legacy (0.3.x) data under `viking://agent/...` remains accessible
-via a read-only compatibility entry, but new data should be written according to the new directory semantics.
+`viking://agent/...` is an account-shared directory for capabilities and configuration,
+including skills, endpoints, tools, payments, and other subdirectories. Directory names
+do not identify agents, and `actor_peer_id` does not filter this scope. Sharing is limited
+to the current account. Peer data belongs under `viking://user/<user_id>/peers/<peer_id>/...`.
 
-The short `viking://user/...` form is relative to the current request identity.
-OpenViking expands it internally to explicit namespace paths such as
-`viking://user/{user_id}/...` before storage and retrieval.
+The home alias `viking://~/...` is relative to the current request identity. OpenViking
+expands it internally to the explicit namespace path `viking://user/{user_id}/...` before
+storage and retrieval, and responses echo the expanded form.
+
+The older uid-less spelling — `viking://user/memories/...` and the same shape for
+`resources`, `skills`, `peers`, `privacy`, and `sessions` — is no longer accepted at the
+request boundary. Such requests fail with an error that points at the `viking://~/...`
+replacement. `viking://user` itself is the container of user spaces, not a shortcut to
+your own root: listing it with a user key shows only your own space.
+
 Identity path segments such as `{user_id}` and `{peer_id}` must be safe single
 segments, for example `alice` or `web-visitor-alice`.
 
@@ -128,7 +168,7 @@ viking://user/{user_id}/sessions/{session_id}/          # Session root
 viking://user/{user_id}/sessions/{session_id}/messages  # Session messages
 viking://user/{user_id}/sessions/{session_id}/tools     # Tool executions
 viking://user/{user_id}/sessions/{session_id}/history   # Archived history
-viking://user/sessions/{session_id}/                    # Current-user short form
+viking://~/sessions/{session_id}/                       # Your own session, via the home alias
 ```
 
 `viking://session/{session_id}` is accepted as a backward-compatible alias for
@@ -245,9 +285,9 @@ viking://
     └── history/
 ```
 
-`viking://agent/...` is a global shared scope for agent capabilities, accessible to all users under the account,
-without agent_id isolation. Legacy (0.3.x) data under `viking://agent/...` remains accessible
-via a read-only compatibility entry, but new data should be written according to the new directory semantics.
+`viking://agent/...` is an account-shared directory without an Agent ID identity layer.
+`actor_peer_id` filters only the current user's `peers` collection. Shared directories
+remain isolated by account.
 
 ## URI Operations
 
@@ -280,32 +320,32 @@ parent = VikingURI(uri).parent.uri  # viking://resources/docs
 ```python
 # Search only in resources
 results = client.find(
-    "authentication",
-    target_uri="viking://resources/"
+    query="authentication",
+    target_uri="viking://resources/",
 )
 
-# Search only in current-user resources
+# Search only in your own resources
 results = client.find(
-    "private project notes",
-    target_uri="viking://user/resources/"
+    query="private project notes",
+    target_uri="viking://~/resources/"
 )
 
-# Search only in user memories
+# Search only in your own memories
 results = client.find(
-    "coding preferences",
-    target_uri="viking://user/memories/"
+    query="coding preferences",
+    target_uri="viking://~/memories/"
 )
 
-# Search only in user skills
+# Search only in your own skills
 results = client.find(
-    "web search",
-    target_uri="viking://user/skills/"
+    query="web search",
+    target_uri="viking://~/skills/"
 )
 
 # Search only in global agent skills
 results = client.find(
-    "web search",
-    target_uri="viking://agent/skills/"
+    query="web search",
+    target_uri="viking://agent/skills/",
 )
 ```
 
@@ -313,16 +353,16 @@ results = client.find(
 
 ```python
 # List directory
-entries = await client.ls("viking://resources/")
+entries = await client.ls(uri="viking://resources/")
 
 # Read file
-content = await client.read("viking://resources/docs/api.md")
+content = await client.read(uri="viking://resources/docs/api.md")
 
 # Get abstract
-abstract = await client.abstract("viking://resources/docs/")
+abstract = await client.abstract(uri="viking://resources/docs/")
 
 # Get overview
-overview = await client.overview("viking://resources/docs/")
+overview = await client.overview(uri="viking://resources/docs/")
 ```
 
 ## Special Files
@@ -333,7 +373,7 @@ Each directory may contain special files:
 |------|---------|
 | `.abstract.md` | L0 abstract (~100 tokens) |
 | `.overview.md` | L1 overview (~2k tokens) |
-| `.relations.json` | Related resources |
+| `` | Related resources |
 | `.meta.json` | Metadata |
 
 ## Best Practices
@@ -354,11 +394,11 @@ Each directory may contain special files:
 # Add resources to the shared account resource scope
 await client.add_resource(url, to="viking://resources/project/")
 
-# Add private resources to the current user's resource root
-await client.add_resource(path, parent="viking://user/resources/project/")
+# Add private resources to your own resource root
+await client.add_resource(path, parent="viking://~/resources/project/")
 
-# Skills are added to the current user's skills root by default
-await client.add_skill(skill)  # canonical root: viking://user/skills/
+# Skills are added to your own skills root by default
+await client.add_skill(skill)  # default root: viking://~/skills/
 
 # Write to the global agent skills root (public/shared) via -p override
 ov skills add xxx -p viking://agent/skills/

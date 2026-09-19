@@ -36,7 +36,10 @@ _INJECTION_TOOL_OPERATIONS: dict[str, ToolOperation] = {
     "ov_read": "read",
     "ov_multi_read": "multi_read",
 }
-_MCP_OPENVIKING_TOOL_RE = re.compile(r"^mcp__openviking__(find|search|list|read|multi_read)$")
+_MCP_OPENVIKING_TOOL_RE = re.compile(
+    r"^mcp__(?:openviking|plugin_.+_openviking)__(find|search|list|read|multi_read)$",
+    re.IGNORECASE,
+)
 _MCP_SEARCH_RESULT_RE = re.compile(r"^- \[[^]]+\]\s+(viking://.+?)\s*$")
 _OPENVIKING_SEARCH_TABLE_ROW_RE = re.compile(
     r"^\s*\d+\s{2,}(?:memory|resource|skill)\s{2,}"
@@ -46,7 +49,14 @@ _OPENVIKING_SEARCH_SIMPLE_ROW_RE = re.compile(
     r"^\s*\d+\s+(?:memory|resource|skill)\s+(viking://\S+)\s*$"
 )
 _LIST_FILE_RE = re.compile(r"^\s*\[file\]\s+(.+?)\s*$")
+# Historical transcripts recorded the removed uid-less shorthand; newer ones use
+# the viking://~ home alias. Both are canonicalized to the caller's user root.
 _USER_MEMORY_SHORTHAND_PREFIX = "viking://user/memories/"
+_USER_MEMORY_HOME_ALIAS_PREFIX = "viking://~/memories/"
+_USER_MEMORY_RELATIVE_PREFIXES = (
+    _USER_MEMORY_SHORTHAND_PREFIX,
+    _USER_MEMORY_HOME_ALIAS_PREFIX,
+)
 
 
 class UsageExtractor(Protocol):
@@ -83,7 +93,7 @@ def _tool_usage(tool_name: str) -> tuple[UsageKind, ToolOperation] | None:
     match = _MCP_OPENVIKING_TOOL_RE.fullmatch(name)
     if match is None:
         return None
-    operation = cast(ToolOperation, match.group(1))
+    operation = cast(ToolOperation, match.group(1).lower())
     if operation in {"find", "search", "list"}:
         return "recall", operation
     return "injection", operation
@@ -148,9 +158,10 @@ def _unique_uris(uris: Iterable[str], context: UsageContext) -> list[str]:
 
 def _canonicalize_usage_uri(uri: str, context: UsageContext) -> str:
     normalized = uri.strip()
-    if normalized.startswith(_USER_MEMORY_SHORTHAND_PREFIX):
-        relative = normalized.removeprefix(_USER_MEMORY_SHORTHAND_PREFIX)
-        return f"viking://user/{context.user_id}/memories/{relative}"
+    for prefix in _USER_MEMORY_RELATIVE_PREFIXES:
+        if normalized.startswith(prefix):
+            relative = normalized.removeprefix(prefix)
+            return f"viking://user/{context.user_id}/memories/{relative}"
     return normalized
 
 
@@ -209,7 +220,8 @@ def _read_failed_in_text(uri: str, texts: Iterable[str], context: UsageContext) 
     aliases = [uri]
     canonical_prefix = f"viking://user/{context.user_id}/memories/"
     if uri.startswith(canonical_prefix):
-        aliases.append(f"{_USER_MEMORY_SHORTHAND_PREFIX}{uri.removeprefix(canonical_prefix)}")
+        relative = uri.removeprefix(canonical_prefix)
+        aliases.extend(f"{prefix}{relative}" for prefix in _USER_MEMORY_RELATIVE_PREFIXES)
     for text in texts:
         for alias in aliases:
             if f"(nothing found at {alias})" in text:

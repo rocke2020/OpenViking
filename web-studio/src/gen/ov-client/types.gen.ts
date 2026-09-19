@@ -517,26 +517,6 @@ export type ImportRequest = {
 };
 
 /**
- * LinkRequest
- *
- * Request model for link.
- */
-export type LinkRequest = {
-    /**
-     * From Uri
-     */
-    from_uri: string;
-    /**
-     * To Uris
-     */
-    to_uris: string | Array<string>;
-    /**
-     * Reason
-     */
-    reason?: string;
-};
-
-/**
  * MkdirRequest
  *
  * Request model for mkdir.
@@ -700,22 +680,6 @@ export type SetRoleRequest = {
      * Role
      */
     role: string;
-};
-
-/**
- * UnlinkRequest
- *
- * Request model for unlink.
- */
-export type UnlinkRequest = {
-    /**
-     * From Uri
-     */
-    from_uri: string;
-    /**
-     * To Uri
-     */
-    to_uri: string;
 };
 
 /**
@@ -1110,7 +1074,7 @@ export type DeleteAdminAccountByAccountIdResponses = {
     /**
      * Successful Response
      */
-    200: unknown;
+    202: unknown;
 };
 
 export type GetAdminAccountIdUsersData = {
@@ -2559,136 +2523,6 @@ export type PostSearchGlobErrors = {
 export type PostSearchGlobError = PostSearchGlobErrors[keyof PostSearchGlobErrors];
 
 export type PostSearchGlobResponses = {
-    /**
-     * Successful Response
-     */
-    200: unknown;
-};
-
-export type GetRelationsData = {
-    body?: never;
-    headers?: {
-        /**
-         * X-Api-Key
-         */
-        'x-api-key'?: string | null;
-        /**
-         * Authorization
-         */
-        authorization?: string | null;
-        /**
-         * X-Openviking-Account
-         */
-        'X-OpenViking-Account'?: string | null;
-        /**
-         * X-Openviking-User
-         */
-        'X-OpenViking-User'?: string | null;
-    };
-    path?: never;
-    query: {
-        /**
-         * Uri
-         *
-         * Viking URI
-         */
-        uri: string;
-    };
-    url: '/api/v1/relations';
-};
-
-export type GetRelationsErrors = {
-    /**
-     * Validation Error
-     */
-    422: HttpValidationError;
-};
-
-export type GetRelationsError = GetRelationsErrors[keyof GetRelationsErrors];
-
-export type GetRelationsResponses = {
-    /**
-     * Successful Response
-     */
-    200: unknown;
-};
-
-export type DeleteRelationsLinkData = {
-    body: UnlinkRequest;
-    headers?: {
-        /**
-         * X-Api-Key
-         */
-        'x-api-key'?: string | null;
-        /**
-         * Authorization
-         */
-        authorization?: string | null;
-        /**
-         * X-Openviking-Account
-         */
-        'X-OpenViking-Account'?: string | null;
-        /**
-         * X-Openviking-User
-         */
-        'X-OpenViking-User'?: string | null;
-    };
-    path?: never;
-    query?: never;
-    url: '/api/v1/relations/link';
-};
-
-export type DeleteRelationsLinkErrors = {
-    /**
-     * Validation Error
-     */
-    422: HttpValidationError;
-};
-
-export type DeleteRelationsLinkError = DeleteRelationsLinkErrors[keyof DeleteRelationsLinkErrors];
-
-export type DeleteRelationsLinkResponses = {
-    /**
-     * Successful Response
-     */
-    200: unknown;
-};
-
-export type PostRelationsLinkData = {
-    body: LinkRequest;
-    headers?: {
-        /**
-         * X-Api-Key
-         */
-        'x-api-key'?: string | null;
-        /**
-         * Authorization
-         */
-        authorization?: string | null;
-        /**
-         * X-Openviking-Account
-         */
-        'X-OpenViking-Account'?: string | null;
-        /**
-         * X-Openviking-User
-         */
-        'X-OpenViking-User'?: string | null;
-    };
-    path?: never;
-    query?: never;
-    url: '/api/v1/relations/link';
-};
-
-export type PostRelationsLinkErrors = {
-    /**
-     * Validation Error
-     */
-    422: HttpValidationError;
-};
-
-export type PostRelationsLinkError = PostRelationsLinkErrors[keyof PostRelationsLinkErrors];
-
-export type PostRelationsLinkResponses = {
     /**
      * Successful Response
      */
@@ -4281,7 +4115,14 @@ export type GetTaskByTaskIdData = {
          */
         task_id: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Include Events
+         *
+         * Include recorded execution events
+         */
+        include_events?: boolean;
+    };
     url: '/api/v1/tasks/{task_id}';
 };
 

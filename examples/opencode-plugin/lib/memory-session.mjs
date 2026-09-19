@@ -3,6 +3,7 @@ import path from "path"
 import {
   extractPartsFromPayload,
   extractTextFromPayload,
+  isCaptureEnabled,
   shouldCaptureText,
 } from "./shared/capture-utils.mjs"
 import {
@@ -46,7 +47,7 @@ export function createMemorySessionManager({ config, pluginRoot }) {
   }
 
   async function init() {
-    if (config.autoCapture) await migrateLegacySessionMap()
+    if (isCaptureEnabled(config)) await migrateLegacySessionMap()
     await loadState()
     const health = await fetchJSON(config, "/health", {}, { timeoutMs: 5000 })
     if (health.ok) {
@@ -157,9 +158,9 @@ export function createMemorySessionManager({ config, pluginRoot }) {
       await handleSessionCompacted(event)
     } else if (event.type === "session.idle") {
       await handleSessionIdle(event)
-    } else if (event.type === "message.updated" && config.autoCapture) {
+    } else if (event.type === "message.updated" && isCaptureEnabled(config)) {
       await handleMessageUpdated(event)
-    } else if (event.type === "message.part.updated" && config.autoCapture) {
+    } else if (event.type === "message.part.updated" && isCaptureEnabled(config)) {
       await handleMessagePartUpdated(event)
     }
   }
@@ -264,8 +265,18 @@ export function createMemorySessionManager({ config, pluginRoot }) {
       clearTimeout(saveTimer)
       saveTimer = null
     }
+    // Do not abort the whole dispose flush when one session fails (e.g. server
+    // already GC'd a stale session). Continue so later sessions still commit.
+    // See https://github.com/volcengine/OpenViking/issues/4490
     for (const sessionId of sessions.keys()) {
-      await flushSession(sessionId, { commit, reason: "flushAll" })
+      try {
+        await flushSession(sessionId, { commit, reason: "flushAll" })
+      } catch (err) {
+        console.warn(
+          `[opencode-plugin] flushAll skipped session ${sessionId}:`,
+          err?.message || err,
+        )
+      }
     }
     await enqueueSave()
   }
@@ -276,7 +287,7 @@ export function createMemorySessionManager({ config, pluginRoot }) {
     if (!state) return false
 
     const added = await flushPendingMessages(opencodeSessionId, state)
-    if (commit && config.autoCapture) {
+    if (commit && isCaptureEnabled(config)) {
       await commitOvSession(state.ovSessionId, { force: true, reason })
     } else if (added > 0) {
       await maybeCommitByThreshold(state)
@@ -378,7 +389,7 @@ export function createMemorySessionManager({ config, pluginRoot }) {
   }
 
   async function flushPendingMessages(opencodeSessionId, state) {
-    if (!config.autoCapture) return 0
+    if (!isCaptureEnabled(config)) return 0
     const toSend = []
     for (const [messageId, message] of state.messages.entries()) {
       if (message.captured) continue
@@ -455,15 +466,35 @@ export function createMemorySessionManager({ config, pluginRoot }) {
       for (const state of sessions.values()) {
         if (state.ovSessionId === ovSessionId) state.lastCommitTime = Date.now()
       }
-      log("INFO", "session", "Committed OpenViking session", { openviking_session: ovSessionId, reason })
-      return { status: "accepted", result: res.result }
+      const traceId = res.traceId || res.result?.trace_id
+      log("INFO", "session", "Committed OpenViking session", {
+        openviking_session: ovSessionId,
+        reason,
+        trace_id: traceId,
+      })
+      return { status: "accepted", result: res.result, traceId }
     }
     if (isRetryableFailure(res)) {
       await enqueue("commitSession", ovSessionId, body)
-      log("WARN", "session", "Queued OpenViking session commit", { openviking_session: ovSessionId, reason })
+      log("WARN", "session", "Queued OpenViking session commit", {
+        openviking_session: ovSessionId,
+        reason,
+        trace_id: res.traceId,
+        status: res.status,
+      })
       return { status: "queued" }
     }
-    throw new Error(`Failed to commit OpenViking session ${ovSessionId}: ${res.error?.message || res.status}`)
+    log("ERROR", "session", "Failed to commit OpenViking session", {
+      openviking_session: ovSessionId,
+      reason,
+      trace_id: res.traceId,
+      status: res.status,
+      error: res.error?.message || res.error?.code,
+    })
+    throw new Error(
+      `Failed to commit OpenViking session ${ovSessionId}: ${res.error?.message || res.status}` +
+      (res.traceId ? ` (trace_id=${res.traceId})` : ""),
+    )
   }
 
   async function migrateLegacySessionMap() {

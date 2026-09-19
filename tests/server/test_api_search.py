@@ -4,6 +4,7 @@
 """Tests for search endpoints: find, search, grep, glob."""
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -11,9 +12,11 @@ import pytest
 from openviking.models.embedder.base import EmbedResult
 from openviking.server.auth import get_request_context
 from openviking.server.identity import RequestContext, Role
+from openviking.server.routers import search as search_router
 from openviking.storage.viking_fs import VikingFS
 from openviking.utils.time_utils import parse_iso_datetime
 from openviking_cli.exceptions import InvalidArgumentError
+from openviking_cli.retrieve import ContextType, FindResult, MatchedContext
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -53,6 +56,145 @@ async def test_find_basic(client_with_resource):
     assert body["result"] is not None
     assert "usage" not in body
     assert "telemetry" not in body
+
+
+@pytest.mark.parametrize("endpoint", ["/api/v1/search/find", "/api/v1/search/search"])
+async def test_search_endpoints_inline_visible_content_when_requested(
+    client: httpx.AsyncClient, service, monkeypatch, endpoint: str
+):
+    async def fake_read_visible(uri, *, ctx):
+        assert ctx is not None
+        return f"visible content for {uri}"
+
+    async def fake_search(**kwargs):
+        del kwargs
+        return FindResult(
+            memories=[],
+            resources=[
+                MatchedContext(
+                    uri="viking://resources/visible.md",
+                    context_type=ContextType.RESOURCE,
+                )
+            ],
+            skills=[],
+        )
+
+    monkeypatch.setattr(service.fs, "read_visible", fake_read_visible)
+    monkeypatch.setattr(
+        service.search, "find" if endpoint.endswith("/find") else "search", fake_search
+    )
+
+    response = await client.post(endpoint, json={"query": "visible", "read_content": True})
+
+    assert response.status_code == 200
+    assert response.json()["result"]["resources"][0]["content"] == (
+        "visible content for viking://resources/visible.md"
+    )
+
+
+async def test_find_omits_content_when_read_is_not_requested(
+    client: httpx.AsyncClient, service, monkeypatch
+):
+    async def fake_search(**kwargs):
+        del kwargs
+        return FindResult(
+            memories=[],
+            resources=[
+                MatchedContext(
+                    uri="viking://resources/visible.md",
+                    context_type=ContextType.RESOURCE,
+                )
+            ],
+            skills=[],
+        )
+
+    monkeypatch.setattr(service.search, "find", fake_search)
+    monkeypatch.setattr(
+        service.fs,
+        "read_visible",
+        lambda *args, **kwargs: pytest.fail("read_visible must not be called"),
+    )
+
+    response = await client.post("/api/v1/search/find", json={"query": "visible"})
+
+    assert response.status_code == 200
+    assert "content" not in response.json()["result"]["resources"][0]
+
+
+async def test_find_keeps_hit_without_content_when_read_fails(
+    client: httpx.AsyncClient, service, monkeypatch
+):
+    async def fake_read_visible(uri, *, ctx):
+        del uri, ctx
+        raise RuntimeError("unavailable")
+
+    async def fake_find(**kwargs):
+        del kwargs
+        return FindResult(
+            memories=[],
+            resources=[
+                MatchedContext(
+                    uri="viking://resources/unavailable.md",
+                    context_type=ContextType.RESOURCE,
+                )
+            ],
+            skills=[],
+        )
+
+    monkeypatch.setattr(service.fs, "read_visible", fake_read_visible)
+    monkeypatch.setattr(service.search, "find", fake_find)
+
+    response = await client.post(
+        "/api/v1/search/find", json={"query": "unavailable", "read_content": True}
+    )
+
+    assert response.status_code == 200
+    assert "content" not in response.json()["result"]["resources"][0]
+
+
+async def test_search_context_rejects_read_content(client: httpx.AsyncClient):
+    response = await client.post(
+        "/api/v1/search/search",
+        json={"query": "visible", "mode": "context", "read_content": True},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "INVALID_ARGUMENT"
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "service_method"),
+    [
+        ("/api/v1/search/find", "find"),
+        ("/api/v1/search/search", "search"),
+    ],
+)
+async def test_search_endpoints_filter_invalid_result_tags(
+    client: httpx.AsyncClient, service, monkeypatch, endpoint: str, service_method: str
+):
+    async def fake_search(**kwargs):
+        del kwargs
+        return FindResult(
+            memories=[],
+            resources=[
+                MatchedContext(
+                    uri="viking://resources/legacy-tags.md",
+                    context_type=ContextType.RESOURCE,
+                    search_tags=["default", "team=infra", "bad=", "project=viking"],
+                )
+            ],
+            skills=[],
+        )
+
+    monkeypatch.setattr(service.search, service_method, fake_search)
+
+    response = await client.post(endpoint, json={"query": "legacy tags"})
+
+    assert response.status_code == 200
+    assert response.json()["result"]["resources"][0]["tags"] == [
+        "team=infra",
+        "project=viking",
+    ]
 
 
 @pytest.mark.parametrize("endpoint", ["/api/v1/search/find", "/api/v1/search/search"])
@@ -858,6 +1000,54 @@ async def test_grep(client_with_resource):
     assert resp.json()["status"] == "ok"
 
 
+@pytest.mark.asyncio
+async def test_grep_forwards_tags_to_filesystem_service(monkeypatch):
+    seen = {}
+
+    async def fake_grep(uri, pattern, **kwargs):
+        seen.update(uri=uri, pattern=pattern, **kwargs)
+        return {"matches": [], "count": 0, "match_count": 0, "files_scanned": 0}
+
+    monkeypatch.setattr(
+        search_router,
+        "get_service",
+        lambda: SimpleNamespace(fs=SimpleNamespace(grep=fake_grep)),
+    )
+
+    await search_router.grep(
+        search_router.GrepRequest(
+            uri="viking://resources", pattern="OpenViking", tags=["team=search", "env=prod"]
+        ),
+        _ctx=RequestContext(user=UserIdentifier("acct", "alice"), role=Role.USER),
+    )
+
+    assert seen["tags"] == ["team=search", "env=prod"]
+
+
+@pytest.mark.asyncio
+async def test_grep_forwards_include_tags_to_filesystem_service(monkeypatch):
+    seen = {}
+
+    async def fake_grep(uri, pattern, **kwargs):
+        seen.update(uri=uri, pattern=pattern, **kwargs)
+        return {"matches": [], "count": 0, "match_count": 0, "files_scanned": 0}
+
+    monkeypatch.setattr(
+        search_router,
+        "get_service",
+        lambda: SimpleNamespace(fs=SimpleNamespace(grep=fake_grep)),
+    )
+
+    await search_router.grep(
+        search_router.GrepRequest(
+            uri="viking://resources", pattern="OpenViking", include_tags=True
+        ),
+        _ctx=RequestContext(user=UserIdentifier("acct", "alice"), role=Role.USER),
+    )
+
+    assert seen["include_tags"] is True
+
+
 async def test_grep_case_insensitive(client_with_resource):
     client, uri = client_with_resource
     parent_uri = "/".join(uri.split("/")[:-1]) + "/"
@@ -1020,3 +1210,43 @@ async def test_glob(client_with_resource):
     )
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
+    assert all(isinstance(match, str) for match in resp.json()["result"]["matches"])
+
+
+async def test_glob_explicit_empty_extra_fields_returns_entry_objects(client_with_resource):
+    client, _ = client_with_resource
+    resp = await client.post(
+        "/api/v1/search/glob",
+        json={"pattern": "**/*.md", "extra_fields": []},
+    )
+
+    assert resp.status_code == 200
+    matches = resp.json()["result"]["matches"]
+    assert matches
+    assert all(isinstance(match, dict) for match in matches)
+    assert all("uri" in match and "isDir" in match for match in matches)
+
+
+@pytest.mark.asyncio
+async def test_glob_forwards_tags_and_tag_projection_to_filesystem_service(monkeypatch):
+    seen = {}
+
+    async def fake_glob(pattern, **kwargs):
+        seen.update(pattern=pattern, **kwargs)
+        return {"matches": [], "count": 0}
+
+    monkeypatch.setattr(
+        search_router,
+        "get_service",
+        lambda: SimpleNamespace(fs=SimpleNamespace(glob=fake_glob)),
+    )
+
+    await search_router.glob(
+        search_router.GlobRequest(
+            pattern="**/*.md", tags=["env=prod"], include_tags=True
+        ),
+        _ctx=RequestContext(user=UserIdentifier("acct", "alice"), role=Role.USER),
+    )
+
+    assert seen["tags"] == ["env=prod"]
+    assert seen["include_tags"] is True

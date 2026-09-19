@@ -16,6 +16,7 @@ Features:
 - IANA Media Type (MIME) based content detection for URLs without file extensions
 """
 
+import socket
 import tempfile
 from enum import Enum
 from pathlib import Path
@@ -30,8 +31,15 @@ from openviking.parse.parsers.media.constants import (
     VIDEO_EXTENSIONS,
 )
 from openviking.utils import is_code_hosting_blob_url
+from openviking.utils.exceptions import error_code_from_http_status
 from openviking.utils.network_guard import build_httpx_request_validation_hooks
-from openviking_cli.exceptions import PermissionDeniedError
+from openviking_cli.exceptions import (
+    DeadlineExceededError,
+    InvalidArgumentError,
+    OpenVikingError,
+    PermissionDeniedError,
+    UnavailableError,
+)
 from openviking_cli.utils.logger import get_logger
 
 from .base import DataAccessor, LocalResource, SourceType
@@ -158,6 +166,7 @@ class URLTypeDetector:
         url: str,
         timeout: Optional[float] = None,
         request_validator=None,
+        headers: Optional[Mapping[str, str]] = None,
     ) -> Tuple[URLType, Dict[str, Any]]:
         """
         Detect URL content type using IANA standards.
@@ -206,7 +215,7 @@ class URLTypeDetector:
                 client_kwargs["trust_env"] = False
 
             async with httpx.AsyncClient(**client_kwargs) as client:
-                response = await client.head(url)
+                response = await client.head(url, headers=headers)
 
                 meta["status_code"] = response.status_code
                 if not (200 <= response.status_code < 300):
@@ -443,12 +452,16 @@ class HTTPAccessor(DataAccessor):
         """
         source_str = str(source)
         request_validator = kwargs.get("request_validator")
+        tos_signature = kwargs.get("tos_signature")
+        tos_access = kwargs.get("tos_access")
 
         # Download the URL
-        temp_path, url_type, meta = await self._download_url(
-            source_str,
-            request_validator=request_validator,
-        )
+        download_kwargs = {"request_validator": request_validator}
+        if tos_signature is not None:
+            download_kwargs["tos_signature"] = tos_signature
+        if tos_access is not None:
+            download_kwargs["tos_access"] = tos_access
+        temp_path, url_type, meta = await self._download_url(source_str, **download_kwargs)
 
         # Both an extensionless text/html page (WEBPAGE) and an explicit
         # ``.html``/``.htm`` URL (DOWNLOAD_HTML) are webpages the user may want
@@ -532,6 +545,8 @@ class HTTPAccessor(DataAccessor):
         self,
         url: str,
         request_validator=None,
+        tos_signature: Optional[str] = None,
+        tos_access: Optional[str] = None,
     ) -> Tuple[str, URLType, Dict[str, Any]]:
         """
         Download URL content to a temporary file.
@@ -552,6 +567,7 @@ class HTTPAccessor(DataAccessor):
         url_type, detect_meta = await self._url_detector.detect(
             url,
             request_validator=request_validator,
+            headers=self._request_headers(tos_signature, tos_access),
         )
 
         temp_path: Optional[str] = None
@@ -568,32 +584,34 @@ class HTTPAccessor(DataAccessor):
                 client_kwargs["trust_env"] = False
 
             async with httpx.AsyncClient(**client_kwargs) as client:
-                headers = {"User-Agent": self.user_agent}
+                headers = self._request_headers(tos_signature, tos_access)
                 try:
                     response = await client.get(url, headers=headers)
                     response.raise_for_status()
                 except httpx.ConnectError as e:
-                    user_msg = "HTTP request failed: could not connect to server. Check the URL or your network."
-                    raise RuntimeError(f"{user_msg} URL: {url}. Details: {e}") from e
+                    cause: BaseException | None = e
+                    while cause is not None:
+                        if isinstance(cause, socket.gaierror) and cause.errno == socket.EAI_NONAME:
+                            raise InvalidArgumentError(
+                                f"Source URL host does not exist: {url}", details={"source": url}
+                            ) from e
+                        cause = cause.__cause__ or cause.__context__
+                    raise UnavailableError(
+                        "source URL", reason=f"Could not connect to {url}: {e}"
+                    ) from e
                 except httpx.TimeoutException as e:
-                    user_msg = "HTTP request failed: timeout. The server took too long to respond."
-                    raise RuntimeError(f"{user_msg} URL: {url}. Details: {e}") from e
+                    raise DeadlineExceededError(f"Fetch source URL {url}", self.timeout) from e
                 except httpx.HTTPStatusError as e:
-                    status_code = e.response.status_code if e.response else "unknown"
-                    if status_code == 401:
-                        user_msg = f"HTTP request failed: authentication error ({status_code}). Check your credentials or permissions."
-                    elif status_code == 403:
-                        user_msg = f"HTTP request failed: access denied ({status_code}). The site blocked the request (login or anti-bot may be required)."
-                    elif status_code == 404:
-                        user_msg = f"HTTP request failed: not found ({status_code}). The URL may be invalid or the resource was removed."
-                    elif 500 <= status_code < 600:
-                        user_msg = f"HTTP request failed: server error ({status_code}). The server encountered an error."
-                    else:
-                        user_msg = f"HTTP request failed: status code {status_code}."
-                    raise RuntimeError(f"{user_msg} URL: {url}. Details: {e}") from e
-                except Exception as e:
-                    user_msg = "HTTP request failed: unexpected error."
-                    raise RuntimeError(f"{user_msg} URL: {url}. Details: {e}") from e
+                    status_code = e.response.status_code
+                    raise OpenVikingError(
+                        f"Source URL returned HTTP {status_code}: {url}",
+                        code=error_code_from_http_status(status_code),
+                        details={"source": url, "upstream_status_code": status_code},
+                    ) from e
+                except httpx.InvalidURL as e:
+                    raise InvalidArgumentError(f"Invalid source URL: {url}") from e
+                except httpx.RequestError as e:
+                    raise UnavailableError("source URL", reason=str(e)) from e
 
                 meta = self._finalize_download_metadata(
                     url=url,
@@ -626,6 +644,20 @@ class HTTPAccessor(DataAccessor):
                 except Exception:
                     pass
             raise
+
+    def _request_headers(
+        self,
+        tos_signature: Optional[str],
+        tos_access: Optional[str],
+    ) -> Dict[str, str]:
+        headers = {"User-Agent": self.user_agent}
+        if tos_signature is not None and tos_access is not None:
+            raise ValueError("tos_signature and tos_access cannot both be provided")
+        if tos_signature is not None:
+            headers["X-Tos-Signature"] = tos_signature
+        elif tos_access is not None:
+            headers["X-Tos-Access"] = tos_access
+        return headers
 
     def _finalize_download_metadata(
         self,

@@ -1,33 +1,38 @@
-## 安装 TRAE 集成
+## 步骤1：安装
 
-需要 macOS/Linux 和 Node.js 18+。运行与客户端对应的安装命令，Hook 和 MCP 会同时配置：
+1. 根据所使用的版本，在终端执行对应的安装命令：
 
-```bash
-# TRAE
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) --harness trae --dist tos
+   **Trae 国际版**
 
-# TRAE CN
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) --harness trae-cn --dist tos
+   ```bash
+   bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) --harness trae --dist tos
+   ```
 
-# 同时安装
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) --harness trae,trae-cn --dist tos
-```
+   **Trae 中国版**
 
-安装器询问连接方式时，请选择 **火山引擎 OpenViking 云服务** 并填写 API Key。只有本机已运行 OpenViking 服务时才选择 **自建 / 本地**。
+   ```bash
+   bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) --harness trae-cn --dist tos
+   ```
 
-## 验证
+2. 安装器会依次询问以下信息：语言（English / 中文）、OpenViking 凭据。在 OpenViking 凭据配置中，选择连接至「火山引擎 OpenViking 云服务 [api.vikingdb.cn-beijing.volces.com]」，并填入 API KEY：
 
-1. 安装后重启 TRAE。
-2. 在 TRAE 设置中确认 `openviking` 已连接。
-3. 新建会话并提问一个与过往项目或个人偏好相关的问题。
-4. 告诉 Agent 一个临时偏好；下一会话再次询问，验证捕获和提交。
+   ```text
+   {{OPENVIKING_API_KEY}}
+   ```
 
-完整说明见 [TRAE 接入文档](https://docs.openviking.ai/zh/agent-integrations/13-trae)。
+## 步骤2：验证
+
+在「设置 → MCP → 已配置的 MCP Servers」中确认能够看到 `openviking` 条目即表示接入成功。
 
 ## 故障排查
 
 | 问题 | 处理 |
 |---|---|
-| 安装后没有自动召回 | 完全退出并重新启动 TRAE，然后新建 Agent 会话。 |
-| 新会话无法回忆上一轮 | 查看 `~/.openviking/logs/trae-hooks.log` 或 `trae-cn-hooks.log`，确认 Stop 提交成功。 |
-| 连接或鉴权失败 | 检查 `~/.openviking/ovcli.conf`，然后重启 TRAE。 |
+| 没有自动召回 | 完全退出 TRAE，重启，再建会话 |
+| 连接 / 鉴权失败 | 检查 `~/.openviking/ovcli.conf`，重启 TRAE |
+| 需要日志 | `~/.openviking/logs/trae-hooks.log` 或 `trae-cn-hooks.log` |
+
+## 参考
+
+- 手动配置文档：[TRAE](https://docs.openviking.net/zh/agent-integrations/13-trae)
+- 源码：[examples/agent-hook-plugin](https://github.com/volcengine/OpenViking/tree/main/examples/agent-hook-plugin)
